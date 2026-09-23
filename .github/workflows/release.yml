@@ -1,0 +1,43 @@
+name: Plugin Release
+on:
+  push:
+    tags: ['gamer-*-v*']
+permissions:
+  contents: read
+concurrency:
+  group: plugins-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  draft:
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: official-plugins
+          path: dist
+      - name: Validate tag and prepare immutable catalog
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node tools/prepare-release.mjs $env:RELEASE_TAG dist
+      - name: Create draft with verified packages and versioned registry
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # No clobber: an existing release must be inspected before retrying.
+          $assets = @(Get-ChildItem dist/plugins/*.gplugin | ForEach-Object FullName)
+          $assets += @('dist/registry.json', 'dist/sha256sums.txt')
+          gh release create $env:RELEASE_TAG --verify-tag --draft --title $env:RELEASE_TAG --notes-file RELEASE_NOTES.md @assets
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }

@@ -1,0 +1,76 @@
+name: Plugins CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  standalone:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: gamer-yaml/ui/package.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            sdk/plugin-signer -> ../../.build
+            gamer-yaml/interpreter
+      - run: node tools/verify-sdk.mjs
+      - run: cargo test --locked --manifest-path gamer-yaml/interpreter/Cargo.toml
+      - name: Build all official packages without a Gamer checkout
+        shell: pwsh
+        run: ./build.ps1 -ChecksumsFile "$PWD/dist/sha256sums.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: official-plugins
+          path: dist/
+          if-no-files-found: error
+  integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source
+      - id: sdk
+        shell: pwsh
+        run: |
+          $sdk = Get-Content source/sdk/lock.json -Raw | ConvertFrom-Json
+          if ($sdk.commit -notmatch '^[a-f0-9]{40}$') { throw 'Invalid pinned host commit' }
+          "commit=$($sdk.commit)" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v4
+        with:
+          repository: jesongit/gamer
+          ref: ${{ steps.sdk.outputs.commit }}
+          path: host
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          path: host/plugins
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: host/web/package.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host/server
+      - run: pnpm --dir host/web install --frozen-lockfile
+      - run: pnpm --dir host/web test:run
+      - run: pnpm --dir host/web build
+      - run: cargo test --locked --manifest-path host/server/Cargo.toml
+        env:
+          GAMER_PROFILE: dev
