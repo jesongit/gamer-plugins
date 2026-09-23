@@ -1,0 +1,89 @@
+package gamer:keymap@1.0.0;
+
+/// The event envelope deliberately contains no DOM object, device path, or
+/// scrcpy pointer id. It is the only value that crosses into the keymap guest.
+interface keymap {
+  enum event-kind {
+    key-down,
+    key-up,
+    mouse-down,
+    mouse-up,
+    mouse-move,
+    wheel,
+    gamepad-button,
+    gamepad-axis,
+  }
+
+  record input-event {
+    kind: event-kind,
+    code: option<string>,
+    repeat: bool,
+    meta: u32,
+    button: u8,
+    x: u32,
+    y: u32,
+    delta-x: s32,
+    delta-y: s32,
+    index: u8,
+    pressed: bool,
+    value: f32,
+  }
+
+  record point {
+    /// Coordinates emitted by the guest are normalized to [0, 1].
+    x: f32,
+    y: f32,
+  }
+
+  record swipe {
+    from-point: point,
+    to: point,
+    duration-ms: u64,
+  }
+
+  record key-action {
+    code: u32,
+    action: string,
+  }
+
+  record touch-move {
+    /// This is a guest-owned slot. The host keeps the native TouchHandle.
+    slot: u64,
+    point: point,
+  }
+
+  record touch-begin {
+    /// Guest-owned slot returned in the action list and retained by the guest.
+    slot: u64,
+    point: point,
+  }
+
+  variant device-action {
+    tap(point),
+    swipe(swipe),
+    key(key-action),
+    text(string),
+    touch-begin(touch-begin),
+    touch-move(touch-move),
+    touch-end(u64),
+  }
+
+  record input-result {
+    consume: bool,
+    actions: list<device-action>,
+  }
+
+  /// Called once after the component is instantiated. `profile` carries the
+  /// raw keymap YAML the host resolved from the package data context (the
+  /// same schema as
+  /// `packages/<package-id>/plugins/gamer-keymap/mappings/*.yaml`:
+  /// version/name/bindings with tap|swipe|raw_key|hold actions). `none` starts
+  /// with the guest's built-in default rules; unmapped input falls through to
+  /// the native control path.
+  start: func(profile: option<string>) -> result<_, string>;
+  handle: func(event: input-event) -> result<input-result, string>;
+}
+
+world keymap-host {
+  export keymap;
+}

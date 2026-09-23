@@ -1,0 +1,9 @@
+**/node_modules/
+**/target/
+**/dist/
+.build/
+*.log
+*.private.pem
+*.key
+.DS_Store
+Thumbs.db

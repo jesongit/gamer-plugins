@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "host_api": "1.0.0",
+  "repository": "https://github.com/jesongit/gamer.git",
+  "commit": "689cc47b1fcaa2780fc97cd357db25f23da84ddd",
+  "files": [
+    {
+      "source": "sdk/ui/module-build.mjs",
+      "path": "ui/module-build.mjs",
+      "sha256": "c1e6aac58431e6d0e138c9609239bc2b667d7d9eef93b05e1071d3e17ee06b81"
+    },
+    {
+      "source": "sdk/ui/host-modules.json",
+      "path": "ui/host-modules.json",
+      "sha256": "d8d88cde7c5ce09f2e9daf6ac2d30ebdc4d59affacebe725a054bd4e50c5c7db"
+    },
+    {
+      "source": "server/wit/gamer/host.wit",
+      "path": "wit/gamer/host.wit",
+      "sha256": "556e528f219f56681663fb776ba7a500839f421abc71746e2f563ddab59fb23f"
+    },
+    {
+      "source": "server/wit/keymap/keymap.wit",
+      "path": "wit/keymap/keymap.wit",
+      "sha256": "6e0aa50f6205de0e95d37924347e51a4aab1132a52815fbf1984ed69e468f50f"
+    },
+    {
+      "source": "tools/plugin-signer/Cargo.lock",
+      "path": "plugin-signer/Cargo.lock",
+      "sha256": "698bba5f898ff144967aaee52fb97c60ee68438a6cb4f1cb530b4cc21be5ce30"
+    },
+    {
+      "source": "tools/plugin-signer/Cargo.toml",
+      "path": "plugin-signer/Cargo.toml",
+      "sha256": "3b73a1e641ef8e4a31cdd86d579cb2c9c0aa4f82ada87d3d76fd6fce56cdcf90"
+    },
+    {
+      "source": "tools/plugin-signer/src/main.rs",
+      "path": "plugin-signer/src/main.rs",
+      "sha256": "1130fe44e8759be8f6adc9d1aba3727ec85d167f033652e596237d9b18ed41cb"
+    }
+  ]
+}
