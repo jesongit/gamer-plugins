@@ -3,7 +3,7 @@
 #   - tools/build-plugins.ps1 打包免签名 gamer-yaml-<ver>.gplugin（官方市场）
 #   - yaml_extension.rs 测试链路现场构建（server/target/yaml-guest）
 # 本 crate 独立于 server workspace，不随 server 编译；wit 路径相对本目录
-# （../../wit/gamer → server/wit/gamer），ABI 变更须重打官方插件包。
+# （../../sdk/wit/gamer，固定 SDK 快照），ABI 变更须重打官方插件包。
 # 解释器本体在 yaml-interp（与 server 测试共享同一份源码，计划 Phase 2），
 # 本 crate 只是 WIT 胶水。
 [package]

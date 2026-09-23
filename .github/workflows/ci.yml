@@ -26,6 +26,7 @@ jobs:
             sdk/plugin-signer -> ../../.build
             gamer-yaml/interpreter
       - run: node tools/verify-sdk.mjs
+      - run: node --test tools/release.test.mjs
       - run: cargo test --locked --manifest-path gamer-yaml/interpreter/Cargo.toml
       - name: Build all official packages without a Gamer checkout
         shell: pwsh
@@ -36,7 +37,7 @@ jobs:
           path: dist/
           if-no-files-found: error
   integration:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,6 +66,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Install media test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: host/server

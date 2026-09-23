@@ -1,55 +1,5 @@
-﻿#requires -Version 5.1
-<#
-.SYNOPSIS
-    构建官方插件产物：guest → WASM Component → 无签名 .gplugin → registry v2 → 完整性自检。
-
-.DESCRIPTION
-    Phase 1 免签名链路（plan §4.2，keygen / 私钥 / signature.sig / Registry proof
-    已整体移出默认链路，CI 不存私钥）：
-      1. 构建 tools/plugin-signer（打包/校验工具）。
-      2. 枚举 <ManifestsRoot>/<id>/manifest.toml（manifest v2：[execution]
-         kind = wasm | builtin），经 signer inspect 解析元数据——id/version/
-         name/description/publisher/permissions/host_api/ui 全部以 manifest 为
-         唯一权威源，本脚本不再维护第二份。
-      3. wasm 包构建对应 guest Component（keymap 源 plugins/gamer-keymap/guest、
-         yaml 源 plugins/gamer-yaml/guest）；builtin 包（gamer-video）无 guest、
-         打 manifest 与 UI，不携带任何占位 WASM。
-      4. signer pack 出 .gplugin（zip：manifest.toml + plugin.wasm + 附加文件，
-         无 signature.sig）——先落在 staging 临时目录。
-      5. 产物自检：signer verify 重走 zip 中央目录/entry magic 校验 + 重新计算
-         sha256/大小 + id/version/kind 与 manifest 比对。任何失败 exit 非零且
-         不触碰既有产物（web/public/registry.json 与 plugins/*.gplugin 原样保留）。
-      6. 全部通过后：registry v2（schema_version=2，条目无 signature 字段）先写
-         临时文件再原子替换；产物拷入 <OutputDir>；清理不在本轮构建清单内的旧
-         .gplugin（-KeepStaleArtifacts 跳过）。
-      7. 可选 -ChecksumsFile：生成 sha256sums.txt（GNU sha256sum -c 兼容，头注释
-         含源提交），供 GitHub Release 上传（从指定提交构建 → 完整性清单 → 产物
-         可上传）。本地构建产物可直接导入，仓库内 web/public/ 继续作为开发 seed。
-
-.PARAMETER OutputDir
-    .gplugin 产物目录（默认 <repo>\web\public\plugins）。干跑可用临时目录。
-
-.PARAMETER RegistryFile
-    registry.json 输出路径（默认 <repo>\web\public\registry.json）。
-
-.PARAMETER ManifestsRoot
-    插件 manifest 根目录（默认 <repo>\plugins）；每个子目录的
-    manifest.toml 即一个待构建插件。
-
-.PARAMETER ChecksumsFile
-    可选。生成 sha256sums.txt 完整性清单（含 registry.json 与全部 .gplugin）。
-
-.PARAMETER Publisher
-    manifest 未声明 publisher 字段时的默认发布者（默认 gamer.dev）。
-
-.PARAMETER KeepStaleArtifacts
-    保留 OutputDir 中不在本轮构建清单内的旧 .gplugin（默认成功后清理）。
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\build-plugins.ps1
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\build-plugins.ps1 -OutputDir $env:TEMP\plugins -RegistryFile $env:TEMP\registry.json -ChecksumsFile $env:TEMP\sha256sums.txt
-#>
+﻿#requires -Version 7.0
+# Independent plugin build: locked SDK, guest, UI, .gplugin and registry.
 [CmdletBinding()]
 param(
     [string]$OutputDir,

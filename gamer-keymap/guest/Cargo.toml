@@ -3,7 +3,7 @@
 #   - tools/build-plugins.ps1 打包 gamer-keymap-<ver>.gplugin（官方市场）
 #   - keymap/mod.rs 测试链路现场构建（install/start/dispatch 真实组件验收）
 # 本 crate 独立于 server workspace，不随 server 编译；wit 路径相对本目录
-# （../../wit/keymap → server/wit/keymap），ABI 变更须重打官方插件包。
+# （../../sdk/wit/keymap，固定 SDK 快照），ABI 变更须重打官方插件包。
 [package]
 name = "gamer-keymap-guest"
 version = "0.1.0"
