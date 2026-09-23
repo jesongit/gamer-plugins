@@ -1,4 +1,4 @@
-﻿#requires -Version 7.0
+﻿#requires -Version 5.1
 # Independent plugin build: locked SDK, guest, UI, .gplugin and registry.
 [CmdletBinding()]
 param(
