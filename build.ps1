@@ -16,15 +16,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = $PSScriptRoot
-$SignerDir = Join-Path $RepoRoot 'sdk\plugin-signer'
+$PackerDir = Join-Path $RepoRoot 'sdk\plugin-packer'
 & node (Join-Path $RepoRoot 'tools/verify-sdk.mjs')
 if ($LASTEXITCODE -ne 0) { throw 'SDK snapshot verification failed' }
 if (-not $ManifestsRoot) { $ManifestsRoot = $RepoRoot }
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'dist\plugins' }
 if (-not $RegistryFile) { $RegistryFile = Join-Path $RepoRoot 'dist\registry.json' }
 if (-not $TargetRoot) { $TargetRoot = Join-Path $RepoRoot '.build' }
-# cargo --target-dir 指向 <TargetRoot> 时，signer 产物直接落在 <TargetRoot>\release\
-$SignerExe = Join-Path $TargetRoot 'release\gamer-plugin-signer.exe'
+# cargo --target-dir 指向 <TargetRoot> 时，packer 产物直接落在 <TargetRoot>\release\
+$PackerExe = Join-Path $TargetRoot 'release\gamer-plugin-packer.exe'
 
 # guest 构建配方（源码位置与 wasm 产物名；版本/元数据一律来自 manifest.toml）。
 $GuestRecipes = @{
@@ -84,11 +84,11 @@ foreach ($tool in @('cargo')) {
     }
 }
 
-# ---- 1. plugin-signer ----
-Write-Host "===[1/6] 构建 plugin-signer ===" -ForegroundColor Cyan
+# ---- 1. plugin-packer ----
+Write-Host "===[1/6] 构建 plugin-packer ===" -ForegroundColor Cyan
 Invoke-Native 'cargo' @(
     'build', '--locked', '--quiet', '--release',
-    '--manifest-path', "$SignerDir\Cargo.toml",
+    '--manifest-path', "$PackerDir\Cargo.toml",
     '--target-dir', $TargetRoot
 ) $RepoRoot
 
@@ -107,7 +107,7 @@ $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gamer-plugins-" + [
 $packages = @()
 foreach ($manifestPath in $manifestFiles) {
     $metaPath = Join-Path $stagingRoot ("meta-" + [System.IO.Path]::GetFileNameWithoutExtension((Split-Path -Parent $manifestPath)) + ".json")
-    Invoke-Native $SignerExe @('inspect', '--manifest', $manifestPath, '--meta-out', $metaPath) $RepoRoot | Out-Null
+    Invoke-Native $PackerExe @('inspect', '--manifest', $manifestPath, '--meta-out', $metaPath) $RepoRoot | Out-Null
     $meta = Read-JsonFile $metaPath
     $id = $meta.id
     $kind = $meta.execution.kind
@@ -176,7 +176,7 @@ foreach ($package in $packages) {
         $relative = Get-RelativeReleasePath $uiRoot $asset.FullName
         $packArgs += @('--file', "ui/$relative=$($asset.FullName)")
     }
-    $packOutput = Invoke-Native $SignerExe $packArgs $RepoRoot
+    $packOutput = Invoke-Native $PackerExe $packArgs $RepoRoot
     $package.Artifact = $out
     $package.Name = $name
     $package.DownloadUrl = if ($DownloadBaseUrl) { $DownloadBaseUrl.TrimEnd('/') + "/$name" } else { "/plugins/$name" }
@@ -189,7 +189,7 @@ foreach ($package in $packages) {
 # ---- 5. 产物自检（全部通过才允许落 web/public）----
 Write-Host "===[5/6] 产物自检（zip 重走 + sha256/size + manifest 比对）===" -ForegroundColor Cyan
 foreach ($package in $packages) {
-    $verifyOutput = Invoke-Native $SignerExe @('verify', '--archive', $package.Artifact) $RepoRoot
+    $verifyOutput = Invoke-Native $PackerExe @('verify', '--archive', $package.Artifact) $RepoRoot
     $vid = (($verifyOutput | Where-Object { $_ -match '^id=' }) -replace '^id=', '')
     $vver = (($verifyOutput | Where-Object { $_ -match '^version=' }) -replace '^version=', '')
     $vkind = (($verifyOutput | Where-Object { $_ -match '^kind=' }) -replace '^kind=', '')

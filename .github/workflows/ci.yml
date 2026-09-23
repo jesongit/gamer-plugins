@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            sdk/plugin-signer -> ../../.build
+            sdk/plugin-packer -> ../../.build
             gamer-yaml/interpreter
       - run: node tools/verify-sdk.mjs
       - run: node --test tools/release.test.mjs
