@@ -27,6 +27,7 @@ import {
   type Step,
 } from './model'
 import { checkLiteral, hasParamDefault, isRefPath, isFunctionName } from './schema'
+import { scriptReferenceTypes, functionReferenceTypes } from './reference-types'
 
 // ---------- 校验上下文 ----------
 
@@ -54,6 +55,7 @@ export function validateScript(model: Program, ctx: ValidationContext = {}): Dia
     ...asNames,
   ])
   validateStepList(model.run, 'run', declaredVars, ctx, diags, 1)
+  diags.push(...scriptReferenceTypes(model, ctx))
   return diags
 }
 
@@ -98,6 +100,7 @@ export function validateFunctionLibrary(
     ])
     validateStepList(fn.run, `functions.${fn.name}.run`, declaredVars, { ...ctx, knownFunctions }, diags, 1)
   }
+  diags.push(...functionReferenceTypes(model, ctx))
   return diags
 }
 

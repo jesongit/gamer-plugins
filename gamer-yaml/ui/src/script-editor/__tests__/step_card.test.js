@@ -59,6 +59,28 @@ describe('StepCard：收起态摘要（V1 四类）', () => {
 })
 
 describe('StepCard：V1 交互', () => {
+  it('点击直接选择匹配结果变量，保留对象引用并支持撤销', async () => {
+    const created = setupScript('run:\n  - tap: {position: [0.5, 0.5]}\n')
+    const schema = [{ name: 'position', type: 'point', required: true, default: null }]
+    const wrapper = mount(StepCard, {
+      props: { model: created.model, stack: created.stack, step: created.model.run[0],
+        containerPath: ['run'], basePath: 'run', index: 0,
+        params: [{ name: 'recv', type: 'object', desc: '本分支匹配结果', required: false, default: null }],
+      },
+      global: { provide: { [SE_TARGET_OPTIONS]: { targets: [{ target: 'tap', group: 'plugin' }],
+        resolveParams: async () => schema, resolveParamsSync: () => schema } } },
+    })
+    await expandCard(wrapper, created.model.run[0].uuid)
+    expect(wrapper.get('.tap-target-hint').text()).toContain('自动点击命中中心')
+    await wrapper.findAll('.cell-mode button').find(b => b.text() === '引用').trigger('click')
+    expect(wrapper.get('.ref-input').element.value).toBe('recv')
+    expect(wrapper.get('datalist option').text()).toBe('本分支匹配结果')
+    expect(created.model.run[0].args.entries.position).toEqual({ ref: 'recv' })
+    created.stack.undo()
+    expect(created.model.run[0].args.entries.position).toEqual({ lit: [0.5, 0.5] })
+    wrapper.unmount()
+  })
+
   it('call 卡：函数名和同行返回值输入经命令栈生效', async () => {
     const created = setupScript('run:\n  - tap: [0.5, 0.5]\n')
     const wrapper = mount(StepCard, {

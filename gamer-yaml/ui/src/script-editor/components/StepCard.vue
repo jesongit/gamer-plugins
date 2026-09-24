@@ -142,6 +142,7 @@
           </div>
           </template>
           <span v-if="conversionNotice" class="field-hint args-conversion-notice" role="status">{{ conversionNotice }}</span>
+          <span v-if="step.fn === 'tap'" class="field-hint tap-target-hint">可直接引用匹配结果，自动点击命中中心；也支持坐标。</span>
         </div>
       </template>
 

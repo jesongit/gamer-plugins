@@ -299,6 +299,20 @@ impl NativeYamlHost {
                 .authorize(*permission)
                 .map_err(anyhow::Error::new)?;
         }
+        // tap consumes a resolved match directly; its normalized center takes
+        // precedence over the match's pixel-space bounding-box x/y.
+        let mut args = args;
+        if name == "tap" {
+            if let Some(position) = args.get_mut("position") {
+                if position.get("center").is_some() {
+                    let center = position.get("center").unwrap();
+                    if point_components(center).is_none() {
+                        bail!("点击目标的 center 必须是 0..1 范围内的中心坐标");
+                    }
+                    *position = center.clone();
+                }
+            }
+        }
         let bound = self.bind_args(&func.params, args)?;
         self.emit_event(RuntimeEventKind::Detail {
             name: "effective_args".into(),
@@ -1447,6 +1461,38 @@ log = "^1.0"
     }
 
     #[test]
+    fn tap_accepts_match_center_without_rematching_and_rejects_invalid_targets() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["input.tap"]);
+        let hit = json!({"center":{"x":0.25,"y":0.75},"x":242,"y":839,"width":217,"height":64,"template":"reward.png","score":0.97});
+        for position in [hit, json!({"x":0.25,"y":0.75}), json!([0.25, 0.75])] {
+            call("tap", json!({"position":position}), &host).unwrap();
+        }
+        let taps = trace.taps.lock().unwrap().clone();
+        assert_eq!(taps.len(), 3);
+        assert!(taps.iter().all(|point| point == &taps[0]));
+        assert_eq!(
+            stub.match_calls.load(Ordering::SeqCst),
+            0,
+            "已有匹配结果不能重新识别"
+        );
+        for position in [
+            Value::Null,
+            json!({"center":null,"x":0.25,"y":0.75}),
+            json!({"center":{"x":1.2,"y":0.5}}),
+            json!("reward.png"),
+        ] {
+            assert!(call("tap", json!({"position":position}), &host).is_err());
+        }
+        assert_eq!(
+            trace.taps.lock().unwrap().len(),
+            3,
+            "非法或空目标不能产生点击"
+        );
+    }
+
+    #[test]
     fn permission_denial_surfaces_denied_error() {
         let trace = Arc::new(Trace::default());
         let stub = VisionStub::new(FrameSize::new(1000, 1000));
@@ -2193,6 +2239,28 @@ runtime = "^1.0"
             stop,
             sink,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_tap_accepts_match_reference_and_center() {
+        let trace = Arc::new(tests::Trace::default());
+        let runtime = LazyYamlWasmtimeRuntime::new();
+        let mut program =
+            wire("run:\n  - tap: $hit\n  - tap: {position: $hit}\n  - tap: $hit.center\n");
+        program["vars"] =
+            json!({"hit":{"center":{"x":0.25,"y":0.75},"x":242,"y":839,"template":"reward.png"}});
+        runtime
+            .run(run_request(
+                program,
+                host_with_permissions(trace.clone(), &["device.read", "input.tap"]),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            ))
+            .await
+            .unwrap();
+        let taps = trace.taps.lock().unwrap();
+        assert_eq!(taps.len(), 3);
+        assert!(taps.iter().all(|point| point == &taps[0]));
     }
 
     #[tokio::test(flavor = "current_thread")]

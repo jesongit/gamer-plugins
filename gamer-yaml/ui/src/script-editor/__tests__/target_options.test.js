@@ -4,7 +4,7 @@ describe('V1 target options contract', () => {
   it('function candidates are plain names with plugin/package groups', () => {
     // V1 无 script:/function: 前缀——候选即函数名，group 标来源
     const targets = [
-      { target: 'tap', group: 'plugin', hint: '点击相对坐标（0..1；可传 match 的 center）' },
+      { target: 'tap', group: 'plugin', hint: '点击坐标或匹配结果；匹配结果自动点击中心，不重新识别' },
       { target: 'wait_find', group: 'plugin', hint: '等待模板出现；超时返回 null' },
       { target: 'login', group: 'package' },
     ]
