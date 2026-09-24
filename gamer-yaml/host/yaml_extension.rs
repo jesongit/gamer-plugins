@@ -59,9 +59,6 @@ mod manifest_sync_tests {
     }
 }
 
-const DEFAULT_SCREEN_WIDTH: u32 = 1000;
-const DEFAULT_SCREEN_HEIGHT: u32 = 1000;
-
 /// find/tap_template 轮询间隔下限（防止 0 间隔打爆设备）。
 const MIN_POLL_INTERVAL_MS: u64 = 50;
 /// 单次 sleep 上限（与 v3 一致）。
@@ -284,7 +281,7 @@ impl NativeYamlHost {
             context,
             device,
             runtime: Arc::new(crate::capabilities::adapters::RuntimeAdapter::new(stop)),
-            screen: RwLock::new(FrameSize::new(DEFAULT_SCREEN_WIDTH, DEFAULT_SCREEN_HEIGHT)),
+            screen: RwLock::new(FrameSize::new(0, 0)),
             sink,
         })
     }
@@ -402,6 +399,7 @@ impl NativeYamlHost {
     // -- handlers ----------------------------------------------------------
 
     async fn tap(&self, args: &BoundArgs) -> Result<Value> {
+        self.refresh_input_screen().await?;
         let point = self.touch_point(args.point("position")?)?;
         self.click_point(point).await?;
         Ok(Value::Null)
@@ -453,6 +451,7 @@ impl NativeYamlHost {
     }
 
     async fn swipe(&self, args: &BoundArgs) -> Result<Value> {
+        self.refresh_input_screen().await?;
         let from = self.touch_point(args.point("from")?)?;
         let to = self.touch_point(args.point("to")?)?;
         let duration = args.duration_ms("duration")?;
@@ -839,9 +838,13 @@ impl NativeYamlHost {
         if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
             bail!("point 坐标超出 0..1");
         }
+        let size = self.screen();
+        if size.width == 0 || size.height == 0 {
+            bail!("设备画面尺寸尚未就绪，无法转换点击坐标");
+        }
         Ok(TouchPoint::new(
-            (x * self.screen().width as f64).round() as u32,
-            (y * self.screen().height as f64).round() as u32,
+            (x * size.width as f64).round() as u32,
+            (y * size.height as f64).round() as u32,
             1.0,
         ))
     }
@@ -891,20 +894,41 @@ impl NativeYamlHost {
             .capture(&self.device)
             .await
             .map_err(anyhow::Error::new)?;
-        self.refresh_screen(&frame).await;
+        self.refresh_screen(&frame).await?;
         Ok(frame)
     }
 
-    /// 以最近一次截图的真实分辨率刷新坐标系（失败保持上次值）。
-    async fn refresh_screen(&self, frame: &crate::capabilities::FrameHandle) {
-        let Some(frame_service) = self.registry.frame() else {
-            return;
-        };
-        if let Ok(size) = frame_service.size(*frame).await {
-            if size.width > 0 && size.height > 0 {
-                *self.screen.write().unwrap() = size;
-            }
+    /// Each __fn call creates a host. Input must read the active coordinate
+    /// space itself, including taps before any find and rotation between calls.
+    async fn refresh_input_screen(&self) -> Result<()> {
+        let size = self
+            .registry
+            .frame()
+            .ok_or_else(|| anyhow!("frame capability 未注册"))?
+            .device_size(&self.device)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.set_screen(size)
+    }
+
+    /// Vision results use the exact captured frame's dimensions.
+    async fn refresh_screen(&self, frame: &crate::capabilities::FrameHandle) -> Result<()> {
+        let size = self
+            .registry
+            .frame()
+            .ok_or_else(|| anyhow!("frame capability 未注册"))?
+            .size(*frame)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.set_screen(size)
+    }
+
+    fn set_screen(&self, size: FrameSize) -> Result<()> {
+        if size.width == 0 || size.height == 0 {
+            bail!("设备画面尺寸尚未就绪");
         }
+        *self.screen.write().unwrap() = size;
+        Ok(())
     }
 
     fn screen(&self) -> FrameSize {
@@ -1203,6 +1227,8 @@ pub(crate) mod tests {
     /// frame+vision+resource 桩：按队列逐次返回匹配结果（缺省 NotFound）。
     pub(crate) struct VisionStub {
         pub(crate) size: FrameSize,
+        input_size: RwLock<FrameSize>,
+        pub(crate) captures: AtomicU64,
         pub(crate) outcomes: Mutex<VecDeque<MatchOutcome>>,
         pub(crate) match_calls: AtomicU64,
         frames: Mutex<Vec<FrameHandle>>,
@@ -1213,6 +1239,8 @@ pub(crate) mod tests {
         pub(crate) fn new(size: FrameSize) -> Arc<Self> {
             Arc::new(Self {
                 size,
+                input_size: RwLock::new(size),
+                captures: AtomicU64::new(0),
                 outcomes: Mutex::new(VecDeque::new()),
                 match_calls: AtomicU64::new(0),
                 frames: Mutex::new(Vec::new()),
@@ -1227,11 +1255,16 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl FrameService for VisionStub {
+        async fn device_size(&self, _device: &DeviceHandle) -> CapabilityResult<FrameSize> {
+            Ok(*self.input_size.read().unwrap())
+        }
+
         async fn latest(&self, _device: &DeviceHandle) -> CapabilityResult<Option<FrameHandle>> {
             Ok(Some(FrameHandle::new()))
         }
 
         async fn capture(&self, _device: &DeviceHandle) -> CapabilityResult<FrameHandle> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
             Ok(FrameHandle::new())
         }
 
@@ -1458,6 +1491,53 @@ log = "^1.0"
         assert!(error.to_string().contains("未知参数 nope"), "{error}");
         let error = call("tap", json!({"position": [0.5, 5.0]}), &host).unwrap_err();
         assert!(error.to_string().contains("point"), "{error}");
+    }
+
+    #[test]
+    fn input_coordinates_use_current_non_square_size_without_capture() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1920, 1080));
+        let host = vision_host(
+            trace.clone(),
+            &stub,
+            LogTrace::new(),
+            &["input.tap", "input.swipe"],
+        );
+        // call() deliberately creates a fresh host each time, as __fn does.
+        call("tap", json!({"position":{"center":{"x":350.0/1920.0,"y":871.0/1080.0},"x":242,"y":839,"width":217,"height":64}}), &host).unwrap();
+        assert_eq!(*trace.taps.lock().unwrap(), vec![[350, 871]]);
+        *stub.input_size.write().unwrap() = FrameSize::new(1080, 1920);
+        call("tap", json!([0.25, 0.75]), &host).unwrap();
+        assert_eq!(*trace.taps.lock().unwrap(), vec![[350, 871], [270, 1440]]);
+        call(
+            "swipe",
+            json!({"from":[0.25,0.75],"to":[0.5,0.5],"duration":"1ms"}),
+            &host,
+        )
+        .unwrap();
+        let swipes = trace.swipes.lock().unwrap();
+        assert_eq!(swipes[0].start().x(), 270);
+        assert_eq!(swipes[0].start().y(), 1440);
+        assert_eq!(swipes[0].end().x(), 540);
+        assert_eq!(swipes[0].end().y(), 960);
+        assert_eq!(
+            stub.captures.load(Ordering::SeqCst),
+            0,
+            "输入只读取会话尺寸，不截图或重新匹配"
+        );
+        *stub.input_size.write().unwrap() = FrameSize::new(0, 0);
+        assert!(call("tap", json!([0.5, 0.5]), &host).is_err());
+        assert!(call(
+            "swipe",
+            json!({"from":[0.25,0.75],"to":[0.5,0.5],"duration":"1ms"}),
+            &host
+        )
+        .is_err());
+        assert_eq!(
+            trace.taps.lock().unwrap().len(),
+            2,
+            "尺寸未知不能使用默认坐标点击"
+        );
     }
 
     #[test]
@@ -2021,7 +2101,7 @@ mod wasm_tests {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
-    use std::sync::OnceLock;
+    use std::sync::{atomic::Ordering, OnceLock};
     use zip::write::SimpleFileOptions;
 
     include!("acceptance_tests.rs");
@@ -2218,6 +2298,7 @@ runtime = "^1.0"
             CapabilityRegistry::builder()
                 .with_device_service(trace.clone() as Arc<dyn crate::capabilities::DeviceService>)
                 .with_input_service(trace as Arc<dyn crate::capabilities::InputService>)
+                .with_frame_service(tests::VisionStub::new(FrameSize::new(1920, 1080)))
                 .build(),
             crate::extensions::HostApiCatalog::default(),
             &manifest,
@@ -2242,13 +2323,48 @@ runtime = "^1.0"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_match_then_tap_uses_real_frame_dimensions() {
+        let trace = Arc::new(tests::Trace::default());
+        let vision = tests::VisionStub::new(FrameSize::new(1920, 1080));
+        vision.push_outcome(MatchOutcome::Found(crate::capabilities::MatchBox {
+            x: 242,
+            y: 839,
+            width: 217,
+            height: 64,
+            score: 0.97,
+        }));
+        let host = tests::vision_host(
+            trace.clone(),
+            &vision,
+            tests::LogTrace::new(),
+            &["device.read", "vision.match", "resource.read", "input.tap"],
+        );
+        let program = wire("run:\n  - match_templates:\n      cases:\n        - template: reward.png\n          as: recv\n          do:\n            - tap: $recv\n            - tap: $recv.center\n");
+        LazyYamlWasmtimeRuntime::new()
+            .run(run_request(
+                program,
+                host,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(*trace.taps.lock().unwrap(), vec![[350, 871]; 2]);
+        assert_eq!(vision.match_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            vision.captures.load(Ordering::SeqCst),
+            1,
+            "点击不应额外截图"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn real_yaml_component_tap_accepts_match_reference_and_center() {
         let trace = Arc::new(tests::Trace::default());
         let runtime = LazyYamlWasmtimeRuntime::new();
         let mut program =
             wire("run:\n  - tap: $hit\n  - tap: {position: $hit}\n  - tap: $hit.center\n");
-        program["vars"] =
-            json!({"hit":{"center":{"x":0.25,"y":0.75},"x":242,"y":839,"template":"reward.png"}});
+        program["vars"] = json!({"hit":{"center":{"x":350.0/1920.0,"y":871.0/1080.0},"x":242,"y":839,"template":"reward.png"}});
         runtime
             .run(run_request(
                 program,
@@ -2259,8 +2375,7 @@ runtime = "^1.0"
             .await
             .unwrap();
         let taps = trace.taps.lock().unwrap();
-        assert_eq!(taps.len(), 3);
-        assert!(taps.iter().all(|point| point == &taps[0]));
+        assert_eq!(*taps, vec![[350, 871]; 3]);
     }
 
     #[tokio::test(flavor = "current_thread")]
