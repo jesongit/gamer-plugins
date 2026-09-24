@@ -1,0 +1,18 @@
+{
+  "plugins": [
+    {
+      "id": "gamer-keymap",
+      "version": "0.1.0-beta.1",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.0-beta.1/gamer-keymap-0.1.0-beta.1.gplugin",
+      "size": 131745,
+      "sha256": "6b3c2c8ac98bd2b8fcfb72a2738cd5659c60398c7b92642ae6b3bfb6c219724c"
+    },
+    {
+      "id": "gamer-video",
+      "version": "0.1.0-beta.1",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.0-beta.1/gamer-video-0.1.0-beta.1.gplugin",
+      "size": 63292,
+      "sha256": "b89ad4442ae84e050b7a3fe775f6431392fd8756d3e290568c96beac748e4257"
+    }
+  ]
+}
