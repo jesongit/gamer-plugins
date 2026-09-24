@@ -25,6 +25,7 @@
 pub(crate) mod actions;
 pub(crate) mod error;
 pub(crate) mod native_funcs;
+mod reference_types;
 pub(crate) mod resources;
 pub(crate) mod run_target;
 pub(crate) mod runner_adapter;

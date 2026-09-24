@@ -63,13 +63,13 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             NativeFunction {
                 name: "tap",
                 display_name: "点击",
-                description: "点击相对坐标（0..1；可传 match 的 center）",
+                description: "点击坐标或匹配结果；匹配结果自动点击中心，不重新识别",
                 params: vec![p(
                     "position",
                     ParamType::Point,
                     true,
                     None,
-                    "目标点 [x, y] 或 {x, y}",
+                    "坐标 [x, y] / {x, y}，或匹配结果（自动取 center）",
                 )],
                 returns: RETURN_NULL,
                 permissions: &[Permission::InputTap],

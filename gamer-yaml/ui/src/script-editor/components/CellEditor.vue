@@ -26,7 +26,7 @@
         @input.stop="onRefInput(($event.target as HTMLInputElement).value)"
       />
       <datalist :id="listId">
-        <option v-for="p in params" :key="p.name" :value="p.name">{{ p.remark || p.type }}</option>
+        <option v-for="p in params" :key="p.name" :value="p.name">{{ p.remark || p.desc || p.type }}</option>
       </datalist>
     </template>
 

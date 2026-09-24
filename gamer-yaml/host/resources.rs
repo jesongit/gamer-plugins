@@ -15,8 +15,7 @@
 //! `_function` 开头且以 `.yaml` 结尾 = 函数库（[`is_function_library_path`]），
 //! 其余 `.yaml` = 自动化。旧 `functions/` 专属目录已删除，保存钩子显式拒绝。
 //!
-//! 保存边界只做**结构**校验；函数存在性/参数匹配在运行前的注册表组合期
-//! 校验（runner_adapter::compose_function_library：执行前明确提示）。
+//! 保存边界校验结构与可确定的引用类型；动态值仍由运行时绑定校验。
 //!
 //! 组合根引导期调用 [`register_resource_handlers`]；未注册时 Core 保存不做
 //! 内容校验（裸 Core 语义）。
@@ -82,10 +81,43 @@ pub(crate) fn script_entry(
 
 /// V1 脚本校验：结构解析（顶层字段、步骤形态、表达式形态）。旧 v3 源因
 /// `version` 字段/未知顶层字段直接被拒（`yaml.version.removed`）。
-fn validate_v1_script(source: &str) -> Result<(), serde_json::Value> {
-    syntax::parse_script(source)
-        .map(|_| ())
-        .map_err(|diagnostics| serde_json::to_value(diagnostics).unwrap_or_default())
+fn type_library(
+    store: &PackageStore,
+    package: &str,
+    exclude: &str,
+) -> Result<syntax::FunctionLibrary, serde_json::Value> {
+    let files = store
+        .list(package, YAML_EXTENSION_ID, "automations")
+        .map_err(
+            |error| json!([{ "code": "yaml.functions.read", "message": error.to_string() }]),
+        )?;
+    Ok(files
+        .iter()
+        .filter(|file| file.path != exclude && is_function_library_path(&file.path))
+        .filter_map(|file| syntax::parse_function_library(file.content.as_deref()?).ok())
+        .flatten()
+        .collect())
+}
+
+fn type_diagnostics(diagnostics: Vec<syntax::Diagnostic>) -> Result<(), serde_json::Value> {
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(json!(diagnostics))
+    }
+}
+
+fn validate_v1_script(
+    source: &str,
+    store: &PackageStore,
+    package: &str,
+) -> Result<(), serde_json::Value> {
+    let script = syntax::parse_script(source)
+        .map_err(|diagnostics| serde_json::to_value(diagnostics).unwrap_or_default())?;
+    type_diagnostics(super::reference_types::script(
+        &script,
+        &type_library(store, package, "")?,
+    ))
 }
 
 /// 函数库文件校验（V1 `functions:` 包装结构；保存边界与 preflight 共用）。
@@ -97,6 +129,9 @@ pub(crate) fn validate_function_library_file(
 ) -> Result<(), serde_json::Value> {
     let library = syntax::parse_function_library(content)
         .map_err(|diagnostics| serde_json::to_value(diagnostics).unwrap_or_default())?;
+    let mut all_functions = type_library(store, package, path)?;
+    all_functions.extend(library.clone());
+    type_diagnostics(super::reference_types::functions(&library, &all_functions))?;
     let names: std::collections::BTreeSet<_> =
         library.iter().map(|(name, _)| name.clone()).collect();
     let failure =
@@ -194,7 +229,7 @@ impl ResourceHandler for YamlResourceHandler {
             return if is_function_library_path(rel) {
                 validate_function_library_file(req.store, req.package, req.path, req.content)
             } else {
-                validate_v1_script(req.content)
+                validate_v1_script(req.content, req.store, req.package)
             };
         }
         if is_removed_functions_dir(req.path) {
@@ -502,6 +537,37 @@ mod rename_tests {
     /// 保存边界：V1 直存；旧 v3 源报 yaml.version.removed；automations/ 内
     /// `_function*.yaml` 按函数库（functions: 包装）校验；旧 functions/ 目录
     /// 显式拒绝。
+    #[test]
+    fn saves_check_reference_types_and_preserve_existing_content_on_error() {
+        let (store, _dir) = temp_store("reference-types");
+        let path = "automations/_function.yaml";
+        let good = "functions:\n  daily:\n    run:\n      - match_templates:\n          cases:\n            - template: reward.png\n              as: hit\n              do:\n                - tap: $hit\n";
+        let original = store
+            .write_text("com.test.app", YAML_EXTENSION_ID, path, good, None, false)
+            .unwrap();
+        let bad = good.replace("tap: $hit", "tap_template: $hit");
+        let error = store
+            .validate_save(SaveValidation {
+                package: "com.test.app",
+                plugin: YAML_EXTENSION_ID,
+                path,
+                content: &bad,
+                store: &store,
+            })
+            .unwrap_err();
+        assert_eq!(error[0]["code"], "yaml.args.ref_type");
+        assert_eq!(
+            error[0]["path"],
+            "functions.daily.run[0].cases[0].do[0].template"
+        );
+        let current = store
+            .read_text("com.test.app", YAML_EXTENSION_ID, path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.content, good);
+        assert_eq!(current.version(), original.version());
+    }
+
     #[test]
     fn saves_are_v1_only() {
         let (store, _dir) = temp_store("save");

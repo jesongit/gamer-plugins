@@ -1,0 +1,15 @@
+[
+  {"name":"时间参数的实际表示保持运行时校验", "source":"params:\n  delay: {type: duration, default: 0.5}\nrun:\n  - find: {template: a.png, threshold: $delay}\n", "errors":[]},
+  {"name":"分支匹配结果不能当模板名", "source":"run:\n  - match_templates:\n      cases:\n        - template: a.png\n          as: hit\n          do:\n            - tap_template: {template: $hit}\n", "errors":["run[0].cases[0].do[0].template"]},
+  {"name":"分支匹配结果可以直接点击", "source":"run:\n  - match_templates:\n      cases:\n        - template: a.png\n          as: hit\n          do:\n            - tap: $hit\n            - tap: {position: $hit}\n            - tap: $hit.center\n            - tap_template: $hit.template\n", "errors":[]},
+  {"name":"查找返回值与字段", "source":"run:\n  - find: a.png\n    as: hit\n  - tap: $hit\n  - tap_template: $hit\n  - tap: $hit.score\n  - log: $hit\n", "errors":["run[2].template","run[3].position"]},
+  {"name":"已声明参数类型", "source":"params:\n  count: {type: integer}\n  target: {type: template}\nrun:\n  - find: $count\n  - tap: $target\n", "errors":["run[0].template","run[1].position"]},
+  {"name":"已知变量类型", "source":"vars: {count: 2}\nrun:\n  - find: $count\n", "errors":["run[0].template"]},
+  {"name":"分支结果覆盖与恢复", "source":"params:\n  hit: {type: template}\nrun:\n  - match_templates:\n      cases:\n        - template: a.png\n          as: hit\n          do:\n            - tap: $hit\n  - find: $hit\n", "errors":[]},
+  {"name":"动态自定义返回值不猜测", "source":"run:\n  - custom: {}\n    as: hit\n  - tap: $hit\n", "errors":[]},
+  {"name":"分支改写后类型不确定", "source":"params:\n  hit: {type: template}\nrun:\n  - if: true\n    then:\n      - find: a.png\n        as: hit\n  - tap: $hit\n", "errors":[]},
+  {"name":"循环跨轮变量不误判", "source":"params:\n  hit: {type: template}\nrun:\n  - repeat: 2\n    do:\n      - tap: $hit\n      - find: a.png\n        as: hit\n", "errors":[]},
+  {"name":"模板列表元素引用", "source":"run:\n  - find: a.png\n    as: hit\n  - find_any: {templates: [$hit, $hit.template]}\n", "errors":["run[1].templates[0]"]},
+  {"name":"函数参数到原生调用", "kind":"function_library", "source":"functions:\n  f:\n    params: {count: {type: integer}}\n    run:\n      - tap_template: $count\n", "errors":["functions.f.run[0].template"]},
+  {"name":"本地函数调用参数", "kind":"function_library", "source":"functions:\n  f:\n    params: {target: {type: template}}\n    run: []\n  g:\n    run:\n      - find: a.png\n        as: hit\n      - f: $hit\n      - f: $hit.template\n", "errors":["functions.g.run[1].target"]}
+]
