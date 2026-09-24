@@ -28,7 +28,14 @@ jobs:
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: node tools/prepare-release.mjs $env:RELEASE_TAG dist
+        run: |
+          node tools/prepare-release.mjs $env:RELEASE_TAG dist
+          if ($LASTEXITCODE -ne 0) { throw 'Release catalog validation failed' }
+          $version = $env:RELEASE_TAG -replace '^gamer-(yaml|keymap|video)-v', ''
+          $bundle = "gamer-official-plugins-$version-windows-x64.zip"
+          Compress-Archive -Path dist/plugins/*.gplugin -DestinationPath "dist/$bundle"
+          $hash = (Get-FileHash "dist/$bundle" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Add-Content dist/sha256sums.txt "$hash  $bundle" -Encoding utf8
       - name: Create draft with verified packages and versioned registry
         shell: pwsh
         env:
@@ -38,6 +45,9 @@ jobs:
         run: |
           # No clobber: an existing release must be inspected before retrying.
           $assets = @(Get-ChildItem dist/plugins/*.gplugin | ForEach-Object FullName)
+          $assets += @(Get-ChildItem dist/*.zip | ForEach-Object FullName)
           $assets += @('dist/registry.json', 'dist/sha256sums.txt')
-          gh release create $env:RELEASE_TAG --verify-tag --draft --title $env:RELEASE_TAG --notes-file RELEASE_NOTES.md @assets
+          $flags = @()
+          if ($env:RELEASE_TAG -match '-v[0-9]+\.[0-9]+\.[0-9]+-') { $flags += '--prerelease' }
+          gh release create $env:RELEASE_TAG --verify-tag --draft --title $env:RELEASE_TAG --notes-file RELEASE_NOTES.md @flags @assets
           if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
