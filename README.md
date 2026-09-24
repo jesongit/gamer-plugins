@@ -26,7 +26,7 @@ UI 与 host 集成测试需显式检出 sdk/lock.json 指定的 Gamer 提交，�
 
 推送 `<plugin-id>-v<manifest-version>` tag 会先运行独立构建与固定宿主集成测试，再建立 Release 草稿；没有自动转正式发布。每次发布包含经过同一基线测试的三插件快照及版本化 registry.json，各插件版本互不绑定。所有下载地址使用不可变 tag，不覆盖已有 Release 资产。
 
-首个公开测试版为 [0.1.0-beta.1](https://github.com/jesongit/gamer-plugins/releases/tag/gamer-yaml-v0.1.0-beta.1)，三款官方插件均使用该版本；推荐搭配 [Gamer 0.2.0-beta.6](https://github.com/jesongit/gamer/releases/tag/v0.2.0-beta.6)。内部开发版本号不自动降级，已有测试安装请保留配置数据后卸载旧插件，再安装公开版本。
+本次测试版为 [自动化 0.1.0-beta.2](https://github.com/jesongit/gamer-plugins/releases/tag/gamer-yaml-v0.1.0-beta.2)，配套 [Gamer 0.2.0-beta.7](https://github.com/jesongit/gamer/releases/tag/v0.2.0-beta.7)。自动化要求宿主 input 1.1，旧本体拒绝安装；请先升级本体。键盘映射和视频工作台保持 0.1.0-beta.1。内部开发版本号不自动降级，已有测试安装请保留配置数据后卸载旧插件，再安装公开版本。
 
 Gamer 启动器首次安装使用主仓发行锁指定的插件 Release，完整离线包携带同一份归档。软件插件页已接入独立发布目录发现：beta 宿主允许预发布，稳定宿主过滤预发布；手动刷新立即检查，网络失败回退缓存和随包目录。归档经宿主同源下载并校验大小/SHA256，安装或更新仍由用户确认，不自动覆盖已安装插件。
 
