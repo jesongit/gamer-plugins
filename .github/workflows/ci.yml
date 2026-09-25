@@ -82,3 +82,9 @@ jobs:
       - run: cargo test --locked --manifest-path host/server/Cargo.toml
         env:
           GAMER_PROFILE: dev
+      - name: Verify live media output with FFmpeg on loopback
+        run: cargo test --locked --manifest-path host/server/Cargo.toml media::output::tests -- --include-ignored
+        env:
+          GAMER_PROFILE: dev
+          GAMER_LOCAL_ONLY: '1'
+          ADB_MDNS: '0'
