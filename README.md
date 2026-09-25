@@ -1,6 +1,6 @@
 # Gamer 官方插件
 
-此仓库保存 gamer-yaml、gamer-keymap、gamer-video 的 manifest、host、WASM guest、UI 和测试。
+此仓库保存 gamer-yaml、gamer-keymap、gamer-video、gamer-package-publisher 的 manifest、host、WASM guest、UI 和测试。
 源码迁自 `jesongit/gamer` 的 `689cc47b1fcaa2780fc97cd357db25f23da84ddd:plugins/`；迁移前历史保留在主仓。
 
 ## 独立构建（Windows）
@@ -24,9 +24,11 @@ UI 与 host 集成测试需显式检出 sdk/lock.json 指定的 Gamer 提交，�
 
 ## 发布
 
-推送 `<plugin-id>-v<manifest-version>` tag 会先运行独立构建与固定宿主集成测试，再建立 Release 草稿；没有自动转正式发布。每次发布包含经过同一基线测试的三插件快照及版本化 registry.json，各插件版本互不绑定。所有下载地址使用不可变 tag，不覆盖已有 Release 资产。
+推送 `<plugin-id>-v<manifest-version>` tag 会先运行独立构建与固定宿主集成测试，再建立 Release 草稿；没有自动转正式发布。每次发布包含经过同一基线测试的完整插件快照及版本化 registry.json，各插件版本互不绑定。所有下载地址使用不可变 tag，不覆盖已有 Release 资产。
 
-正式发行基线为 [官方插件 0.1.0](https://github.com/jesongit/gamer-plugins/releases/tag/gamer-yaml-v0.1.0)，配套 [Gamer 0.2.0](https://github.com/jesongit/gamer/releases/tag/v0.2.0)。自动化要求宿主 input 1.1，旧本体拒绝安装；请先升级本体。自动化、键盘映射和视频工作台均为 0.1.0。公开 beta 可按正常版本顺序升级；内部开发版本号不自动降级，已有内部测试安装请保留配置数据后卸载旧插件，再安装公开版本。验收范围与尚未完成的真机补充测试见 [发行说明](RELEASE_NOTES.md)。
+最新正式目录为 [官方插件 0.1.0（含配置包发布）](https://github.com/jesongit/gamer-plugins/releases/tag/gamer-package-publisher-v0.1.0)。四款插件均为 0.1.0；自动化、键盘映射和视频工作台复用原已公开归档字节。配置包发布插件要求 Gamer 0.2.1 的 resource 1.1 和 package.publish 能力；自动化要求 input 1.1（Gamer 0.2.0 起提供）。新能力请先升级本体。公开 beta 可正常升级，已有内部测试安装不自动降级。验收范围见 [发行说明](RELEASE_NOTES.md)。
+
+[配置包发布插件](gamer-package-publisher/README.md) 使用运行 Gamer 的电脑上的 gh 登录创建草稿并确认公开；配置订阅和下载无需 gh 登录。默认公开配置仓库为 [gamer-packages](https://github.com/jesongit/gamer-packages)，也支持用户自己的公开 GitHub 仓库。
 
 Gamer 启动器首次安装使用主仓发行锁指定的插件 Release，完整离线包携带同一份归档。软件插件页已接入独立发布目录发现：beta 宿主允许预发布，稳定宿主过滤预发布；手动刷新立即检查，网络失败回退缓存和随包目录。归档经宿主同源下载并校验大小/SHA256，安装或更新仍由用户确认，不自动覆盖已安装插件。
 
