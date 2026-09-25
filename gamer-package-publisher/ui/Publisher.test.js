@@ -32,3 +32,19 @@ it('失败保留预览和重试入口，不误报成功', async () => {
   await w.findAll('button').find(b => b.text().includes('创建 / 重试草稿')).trigger('click'); await flushPromises()
   expect(w.get('[role="alert"]').text()).toContain('上传失败'); expect(w.text()).toContain('创建 / 重试草稿'); expect(w.text()).not.toContain('配置目录已公开'); w.unmount()
 })
+
+it('确认期间切换历史任务也只发布已确认的任务', async () => {
+  const w = mount(Publisher); await prepare(w)
+  await w.findAll('button').find(b => b.text().includes('创建 / 重试草稿')).trigger('click'); await flushPromises()
+  let approve
+  mocks.confirm.mockImplementation(() => new Promise(resolve => { approve = resolve }))
+  await w.findAll('button').find(b => b.text() === '公开发布').trigger('click'); await flushPromises()
+  mocks.call.mockImplementation(async (_, action) => action === 'publisher.jobs' ? [{ ...job, id: 'other-job', repository: 'other/repo', state: 'draft' }] : { ...job, state: 'published' })
+  await w.findAll('button').find(b => b.text() === '刷新任务').trigger('click'); await flushPromises()
+  await w.findAll('button').find(b => b.text() === '打开').trigger('click'); await flushPromises()
+  expect(w.get('.preview').text()).toContain('other/repo')
+  approve(true); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-package-publisher', 'publisher.publish', { job_id: 'job' })
+  expect(mocks.call).not.toHaveBeenCalledWith('gamer-package-publisher', 'publisher.publish', { job_id: 'other-job' })
+  w.unmount()
+})

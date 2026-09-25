@@ -51,8 +51,9 @@ const prepare = () => run('准备归档', async () => { job.value = await call('
 const makeDraft = () => run('上传草稿', async () => { job.value = await call('draft', { job_id: job.value.id }) })
 async function publish() {
   if (!job.value || busy.value) return
-  if (!await confirm(`以账号 ${job.value.account} 向 ${job.value.repository} 公开这 ${job.value.catalog.packages.length} 个配置包？`, { title: '公开配置包', confirmText: '公开发布' })) return
-  await run('公开发布', async () => { job.value = await call('publish', { job_id: job.value.id }); message.value = '配置目录已公开' })
+  const target = job.value
+  if (!await confirm(`以账号 ${target.account} 向 ${target.repository} 公开这 ${target.catalog.packages.length} 个配置包？`, { title: '公开配置包', confirmText: '公开发布' })) return
+  await run('公开发布', async () => { job.value = await call('publish', { job_id: target.id }); message.value = '配置目录已公开' })
 }
 async function cancel() { try { await call('cancel'); message.value = '已请求取消，远端草稿保留，可恢复任务重试。' } catch (e) { error.value = e.message } }
 onMounted(async () => { try { packages.value = (await api.listPackages()).packages || []; await loadJobs() } catch (e) { error.value = e.message } })
