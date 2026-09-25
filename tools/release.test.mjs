@@ -41,3 +41,12 @@ test('publisher tag accepts its packaged builtin catalog', () => {
   writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
   assert.equal(spawnSync(process.execPath, [script, 'gamer-package-publisher-v1.2.3', root]).status, 0)
 })
+
+test('live plugin tag accepts its packaged builtin catalog', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  registry.plugins[0].id = 'gamer-live'
+  writeFileSync(resolve(root, 'plugins/gamer-live-1.2.3.gplugin'), readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin')))
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-live-v1.2.3', root]).status, 0)
+})
