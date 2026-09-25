@@ -31,3 +31,13 @@ test('changed artifact is rejected before publishing the catalog', () => {
   assert.notEqual(spawnSync(process.execPath, [script, 'gamer-yaml-v1.2.3', root]).status, 0)
   assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
 })
+
+
+test('publisher tag accepts its packaged builtin catalog', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  registry.plugins[0].id = 'gamer-package-publisher'
+  writeFileSync(resolve(root, 'plugins/gamer-package-publisher-1.2.3.gplugin'), readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin')))
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-package-publisher-v1.2.3', root]).status, 0)
+})
