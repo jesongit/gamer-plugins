@@ -22,7 +22,7 @@ function Entry-Hashes([string]$Path) {
     } finally { $zip.Dispose() }
 }
 foreach ($p in $lock.plugins) {
-    if ($p.id -notmatch '^gamer-(keymap|video)$' -or $p.version -notmatch '^[0-9A-Za-z.-]+$') { throw 'Invalid reuse identity' }
+    if ($p.id -notmatch '^gamer-(yaml|keymap|video)$' -or $p.version -notmatch '^[0-9A-Za-z.-]+$') { throw 'Invalid reuse identity' }
     $name = "$($p.id)-$($p.version).gplugin"
     if ($p.download_url -notmatch '^https://github.com/jesongit/gamer-plugins/releases/download/[^/]+/[^/]+$' -or -not $p.download_url.EndsWith("/$name")) { throw 'Invalid reuse URL' }
     $entry = @($registry.plugins | Where-Object { $_.id -eq $p.id -and $_.version -eq $p.version })

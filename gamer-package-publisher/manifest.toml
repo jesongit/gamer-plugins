@@ -1,0 +1,28 @@
+manifest_version = 2
+id = "gamer-package-publisher"
+version = "0.1.0"
+name = "配置包发布"
+description = "使用本机 GitHub CLI 将配置包发布到自己的公开仓库"
+permissions = ["ui.host", "package.publish"]
+
+[host_api]
+ui = "^1.0"
+resource = "^1.1"
+
+[targets.android]
+packages = ["*"]
+
+[execution]
+kind = "builtin"
+builtin_id = "gamer-package-publisher"
+host_version = ">=0.2.1"
+
+[[ui.contributions]]
+panel_id = "publisher"
+title = "配置包发布"
+order = 40
+location = "console.right"
+runtime = "core"
+entry = "ui/plugin.js"
+requires_device = false
+component = "PackagePublisher"

@@ -32,7 +32,7 @@ jobs:
           ./tools/reuse-published.ps1 -OutputDir dist
           node tools/prepare-release.mjs $env:RELEASE_TAG dist
           if ($LASTEXITCODE -ne 0) { throw 'Release catalog validation failed' }
-          $version = $env:RELEASE_TAG -replace '^gamer-(yaml|keymap|video)-v', ''
+          $version = $env:RELEASE_TAG -replace '^gamer-(yaml|keymap|video|package-publisher)-v', ''
           $bundle = "gamer-official-plugins-$version-windows-x64.zip"
           Compress-Archive -Path dist/plugins/*.gplugin -DestinationPath "dist/$bundle"
           $hash = (Get-FileHash "dist/$bundle" -Algorithm SHA256).Hash.ToLowerInvariant()
