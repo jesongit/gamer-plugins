@@ -76,6 +76,9 @@ jobs:
       - run: pnpm --dir host/web install --frozen-lockfile
       - run: pnpm --dir host/web test:run
       - run: pnpm --dir host/web build
+      - name: Fetch pinned release fixtures for market integration tests
+        shell: pwsh
+        run: ./host/release/packaging/fetch-plugins.ps1 -TestFixturesOnly
       - run: cargo test --locked --manifest-path host/server/Cargo.toml
         env:
           GAMER_PROFILE: dev
