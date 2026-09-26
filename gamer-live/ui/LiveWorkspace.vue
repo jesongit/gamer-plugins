@@ -68,7 +68,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
     <div class="live-content">
       <p v-if="error" role="alert" class="error">{{ error }}</p>
       <section v-show="activeTab === 'output'" id="live-output" aria-label="音视频输出">
-        <div class="heading"><h3>音视频输出</h3><span>{{ states[status.stream?.state] || '未输出' }}</span></div>
+        <p class="connection-status" role="status">{{ states[status.stream?.state] || '未输出' }}</p>
         <p class="hint">设备画面与游戏声音交给直播姬，麦克风和开播在直播姬中设置。</p>
         <form @submit.prevent="startOutput">
           <fieldset :disabled="busy || streamActive">
@@ -92,7 +92,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
       </section>
       <div v-show="activeTab === 'interaction'" id="live-interaction" class="interaction-content">
         <section>
-          <div class="heading"><h3>B 站直播互动</h3><span>{{ states[status.connection.state] || '未连接' }}</span></div>
+          <p class="connection-status" role="status">{{ states[status.connection.state] || '未连接' }}</p>
           <p class="hint">接收弹幕、礼物、点赞等已获授权的事件。开发者账号还需申请对应直播权限；两种接入方式的凭据不能混用。</p>
           <form @submit.prevent="connect" autocomplete="off">
             <fieldset :disabled="busy || connected">
@@ -129,5 +129,6 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
 .live-content{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:16px;padding:8px;scrollbar-gutter:stable}
 .live-content>*{box-sizing:border-box;flex-shrink:0;width:100%;max-width:820px;margin-inline:auto}
 .interaction-content{display:grid;gap:16px}
+.connection-status{font-size:12px;color:#77cbb4}
 h3,p{margin:0}section{display:grid;gap:12px}.hint{font-size:12px;opacity:.7;line-height:1.7}section{border:1px solid var(--border,#41444c);border-radius:10px;padding:16px;min-width:0}.heading,.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.heading span{font-size:12px;color:#77cbb4}.row>label{flex:1;min-width:0}fieldset{border:0;padding:0;margin:0;min-width:0;display:grid;gap:12px}label{display:grid;gap:6px;font-size:13px}input,select{box-sizing:border-box;width:100%;min-width:0;padding:8px;border:1px solid var(--border,#535762);border-radius:5px;background:var(--bg-1,#24262c);color:inherit}button{padding:7px 12px;border-radius:5px;border:1px solid var(--border,#535762);background:var(--bg-2,#292d35);color:inherit;cursor:pointer;justify-self:start}button:disabled,fieldset:disabled{opacity:.55}form,.source{display:grid;gap:12px}.check{display:flex;align-items:center}.check input{width:auto}.error{color:#f19494;font-size:13px;overflow-wrap:anywhere}ol{padding:0;margin:0;list-style:none;max-height:320px;overflow:auto}li{display:flex;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border,#41444c);font-size:12px;overflow-wrap:anywhere}time{opacity:.55}li b{color:#77cbb4}
 </style>
