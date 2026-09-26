@@ -20,6 +20,7 @@ it('本机输出由显式提交启动，带设备与音频设置', async () => {
 })
 it('切换 OAuth 后不发送残留身份码，成功提交后清除秘密字段', async () => {
   const w = mount(LiveWorkspace); await flushPromises()
+  await w.get('[aria-controls="live-interaction"]').trigger('click')
   await w.get('[aria-label="主播身份码"]').setValue('old-code')
   await w.get('[aria-label="应用 ID"]').setValue('123')
   await w.get('[aria-label="接入方式"]').setValue('oauth')
@@ -34,6 +35,7 @@ it('切换 OAuth 后不发送残留身份码，成功提交后清除秘密字段
 })
 it('错误不显示成已连接，秘密可在修正后重试', async () => {
   const w = mount(LiveWorkspace); await flushPromises()
+  await w.get('[aria-controls="live-interaction"]').trigger('click')
   mocks.call.mockRejectedValueOnce(new Error('权限不足'))
   await w.findAll('form')[1].trigger('submit'); await flushPromises()
   expect(w.get('[role="alert"]').text()).toContain('权限不足')
