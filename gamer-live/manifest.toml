@@ -1,22 +1,28 @@
 manifest_version = 2
 id = "gamer-live"
-version = "0.1.0"
+version = "0.2.1"
 name = "直播助手"
 description = "向直播姬提供设备音视频素材，接收 B 站直播互动；支持手动 RTMP 输出"
-permissions = ["ui.host", "media.stream", "live.connect"]
+permissions = ["ui.host", "media.stream", "live.connect", "resource.read", "run.submit", "run.control"]
 
 [host_api]
 ui = "^1.0"
 media = "^1.0"
 runtime = "^1.0"
+resource = "^1.0"
+run = "^1.0"
 
 [targets.android]
 packages = ["*"]
 
+[[dependencies]]
+id = "gamer-yaml"
+required = false
+
 [execution]
 kind = "builtin"
 builtin_id = "gamer-live"
-host_version = ">=0.2.1"
+host_version = ">=0.2.2"
 
 [[ui.contributions]]
 panel_id = "live"

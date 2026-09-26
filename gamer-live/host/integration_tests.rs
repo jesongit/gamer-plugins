@@ -31,7 +31,9 @@ fn archive(permissions: bool) -> Vec<u8> {
     let manifest = if permissions {
         manifest.to_owned()
     } else {
-        manifest.replace("\"media.stream\", \"live.connect\"", "\"live.connect\"")
+        manifest
+            .replace("\"media.stream\", \"live.connect\"", "\"live.connect\"")
+            .replace(", \"run.submit\", \"run.control\"", "")
     };
     let mut out = std::io::Cursor::new(Vec::new());
     {
@@ -64,6 +66,13 @@ async fn calls_require_running_and_permissions_and_disable_drains_jobs() {
         .call_extension(&id, "stream.start", json!({}))
         .await
         .is_err());
+    assert_eq!(jobs.calls.load(Ordering::SeqCst), 0);
+    for action in ["queue.configure", "queue.test", "queue.control"] {
+        assert!(service
+            .call_extension(&id, action, json!({}))
+            .await
+            .is_err());
+    }
     assert_eq!(jobs.calls.load(Ordering::SeqCst), 0);
     service
         .call_extension(&id, "events.read", json!({}))

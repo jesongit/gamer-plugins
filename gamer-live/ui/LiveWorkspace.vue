@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { api } from '../../../web/src/api'
+import InteractionPanel from './InteractionPanel.vue'
 
 const devices = ref([]), status = ref({ stream: null, connection: {} }), events = ref([])
 const error = ref(''), busy = ref(false), gap = ref(false), copied = ref(false)
@@ -106,13 +107,15 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
             <button v-if="connected" type="button" :disabled="busy" @click="act('connection.disconnect')">断开互动</button>
           </form>
           <p class="hint">凭据仅保存在本次服务进程内，不写入配置包。断开后重新连接需再次输入；每位使用者填写自己的凭据。OAuth 模式需自行取得并更新 Token。</p>
+          <p class="hint">断开互动只停止接收消息，已排队操作继续执行。要同时停下游戏操作，请使用「停止互动执行」。</p>
           <p v-if="status.connection.error" class="error">{{ status.connection.error }}</p>
         </section>
+        <InteractionPanel :devices="devices" />
         <section>
           <div class="heading"><h3>最近互动</h3><button @click="events = []; gap = false">清空显示</button></div>
           <p v-if="gap" class="hint">连接期间有部分旧事件超出缓存，只显示仍保留的记录。</p>
-          <p v-if="!events.length" class="hint">等待直播间事件。当前面板只查看消息，不会触发游戏操作。</p>
-          <ol><li v-for="event in [...events].reverse()" :key="event.seq"><time>{{ new Date(event.received_at).toLocaleTimeString() }}</time><b>{{ kinds[event.kind] || event.kind }}</b><span>{{ event.actor?.name || '匿名观众' }}</span><span>{{ event.payload.text || event.payload.gift_name || '' }}{{ event.payload.count != null ? ` × ${event.payload.count}` : '' }}</span></li></ol>
+          <p v-if="!events.length" class="hint">等待直播间事件。配置并启用互动规则后，新消息可进入执行队列。</p>
+          <ol><li v-for="event in [...events].reverse()" :key="event.seq"><time>{{ new Date(event.received_at).toLocaleTimeString() }}</time><b>{{ kinds[event.kind] || event.kind }}</b><span>{{ event.actor?.name || '匿名观众' }}</span><span>{{ event.payload.text || event.payload.gift_name || '' }}{{ event.payload.count != null ? ` × ${event.payload.count}` : '' }}</span><span v-if="event.kind === 'gift'">礼物 ID：{{ event.payload.gift_id }}</span></li></ol>
         </section>
       </div>
       <p class="hint">关闭此面板不会停止连接；停用插件或退出 Gamer 会停止全部输出和互动。</p>

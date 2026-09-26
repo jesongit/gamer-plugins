@@ -1,6 +1,9 @@
 //! Live workspace: platform sessions belong here; media transport belongs to Core.
 mod bilibili;
 mod events;
+mod queue;
+mod rules;
+pub mod runtime;
 use crate::{
     device::DeviceManager,
     extensions::{service::BuiltinService, ExtensionError, ExtensionResult, Permission},
@@ -24,6 +27,13 @@ pub const ACTIONS: &[&str] = &[
     "connection.connect",
     "connection.disconnect",
     "events.read",
+    "rules.read",
+    "rules.save",
+    "rules.preview",
+    "queue.status",
+    "queue.configure",
+    "queue.control",
+    "queue.test",
 ];
 pub fn accepts(id: &str, action: &str) -> bool {
     id == ID && ACTIONS.contains(&action)
@@ -33,6 +43,10 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         return None;
     }
     Some(match action {
+        "rules.save" => &[Permission::UiHost],
+        "rules.read" | "rules.preview" => &[Permission::ResourceRead],
+        "queue.configure" | "queue.test" => &[Permission::RunSubmit],
+        "queue.control" => &[Permission::RunSubmit, Permission::RunControl],
         "stream.start" | "stream.stop" => &[Permission::MediaStream],
         "connection.connect" | "connection.disconnect" | "events.read" => {
             &[Permission::LiveConnect]
@@ -90,19 +104,98 @@ pub struct LiveService {
     connection: AsyncMutex<Option<Connection>>,
     status: Arc<Mutex<ConnectionStatus>>,
     events: Arc<Mutex<events::EventBuffer>>,
+    queue: Option<Arc<queue::Queue>>,
+    queue_error: Option<String>,
 }
 impl LiveService {
-    pub fn new(devices: Arc<DeviceManager>) -> Self {
-        Self {
+    pub fn new(runtime: runtime::Runtime, data_root: &std::path::Path) -> Result<Self> {
+        let devices = runtime.devices.clone();
+        let queue = queue::Queue::open(
+            data_root.join("extension-data/gamer-live/queue.json"),
+            Arc::new(runtime),
+        );
+        let (queue, queue_error) = match queue {
+            Ok(queue) => (Some(queue), None),
+            Err(error) => (None, Some(format!("互动队列不可用：{error:#}"))),
+        };
+        Ok(Self {
             devices,
             output: AsyncMutex::new(None),
             connection: AsyncMutex::new(None),
             status: Arc::new(Mutex::new(ConnectionStatus::default())),
             events: Arc::new(Mutex::new(events::EventBuffer::default())),
-        }
+            queue,
+            queue_error,
+        })
+    }
+    fn queue(&self) -> Result<&Arc<queue::Queue>> {
+        self.queue.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(self
+                .queue_error
+                .clone()
+                .unwrap_or_else(|| "互动队列不可用".into()))
+        })
     }
     async fn dispatch(&self, action: &str, values: Value) -> Result<Value> {
         match action {
+            "queue.status" => Ok(self
+                .queue()?
+                .status(
+                    values["offset"].as_u64().unwrap_or(0).min(10000) as usize,
+                    values["filter"].as_str().unwrap_or(""),
+                )
+                .await),
+            "queue.configure" => {
+                self.queue()?
+                    .configure(
+                        values["device_id"].as_str().unwrap_or(""),
+                        values["package_id"].as_str().unwrap_or(""),
+                    )
+                    .await?;
+                Ok(json!({"ok":true}))
+            }
+            "queue.control" => {
+                let ids: Vec<String> =
+                    serde_json::from_value(values.get("ids").cloned().unwrap_or(json!([])))?;
+                self.queue()?
+                    .control(
+                        values["op"].as_str().unwrap_or(""),
+                        &ids,
+                        values["request_id"].as_str().unwrap_or(""),
+                    )
+                    .await
+            }
+            "rules.read" => self
+                .queue()?
+                .read_rules(values["package_id"].as_str().unwrap_or("")),
+            "rules.save" => self.queue()?.save_rules(
+                values["package_id"].as_str().unwrap_or(""),
+                serde_json::from_value(values["ruleset"].clone())?,
+                values["expected_version"].as_str(),
+            ),
+            "rules.preview" | "queue.test" => {
+                let event = events::LiveEvent {
+                    schema_version: 1,
+                    seq: 0,
+                    platform_id: "test".into(),
+                    connection_id: "test".into(),
+                    room_id: "test".into(),
+                    event_id: None,
+                    kind: values["kind"].as_str().unwrap_or("message").into(),
+                    occurred_at: None,
+                    received_at: chrono::Utc::now().to_rfc3339(),
+                    actor: Some(json!({"id":"test","name":"模拟观众"})),
+                    payload: values["payload"].clone(),
+                    platform_data: Value::Null,
+                };
+                self.queue()?
+                    .preview(
+                        event,
+                        action == "queue.test",
+                        values["request_id"].as_str().unwrap_or(""),
+                    )
+                    .await
+            }
             "live.status" => {
                 let output = self.output.lock().await;
                 Ok(
@@ -141,6 +234,9 @@ impl LiveService {
                 let request: Request = serde_json::from_value(values)?;
                 ensure!(request.platform_id == "bilibili", "暂不支持此直播平台");
                 request.credentials.validate()?;
+                if let Some(queue) = &self.queue {
+                    queue.new_connection().await?;
+                }
                 let mut slot = self.connection.lock().await;
                 ensure!(
                     slot.as_ref().is_none_or(|h| h.task.is_finished()),
@@ -159,6 +255,7 @@ impl LiveService {
                     request.credentials,
                     self.status.clone(),
                     self.events.clone(),
+                    self.queue.clone(),
                     rx,
                 ));
                 *slot = Some(Connection { stop, task });
@@ -196,6 +293,20 @@ impl BuiltinService for LiveService {
             .map_err(|e| ExtensionError::CallRejected(e.to_string()))
     }
     async fn stop(&self) {
+        if let Some(queue) = &self.queue {
+            queue.suspend(true).await;
+        }
+        self.stop_connections().await;
+    }
+    async fn shutdown(&self) {
+        if let Some(queue) = &self.queue {
+            queue.suspend(false).await;
+        }
+        self.stop_connections().await;
+    }
+}
+impl LiveService {
+    async fn stop_connections(&self) {
         // Stop both independently; neither output nor account secrets survive disable.
         tokio::join!(
             async {

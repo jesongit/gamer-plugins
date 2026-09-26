@@ -54,6 +54,43 @@ impl StoreEntrypointDescriber {
 }
 
 impl crate::scheduler::EntrypointDescriber for StoreEntrypointDescriber {
+    fn bind_args(
+        &self,
+        entrypoint: &str,
+        args: &serde_json::Map<String, Value>,
+    ) -> Result<serde_json::Map<String, Value>, crate::scheduler::EntrypointDescribeError> {
+        use crate::scheduler::EntrypointDescribeError as E;
+        let invalid = |message: String| E::Invalid {
+            diagnostics: serde_json::json!([{"message":message}]),
+        };
+        let params = if let Some((pkg, name)) = entrypoint.rsplit_once('#') {
+            let library =
+                compose_function_library(&self.scripts, pkg).map_err(|e| invalid(e.to_string()))?;
+            let (_, def) = library
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or_else(|| E::NotFound {
+                    resource: entrypoint.into(),
+                })?;
+            def.call_params(name)
+        } else {
+            let entry = script_entry(&self.scripts, entrypoint)
+                .map_err(|e| invalid(e.to_string()))?
+                .ok_or_else(|| E::NotFound {
+                    resource: entrypoint.into(),
+                })?;
+            parse_script(&entry.content)
+                .map_err(|d| E::Invalid {
+                    diagnostics: serde_json::to_value(d).unwrap_or_default(),
+                })?
+                .params
+        };
+        crate::extensions::gamer_yaml::task_params::bind_entry_args(entrypoint, &params, args, true)
+            .map(|b| b.resolved)
+            .map_err(|d| E::Invalid {
+                diagnostics: serde_json::to_value(d).unwrap_or_default(),
+            })
+    }
     fn describe(
         &self,
         entrypoint: &str,
@@ -232,6 +269,51 @@ mod tests {
             }
             other => panic!("期望 Invalid，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn binds_function_and_script_using_authoritative_v1_types() {
+        use crate::scheduler::EntrypointDescriber;
+        use serde_json::{json, Map};
+        let (cfg, _dir) = store_dir("bind");
+        write(&cfg, "automations", "_function.yaml", "functions:\n  claim:\n    params:\n      count:\n        type: integer\n        default: 3\n    run:\n      - log: hi\n");
+        write(
+            &cfg,
+            "automations",
+            "daily.yaml",
+            "params:\n  who:\n    type: string\n    required: true\nrun:\n  - log: hi\n",
+        );
+        let describer = StoreEntrypointDescriber::new(Arc::new(PackageStore::open(&cfg).unwrap()));
+        assert_eq!(
+            describer
+                .bind_args("com.test.app#claim", &Map::new())
+                .unwrap()["count"],
+            3
+        );
+        assert!(describer
+            .bind_args(
+                "com.test.app#claim",
+                json!({"count":"3"}).as_object().unwrap()
+            )
+            .is_err());
+        assert!(describer
+            .bind_args(
+                "com.test.app#claim",
+                json!({"unknown":1}).as_object().unwrap()
+            )
+            .is_err());
+        assert!(describer
+            .bind_args("com.test.app/daily.yaml", &Map::new())
+            .is_err());
+        assert_eq!(
+            describer
+                .bind_args(
+                    "com.test.app/daily.yaml",
+                    json!({"who":"viewer"}).as_object().unwrap()
+                )
+                .unwrap()["who"],
+            "viewer"
+        );
     }
 
     #[test]

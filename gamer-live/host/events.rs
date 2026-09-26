@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct LiveEvent {
     pub schema_version: u8,
     pub seq: u64,
@@ -43,10 +43,10 @@ fn scalar(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 impl EventBuffer {
-    pub fn push(&mut self, connection: &str, raw: Value) {
+    pub fn push(&mut self, connection: &str, raw: Value) -> Option<LiveEvent> {
         // Bound retained raw payloads as well as event count.
         if raw.to_string().len() > 64 * 1024 {
-            return;
+            return None;
         }
         let cmd = raw["cmd"].as_str().unwrap_or("unknown");
         let kind = match cmd
@@ -82,7 +82,7 @@ impl EventBuffer {
         if let Some(id) = &id {
             let key = format!("{connection}:{room}:{cmd}:{id}");
             if !self.ids.insert(key.clone()) {
-                return;
+                return None;
             }
             self.order.push_back(key);
             while self.order.len() > 2048 {
@@ -110,10 +110,11 @@ impl EventBuffer {
             platform_data: raw,
         };
         self.next += 1;
-        self.events.push_back(event);
+        self.events.push_back(event.clone());
         while self.events.len() > 500 {
             self.events.pop_front();
         }
+        Some(event)
     }
     pub fn page(&self, after: u64) -> Value {
         let oldest = self.events.front().map_or(self.next, |e| e.seq);

@@ -1,6 +1,6 @@
 # 直播助手
 
-提供设备音视频输出和直播互动接入，不包含互动玩法或自动游戏操作。
+提供设备音视频输出、直播互动接入，以及弹幕／礼物触发函数或自动化的串行队列。互动执行需要 Gamer 0.2.2+ 和已启用的 gamer-yaml；插件版本 0.2.1。
 
 ## 配合直播姬
 
@@ -28,6 +28,32 @@
 
 连接具有 API 心跳、WebSocket 心跳、授权超时、断线退避重试和可见错误。OpenLive 主动断开调用结束接口；OAuth 断开关闭长连并停止心跳，由平台回收会话。平台下发哪些消息取决于权限、直播状态和事件实际发生情况。
 
+## 互动规则与执行队列
+
+在「直播互动」绑定设备和配置包，先为设备选择 Android 应用。添加常用示例后选择配置包中已有的函数或自动化，填写参数并保存。6 个示例默认停用，不内置游戏坐标：弹幕跳跃、放技能、换角色、开始挑战，以及礼物放技能、触发挑战。
+
+规则支持弹幕等于／包含、礼物 ID 与最低数量。参数可取固定值、入口默认值或事件字段；礼物 ID／观众 ID 为字符串，礼物数量为整数。按列表顺序只处理首条命中的启用规则，冷却从成功入队开始；冷却或参数错误不会绕到下一条规则。普通弹幕触发，镜像弹幕只展示。
+
+先用「仅预览匹配」检查参数；「加入队列测试」会生成标记为模拟测试的真实队列项。初始队列暂停，点击「继续队列」后执行。测试正常后开启「启用新触发」，只处理之后收到的消息。队列明确绑定目标，切换页面不会改派。
+
+每条礼物消息只入队一次，数量作为参数，不展开成多个运行。适配沿用官方 `SEND_GIFT.gift_num` 字段，不推测连送累计差值。当前有官方格式契约测试，真实账号连送仍需实际样本验证；使用前先对照最近消息和预览结果。依据：[官方 SendGift 定义](https://raw.githubusercontent.com/bilibili-openplatform/OpenLive_CSharpDemo/main/OpenBLive/Runtime/Data/SendGift.cs)。
+
+| 操作 | 效果 |
+|---|---|
+| 停用新触发 | 不接受后续直播事件；已入队项继续 |
+| 暂停队列 | 不启动下一项；当前项继续，新事件仍可入队 |
+| 移除／清空等待项 | 只处理尚未启动的项，保留移除结果 |
+| 取消当前运行 | 请求取消；等运行真正终止后才推进 |
+| 停止互动执行 | 停用触发、暂停、清空等待项并请求取消当前互动运行 |
+| 解除目标绑定 | 仅在触发关闭且当前／等待项均已处理后允许 |
+| 重新执行 | 失败、取消或已核对项生成新项，排在队尾；不能改派其他目标 |
+
+函数和自动化共用一条 FIFO，等待设备上的手动／定时运行结束，提交仍经过 Core 设备互斥。单项失败记录后继续；设备或公共依赖不可用暂停队列，修复后手动继续。可设单项超时（默认关闭），超时只请求取消，不强行启动后项。关闭页面不停止队列；断开直播只停收消息；停用插件清空等待并取消当前互动；正常服务退出保留等待项。
+
+规则写入 `packages/<pkg>/plugins/gamer-live/interaction/rules.json`，资源版本冲突拒绝覆盖。队列写入本机 `extension-data/gamer-live/queue.json`，不随配置包导出、不含凭据。重启后触发关闭、队列暂停；未确认的运行进入「结果待核对」，不得自动重跑。用户查阅日志核对后结束该项，再决定是否重新入队。
+
+等待最多 100 项，满时拒绝新项并记录原因。历史／触发记录保留最多 7 天、各 10000 条，队列文件上限 16 MiB 时提前清理旧记录；等待和待核对项不自动过期。稳定事件 ID 在同一会话内去重（最多 7 天、20000 个），手动测试／重试请求 ID 在对应队列记录保留期间幂等。无事件 ID 不按相同正文合并，也不能识别平台重复投递。源码不做快照，队列固定入口、参数和目标，执行时使用当时保存的函数内容并重新校验。
+
 ## 动作与扩展边界
 
 统一通过 `POST /api/extensions/gamer-live/call` 调用，插件必须处于 Running，能力清单来自 `/api/extensions/gamer-live/capabilities`。
@@ -40,8 +66,15 @@
 | `connection.connect` | `{platform_id:"bilibili", credentials:{mode,access_key,access_secret,app_id?,identity_code?,access_token?}}` | `live.connect` |
 | `connection.disconnect` | `{}` | `live.connect` |
 | `events.read` | `{after:0}`，后续传上次 `next_seq` | `live.connect` |
+| `rules.read` | `{package_id}` → `{schema_version,rules,version}` | `resource.read` |
+| `rules.save` | `{package_id,expected_version,ruleset:{schema_version:1,rules}}` | `ui.host` |
+| `rules.preview` | `{kind:"message"或"gift",payload:{text?,gift_id?,count?}}` | `resource.read` |
+| `queue.status` | `{offset?:0,filter?:"failed"}`，历史每页 30 项 | 无额外权限 |
+| `queue.configure` | `{device_id,package_id}` | `run.submit` |
+| `queue.test` | 同 preview，另需唯一 `request_id` | `run.submit` |
+| `queue.control` | `{op,ids?:[],request_id?}`；op 为 enable/disable/resume/pause/remove/clear/cancel/stop/resolve/retry/unbind；retry 需 request_id | `run.submit` + `run.control` |
 
-事件协议 v1：`schema_version, seq, platform_id, connection_id, room_id, event_id, kind, occurred_at, received_at, actor, payload, platform_data`。统一种类含弹幕、礼物、醒目留言、舰长、点赞、进入和房间状态；原始平台字段保留在 `platform_data`。未知种类返回 `platform.event`，缺失身份返回 null，不猜测 UID；不把礼物价格当作收益。事件读取是有界的进程内观察缓存，不是可靠任务队列：最近 500 条，每次最多 100 条，单事件上限 64 KiB，同连接消息 ID 去重；落后于缓存时 `gap=true`。不保存消息历史、不发送弹幕、不解释玩法。
+事件协议 v1：`schema_version, seq, platform_id, connection_id, room_id, event_id, kind, occurred_at, received_at, actor, payload, platform_data`。统一种类含弹幕、礼物、醒目留言、舰长、点赞、进入和房间状态；原始平台字段保留在 `platform_data`。未知种类返回 `platform.event`，缺失身份返回 null，不猜测 UID；不把礼物价格当作收益。事件读取是有界的进程内观察缓存，不是可靠任务队列：最近 500 条，每次最多 100 条，单事件上限 64 KiB，同连接消息 ID 去重；落后于缓存时 `gap=true`。此观察缓存不保存完整消息历史、不发送弹幕；触发摘要与运行队列按上文单独保存。
 
 平台适配位于 `host/bilibili.rs`，事件归一化位于 `host/events.rs`，插件生命周期与状态位于 `host/mod.rs`；通用音视频输出归 Core `media/output.rs`。后续平台扩展增加平台适配与字段映射，沿用同一输出机制和事件信封，无须将平台接口写入 Core。本插件是 builtin，变更 `host/` 或 Core 必须随新版 Gamer 发布；`.gplugin` 只包含 manifest 和 UI。
 
