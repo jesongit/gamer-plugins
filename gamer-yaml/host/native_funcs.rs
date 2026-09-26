@@ -97,7 +97,13 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 display_name: "按键",
                 description: "发送按键（HOME/BACK/…或数字 keycode）",
                 params: vec![
-                    p("key", ParamType::Key, true, None, "按键名或 keycode"),
+                    p(
+                        "key",
+                        ParamType::Key,
+                        true,
+                        None,
+                        "按键名（浏览器支持字母/方向键等）或 Android keycode",
+                    ),
                     p(
                         "action",
                         ParamType::String,
