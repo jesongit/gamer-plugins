@@ -341,6 +341,8 @@ impl Guest for KeymapGuest {
                 actions: Vec::new(),
             });
         }
+        let mut mapped = matches!(event.kind, EventKind::KeyDown | EventKind::KeyUp)
+            && BUILTIN_KEYS.contains(&event.code.as_deref().unwrap_or_default());
         let actions = match event.kind {
             EventKind::KeyDown | EventKind::KeyUp => {
                 let selector = event.code.as_deref().unwrap_or_default();
@@ -348,8 +350,14 @@ impl Guest for KeymapGuest {
                 let repeat = press && event.repeat;
                 match profile_action(&mut guest_state, selector, press) {
                     // profile 覆盖：绑定过的按键一律消费（重复按下仅消费）。
-                    Some(actions) if !repeat => actions,
-                    Some(_) => Vec::new(),
+                    Some(actions) if !repeat => {
+                        mapped = true;
+                        actions
+                    }
+                    Some(_) => {
+                        mapped = true;
+                        Vec::new()
+                    }
                     None if repeat => Vec::new(),
                     // 内置默认规则 + 未映射按键 pass-through。
                     None => builtin_actions(&event),
@@ -360,8 +368,8 @@ impl Guest for KeymapGuest {
             // 否则任意点击都会被改写到错误位置，拖动也会跳到屏幕中心。
             EventKind::MouseDown | EventKind::MouseMove | EventKind::MouseUp => Vec::new(),
             EventKind::GamepadButton if event.index == 0 => {
-                vec![DeviceAction::Key(KeyAction {
-                    code: 62,
+                vec![DeviceAction::NamedKey(NamedKeyAction {
+                    name: "Space".into(),
                     action: if event.pressed { "down" } else { "up" }.to_string(),
                 })]
             }
@@ -396,7 +404,7 @@ impl Guest for KeymapGuest {
             _ => Vec::new(),
         };
         Ok(InputResult {
-            consume: !actions.is_empty(),
+            consume: mapped || !actions.is_empty(),
             actions,
         })
     }

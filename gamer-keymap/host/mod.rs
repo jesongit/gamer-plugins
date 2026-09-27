@@ -2151,6 +2151,30 @@ mod wasm_component_tests {
             .dispatch_keymap_input(device(), screen, InputEvent::key_up("KeyW"), None)
             .await
             .unwrap();
+        // A repeated mapped key remains consumed even without a new device action.
+        service
+            .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyW"), None)
+            .await
+            .unwrap();
+        let repeated = service
+            .dispatch_keymap_input(
+                device(),
+                screen,
+                InputEvent::KeyDown {
+                    code: "KeyW".into(),
+                    repeat: true,
+                    meta: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(repeated.consume);
+        assert!(repeated.actions.is_empty());
+        service
+            .dispatch_keymap_input(device(), screen, InputEvent::key_up("KeyW"), None)
+            .await
+            .unwrap();
         // KeyQ raw_key Enter(66)：down/up 配对。
         service
             .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyQ"), None)
@@ -2165,6 +2189,21 @@ mod wasm_component_tests {
             .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyA"), None)
             .await
             .unwrap();
+        let builtin_repeat = service
+            .dispatch_keymap_input(
+                device(),
+                screen,
+                InputEvent::KeyDown {
+                    code: "KeyA".into(),
+                    repeat: true,
+                    meta: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(builtin_repeat.consume);
+        assert!(builtin_repeat.actions.is_empty());
         let events = trace.snapshot();
         assert!(events
             .iter()
