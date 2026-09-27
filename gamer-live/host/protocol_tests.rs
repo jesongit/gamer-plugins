@@ -134,6 +134,7 @@ async fn websocket_authentication_heartbeat_and_event_flow() {
             "fixture-auth",
             &status,
             &events,
+            None,
         ),
     )
     .await
