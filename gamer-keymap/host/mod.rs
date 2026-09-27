@@ -1699,6 +1699,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.example.game".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -1752,6 +1753,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "official.game".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();

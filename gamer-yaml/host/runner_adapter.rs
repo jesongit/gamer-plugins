@@ -496,6 +496,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.test.app".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -624,6 +625,7 @@ mod tests {
             store
                 .create_package(crate::resources::PackageInput {
                     id: package.into(),
+                    android_targets: vec!["*".into()],
                     ..Default::default()
                 })
                 .unwrap();
@@ -657,6 +659,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.stable".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -726,6 +729,7 @@ mod tests {
         source
             .create_package(crate::resources::PackageInput {
                 id: "com.archive".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
