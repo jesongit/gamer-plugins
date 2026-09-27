@@ -62,7 +62,7 @@ impl Backend for Fake {
         Ok(())
     }
     fn rules(&self, _: &str) -> Result<(RuleSet, Option<String>)> {
-        Ok((self.rules.lock().clone(), None))
+        Ok((self.rules.lock().clone(), Some("one".into())))
     }
     fn save_rules(&self, _: &str, r: &RuleSet, _: Option<&str>) -> Result<String> {
         *self.rules.lock() = r.clone();
@@ -126,7 +126,6 @@ async fn setup() -> (tempfile::TempDir, Arc<Fake>, Arc<Queue>) {
     let f = Fake::new();
     let q = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
     q.configure("phone", "default").await.unwrap();
-    q.control("enable", &[], "").await.unwrap();
     (dir, f, q)
 }
 
@@ -139,9 +138,6 @@ async fn fifo_waits_for_terminal_and_busy_does_not_reorder() {
         q.status(0, "").await["waiting"].as_array().unwrap().len(),
         2
     );
-    q.tick().await;
-    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-    q.control("resume", &[], "").await.unwrap();
     f.busy.store(true, Ordering::SeqCst);
     q.tick().await;
     assert_eq!(
@@ -201,13 +197,11 @@ async fn restart_is_paused_and_running_is_review_not_replayed() {
     let (dir, f, q) = setup().await;
     q.receive(event("a")).await;
     q.receive(event("b")).await;
-    q.control("resume", &[], "").await.unwrap();
     q.tick().await;
     drop(q);
     let restored = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
     let status = restored.status(0, "").await;
     assert_eq!(status["paused"], true);
-    assert_eq!(status["enabled"], false);
     assert_eq!(status["current"]["state"], "review");
     assert_eq!(status["waiting"].as_array().unwrap().len(), 1);
     assert!(restored.control("resume", &[], "").await.is_err());
@@ -227,7 +221,6 @@ async fn controls_keep_current_and_clear_pending_durably() {
     let (dir, f, q) = setup().await;
     q.receive(event("a")).await;
     q.receive(event("b")).await;
-    q.control("resume", &[], "").await.unwrap();
     q.tick().await;
     let id = q.status(0, "").await["current"]["id"]
         .as_str()
@@ -249,7 +242,6 @@ async fn controls_keep_current_and_clear_pending_durably() {
 async fn offline_and_write_failure_stop_dispatch_without_draining() {
     let (dir, f, q) = setup().await;
     q.receive(event("a")).await;
-    q.control("resume", &[], "").await.unwrap();
     f.offline.store(true, Ordering::SeqCst);
     q.tick().await;
     assert_eq!(
@@ -304,11 +296,9 @@ async fn disabling_plugin_cancels_current_and_unbind_waits_for_terminal() {
     let (_dir, f, q) = setup().await;
     q.receive(event("a")).await;
     q.receive(event("b")).await;
-    q.control("resume", &[], "").await.unwrap();
     q.tick().await;
     q.suspend(true).await;
     let s = q.status(0, "").await;
-    assert_eq!(s["enabled"], false);
     assert_eq!(s["paused"], true);
     assert_eq!(s["waiting"], json!([]));
     assert_eq!(s["current"]["state"], "cancelling");
@@ -328,7 +318,6 @@ async fn changed_room_blocks_and_timeout_waits_for_cancellation() {
     changed.room_id = "another-room".into();
     q.receive(changed).await;
     let s = q.status(0, "").await;
-    assert_eq!(s["enabled"], false);
     assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
     q.control("resume", &[], "").await.unwrap();
     q.tick().await;
@@ -369,4 +358,31 @@ async fn gifts_use_message_quantity_once_and_string_identity() {
     let s = q.status(0, "").await;
     assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
     assert_eq!(s["waiting"][0]["args"], json!({"count":5,"who":"42"}));
+}
+
+#[tokio::test]
+async fn per_rule_switch_is_the_only_normal_trigger_gate() {
+    let (_dir, f, q) = setup().await;
+    q.toggle_rule("default", "jump", false, "one").unwrap();
+    q.receive(event("off")).await;
+    assert_eq!(q.status(0, "").await["waiting"], json!([]));
+    q.toggle_rule("default", "jump", true, "one").unwrap();
+    q.receive(event("on")).await;
+    q.tick().await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert!(q.toggle_rule("default", "jump", false, "old").is_err());
+    assert!(f.rules.lock().rules[0].enabled);
+}
+
+#[tokio::test]
+async fn empty_restart_does_not_reintroduce_a_hidden_master_switch() {
+    let (dir, f, q) = setup().await;
+    q.suspend(false).await;
+    drop(q);
+    let q = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
+    assert_eq!(q.status(0, "").await["paused"], false);
+    q.new_connection().await.unwrap();
+    q.receive(event("fresh")).await;
+    q.tick().await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
 }

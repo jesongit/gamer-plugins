@@ -4,7 +4,15 @@ use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -83,7 +91,6 @@ struct State {
     schema_version: u8,
     revision: u64,
     target: Option<Target>,
-    enabled: bool,
     paused: bool,
     blocked: Option<String>,
     items: Vec<Item>,
@@ -100,8 +107,7 @@ impl Default for State {
             schema_version: 1,
             revision: 0,
             target: None,
-            enabled: false,
-            paused: true,
+            paused: false,
             blocked: None,
             items: vec![],
             receipts: vec![],
@@ -116,6 +122,7 @@ pub struct Queue {
     state: Mutex<State>,
     path: PathBuf,
     backend: Arc<dyn Backend>,
+    accepting: AtomicBool,
 }
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -145,8 +152,10 @@ impl Queue {
             State::default()
         };
         ensure!(state.schema_version == 1, "不支持此互动队列版本");
-        state.enabled = false;
-        state.paused = true;
+        state.paused = state.items.iter().any(|i| i.pending() || i.active());
+        state.blocked = state
+            .paused
+            .then(|| "已恢复上次未结束的队列，请核对后继续或清空".into());
         for item in &mut state.items {
             if item.active() {
                 item.state = "review".into();
@@ -157,6 +166,7 @@ impl Queue {
             state: Mutex::new(state),
             path,
             backend,
+            accepting: AtomicBool::new(true),
         });
         let weak = Arc::downgrade(&queue);
         tokio::spawn(async move {
@@ -220,7 +230,6 @@ impl Queue {
     fn commit(&self, current: &mut State, mut next: State) -> Result<()> {
         if let Err(e) = self.persist(&mut next) {
             current.paused = true;
-            current.enabled = false;
             current.blocked = Some(format!("队列保存失败：{e}"));
             current.revision += 1;
             return Err(e.context("队列保存失败，已暂停"));
@@ -238,7 +247,7 @@ impl Queue {
             .rev()
             .filter(|i| !i.pending() && !i.active() && (filter.is_empty() || i.state == filter))
             .collect();
-        json!({"revision":s.revision,"target":s.target,"enabled":s.enabled,"paused":s.paused,"blocked":s.blocked,
+        json!({"revision":s.revision,"target":s.target,"paused":s.paused,"blocked":s.blocked,
             "current":current,"waiting":waiting,"capacity":100,"history":history.iter().skip(offset).take(30).collect::<Vec<_>>(),"has_more":history.len()>offset+30,
             "receipts":s.receipts.iter().rev().take(100).collect::<Vec<_>>(),
             "device_run":s.target.as_ref().and_then(|t|self.backend.active(&t.device_id))})
@@ -247,12 +256,12 @@ impl Queue {
         let target = self.backend.target(device, package)?;
         let mut s = self.state.lock().await;
         ensure!(
-            !s.enabled && !s.items.iter().any(|i| i.pending() || i.active()),
-            "请先停用触发并处理当前及等待项，再更换目标"
+            !s.items.iter().any(|i| i.pending() || i.active()),
+            "请先处理当前及等待项，再更换目标"
         );
         let mut n = s.clone();
         n.target = Some(target);
-        n.paused = true;
+        n.paused = false;
         n.blocked = None;
         n.cooldowns.clear();
         self.commit(&mut s, n)
@@ -260,14 +269,18 @@ impl Queue {
     pub async fn new_connection(&self) -> Result<()> {
         let mut s = self.state.lock().await;
         ensure!(
-            !s.enabled && !s.items.iter().any(|i| i.pending() || i.active()),
-            "更换连接前请停用触发并处理当前及等待项"
+            !s.items.iter().any(|i| i.pending() || i.active()),
+            "更换连接前请处理当前及等待项"
         );
         let mut n = s.clone();
         n.session = Uuid::new_v4().to_string();
         n.room_id = None;
         n.cooldowns.clear();
-        self.commit(&mut s, n)
+        n.paused = false;
+        n.blocked = None;
+        self.commit(&mut s, n)?;
+        self.accepting.store(true, Ordering::SeqCst);
+        Ok(())
     }
     pub fn read_rules(&self, package: &str) -> Result<Value> {
         let (rules, version) = self.backend.rules(package)?;
@@ -301,6 +314,26 @@ impl Queue {
         let version = self.backend.save_rules(package, &rules, version)?;
         Ok(json!({"version":version}))
     }
+    pub fn toggle_rule(
+        &self,
+        package: &str,
+        id: &str,
+        enabled: bool,
+        version: &str,
+    ) -> Result<Value> {
+        let (mut rules, current) = self.backend.rules(package)?;
+        ensure!(
+            current.as_deref() == Some(version),
+            "规则已被其他页面修改，请重新读取"
+        );
+        let rule = rules
+            .rules
+            .iter_mut()
+            .find(|r| r.id == id)
+            .context("规则不存在")?;
+        rule.enabled = enabled;
+        self.save_rules(package, rules, Some(version))
+    }
     pub async fn preview(
         &self,
         event: LiveEvent,
@@ -321,6 +354,9 @@ impl Queue {
         self.accept(event, enqueue, true, request_id).await
     }
     pub async fn receive(&self, event: LiveEvent) {
+        if !self.accepting.load(Ordering::SeqCst) {
+            return;
+        }
         if let Err(e) = self.accept(event, true, false, "").await {
             tracing::warn!(error=%e, "直播互动未入队");
         }
@@ -333,6 +369,9 @@ impl Queue {
         request_id: &str,
     ) -> Result<Value> {
         let mut s = self.state.lock().await;
+        if !test && !self.accepting.load(Ordering::SeqCst) {
+            return Ok(json!({"result":"直播连接已停止"}));
+        }
         if test && enqueue {
             if let Some(i) = s.items.iter().find(|i| i.request_id == request_id) {
                 return Ok(json!({"result":"已入队","item_id":i.id}));
@@ -357,12 +396,8 @@ impl Queue {
             }
         }
         let result: Result<String> = async {
-            if !test && !n.enabled {
-                return Ok("触发已停用".into());
-            }
             if !test && !e.room_id.is_empty() {
                 if n.room_id.as_ref().is_some_and(|room| room != &e.room_id) {
-                    n.enabled = false;
                     n.paused = true;
                     n.blocked = Some("直播间发生变化，请处理旧队列后重新连接".into());
                     anyhow::bail!("直播间与当前队列会话不一致");
@@ -445,31 +480,19 @@ impl Queue {
         let mut n = s.clone();
         let mut outcomes = vec![];
         match op {
-            "enable" | "resume" => {
-                let t = n.target.as_ref().context("请先绑定设备和配置包")?;
+            "resume" => {
+                let t = n.target.as_ref().context("请先选择执行设备和配置包")?;
                 self.backend.check(t)?;
                 ensure!(
                     !n.items.iter().any(|i| i.state == "review"),
                     "请先核对恢复的运行结果"
                 );
-                if op == "enable" {
-                    let (rules, _) = self.backend.rules(&t.package_id)?;
-                    rules.validate(&t.package_id)?;
-                    ensure!(
-                        rules.rules.iter().any(|r| r.enabled),
-                        "请先启用至少一条有效规则"
-                    );
-                    n.enabled = true;
-                } else {
-                    n.paused = false;
-                }
+                n.paused = false;
                 n.blocked = None;
             }
-            "disable" => n.enabled = false,
-            "pause" => n.paused = true,
             "unbind" => {
                 ensure!(
-                    !n.enabled && !n.items.iter().any(|i| i.pending() || i.active()),
+                    !n.items.iter().any(|i| i.pending() || i.active()),
                     "请先停止互动执行并处理当前项"
                 );
                 n.target = None;
@@ -488,8 +511,11 @@ impl Queue {
                     }
                 }
                 if op == "stop" {
-                    n.enabled = false;
                     n.paused = true;
+                }
+                if op == "clear" && !n.items.iter().any(Item::active) {
+                    n.paused = false;
+                    n.blocked = None;
                 }
             }
             "cancel" => {}
@@ -568,9 +594,8 @@ impl Queue {
         } else {
             None
         };
-        if ["pause", "disable", "stop"].contains(&op) {
+        if op == "stop" {
             s.paused = n.paused;
-            s.enabled = n.enabled;
         }
         let saved = self.commit(&mut s, n);
         if let Some(id) = cancel_id {
@@ -589,6 +614,7 @@ impl Queue {
         Ok(json!({"results":outcomes}))
     }
     pub async fn suspend(&self, clear: bool) {
+        self.accepting.store(false, Ordering::SeqCst);
         if clear {
             if let Err(e) = self.control("stop", &[], "").await {
                 tracing::error!(error=%e,"直播互动停止未完成");
@@ -596,7 +622,6 @@ impl Queue {
             return;
         }
         let mut s = self.state.lock().await;
-        s.enabled = false;
         s.paused = true;
         let mut n = s.clone();
         if clear {
@@ -735,7 +760,6 @@ impl Queue {
             let error = s.blocked.clone();
             *s = fallback;
             s.paused = true;
-            s.enabled = false;
             s.blocked = error;
         }
     }

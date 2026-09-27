@@ -29,6 +29,7 @@ pub const ACTIONS: &[&str] = &[
     "events.read",
     "rules.read",
     "rules.save",
+    "rules.toggle",
     "rules.preview",
     "queue.status",
     "queue.configure",
@@ -43,7 +44,7 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         return None;
     }
     Some(match action {
-        "rules.save" => &[Permission::UiHost],
+        "rules.save" | "rules.toggle" => &[Permission::UiHost, Permission::RunSubmit],
         "rules.read" | "rules.preview" => &[Permission::ResourceRead],
         "queue.configure" | "queue.test" => &[Permission::RunSubmit],
         "queue.control" => &[Permission::RunSubmit, Permission::RunControl],
@@ -168,6 +169,14 @@ impl LiveService {
             "rules.read" => self
                 .queue()?
                 .read_rules(values["package_id"].as_str().unwrap_or("")),
+            "rules.toggle" => self.queue()?.toggle_rule(
+                values["package_id"].as_str().unwrap_or(""),
+                values["id"].as_str().unwrap_or(""),
+                values["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("缺少规则开关值"))?,
+                values["expected_version"].as_str().unwrap_or(""),
+            ),
             "rules.save" => self.queue()?.save_rules(
                 values["package_id"].as_str().unwrap_or(""),
                 serde_json::from_value(values["ruleset"].clone())?,

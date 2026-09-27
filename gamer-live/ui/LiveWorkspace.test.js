@@ -21,7 +21,7 @@ it('本机输出由显式提交启动，带设备与音频设置', async () => {
 })
 it('切换 OAuth 后不发送残留身份码，成功提交后清除秘密字段', async () => {
   const w = mountWorkspace(); await flushPromises()
-  await w.get('[aria-controls="live-interaction"]').trigger('click')
+  await w.get('[aria-controls="live-settings"]').trigger('click')
   await w.get('[aria-label="主播身份码"]').setValue('old-code')
   await w.get('[aria-label="应用 ID"]').setValue('123')
   await w.get('[aria-label="接入方式"]').setValue('oauth')
@@ -36,10 +36,21 @@ it('切换 OAuth 后不发送残留身份码，成功提交后清除秘密字段
 })
 it('错误不显示成已连接，秘密可在修正后重试', async () => {
   const w = mountWorkspace(); await flushPromises()
-  await w.get('[aria-controls="live-interaction"]').trigger('click')
+  await w.get('[aria-controls="live-settings"]').trigger('click')
   mocks.call.mockRejectedValueOnce(new Error('权限不足'))
   await w.findAll('form')[1].trigger('submit'); await flushPromises()
   expect(w.get('[role="alert"]').text()).toContain('权限不足')
   expect(w.text()).not.toContain('已连接')
+  w.unmount()
+})
+
+it('三个页签分开设置、规则和日志，设置同时包含输出和互动连接', async () => {
+  const w = mountWorkspace(); await flushPromises()
+  expect(w.findAll('.tab-btn').map(b => b.text())).toEqual(['直播设置', '互动规则', '触发日志'])
+  expect(w.get('[aria-label="音视频输出"]').isVisible()).toBe(true)
+  expect(w.get('[aria-label="互动连接"]').isVisible()).toBe(true)
+  await w.get('[aria-controls="live-rules"]').trigger('click')
+  expect(w.get('#live-settings').element.style.display).toBe('none')
+  expect(w.findComponent({ name: 'InteractionPanel' }).props('view')).toBe('rules')
   w.unmount()
 })

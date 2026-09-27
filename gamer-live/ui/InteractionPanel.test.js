@@ -12,11 +12,11 @@ vi.mock('../../../web/src/api', () => ({ api: {
 import InteractionPanel from './InteractionPanel.vue'
 let wrapper
 beforeEach(() => {
-  mock.rules = []; mock.status = { revision: 1, waiting: [], history: [], receipts: [], paused: true, enabled: false, target: { device_id: 'phone', package_id: 'default', android_package: 'game' } }
+  mock.rules = []; mock.status = { revision: 1, waiting: [], history: [], receipts: [], paused: false, target: { device_id: 'phone', package_id: 'default', android_package: 'game' } }
   mock.call.mockReset().mockImplementation(async (_, action) => {
     if (action === 'queue.status') return structuredClone(mock.status)
     if (action === 'rules.read') return { rules: structuredClone(mock.rules), version: 'v1' }
-    if (action === 'rules.save') return { version: 'v2' }
+    if (action === 'rules.save' || action === 'rules.toggle') return { version: 'v2' }
     if (action === 'rules.preview') return { result: '匹配成功（预览，未入队）', resolved: { args: { count: 1 } } }
     return { results: [] }
   })
@@ -37,13 +37,30 @@ it('模拟预览不入队，实际测试由独立操作提交', async () => {
   await button('加入队列测试（实际执行）').trigger('click'); await flushPromises()
   expect(mock.call).toHaveBeenCalledWith('gamer-live', 'queue.test', expect.objectContaining({ request_id: expect.any(String), payload: expect.objectContaining({ text: '跳' }) }))
 })
-it('暂停不取消当前运行，服务端错误在页面保留', async () => {
-  mock.status.paused = false; await open()
-  await button('暂停队列').trigger('click'); await flushPromises()
-  expect(mock.call).toHaveBeenCalledWith('gamer-live', 'queue.control', expect.objectContaining({ op: 'pause' }))
-  mock.call.mockRejectedValueOnce(new Error('保存失败，已暂停'))
-  await button('停止互动执行').trigger('click'); await flushPromises()
-  expect(wrapper.get('[role="alert"]').text()).toContain('保存失败')
+it('规则开关立即保存，无触发总开关或启动队列按钮', async () => {
+  mock.rules = [{ ...newRule({ name: '账号日常' }), entrypoint: 'default/test.yaml' }]
+  await open()
+  const toggle = wrapper.get('[role="switch"]')
+  await toggle.setValue(true); await flushPromises()
+  expect(mock.call).toHaveBeenCalledWith('gamer-live', 'rules.toggle', expect.objectContaining({ id: mock.rules[0].id, enabled: true, expected_version: 'v1' }))
+  expect(toggle.element.checked).toBe(true)
+  expect(wrapper.text()).not.toContain('有未保存修改')
+  for (const name of ['启用新触发', '继续队列', '暂停队列', '停止互动执行']) expect(button(name)).toBeUndefined()
+  mock.call.mockRejectedValueOnce(new Error('规则已被其他页面修改'))
+  await toggle.setValue(false); await flushPromises()
+  expect(toggle.element.checked).toBe(true)
+  expect(wrapper.get('[role="alert"]').text()).toContain('其他页面修改')
+})
+it('按页签显示设置、规则和日志，切换保留规则草稿', async () => {
+  await open()
+  expect(wrapper.get('#live-rules').isVisible()).toBe(true)
+  expect(wrapper.get('#live-logs').element.style.display).toBe('none')
+  await button('新增规则').trigger('click')
+  await wrapper.setProps({ view: 'logs' })
+  expect(wrapper.get('#live-rules').element.style.display).toBe('none')
+  expect(wrapper.get('#live-logs').element.style.display).not.toBe('none')
+  await wrapper.setProps({ view: 'rules' })
+  expect(wrapper.text()).toContain('有未保存修改')
 })
 it('保存冲突保留修改，日志按服务端 next 游标取到末页', async () => {
   mock.rules = [newRule({ name: '跳跃' })]
