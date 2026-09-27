@@ -493,7 +493,7 @@ impl Queue {
             "unbind" => {
                 ensure!(
                     !n.items.iter().any(|i| i.pending() || i.active()),
-                    "请先停止互动执行并处理当前项"
+                    "请先处理当前及等待项"
                 );
                 n.target = None;
                 n.paused = true;
@@ -511,7 +511,7 @@ impl Queue {
                     }
                 }
                 if op == "stop" {
-                    n.paused = true;
+                    n.paused = n.items.iter().any(Item::active);
                 }
                 if op == "clear" && !n.items.iter().any(Item::active) {
                     n.paused = false;
@@ -623,15 +623,7 @@ impl Queue {
         }
         let mut s = self.state.lock().await;
         s.paused = true;
-        let mut n = s.clone();
-        if clear {
-            for i in &mut n.items {
-                if i.pending() {
-                    i.state = "removed".into();
-                    i.finished_at = Some(now());
-                }
-            }
-        }
+        let n = s.clone();
         if let Err(e) = self.commit(&mut s, n) {
             tracing::error!(error=%e,"直播队列停止状态保存失败");
         }

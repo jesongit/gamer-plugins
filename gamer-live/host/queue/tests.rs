@@ -377,6 +377,10 @@ async fn per_rule_switch_is_the_only_normal_trigger_gate() {
 #[tokio::test]
 async fn empty_restart_does_not_reintroduce_a_hidden_master_switch() {
     let (dir, f, q) = setup().await;
+    q.suspend(true).await;
+    assert_eq!(q.status(0, "").await["paused"], false);
+    q.receive(event("stopped")).await;
+    assert_eq!(q.status(0, "").await["waiting"], json!([]));
     q.suspend(false).await;
     drop(q);
     let q = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
