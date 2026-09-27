@@ -15,11 +15,12 @@ use tokio_tungstenite::{
     tungstenite::{protocol::WebSocketConfig, Message},
 };
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub mode: String,
     pub access_key: String,
+    #[serde(default)]
     pub access_secret: String,
     #[serde(default)]
     pub app_id: String,

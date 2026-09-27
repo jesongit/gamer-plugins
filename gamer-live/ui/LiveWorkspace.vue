@@ -4,11 +4,17 @@ import { api } from '../../../web/src/api'
 import InteractionPanel from './InteractionPanel.vue'
 
 const devices = ref([]), status = ref({ stream: null, connection: {} }), events = ref([])
+const feedback = ref(''), savedSettings = ref({ version: null, profiles: {} })
 const error = ref(''), busy = ref(false), gap = ref(false), copied = ref(false)
 const activeTab = ref('settings')
 const tabs = [{ key: 'settings', label: '直播设置' }, { key: 'rules', label: '互动规则' }, { key: 'logs', label: '触发日志' }]
 const output = reactive({ device_id: '', mode: 'local', push_url: '', audio: true, fps: 30, bitrate_kbps: 4000 })
 const credentials = reactive({ mode: 'open_live', access_key: '', access_secret: '', app_id: '', identity_code: '', access_token: '' })
+const savedProfile = computed(() => savedSettings.value.profiles?.[credentials.mode])
+function canReuse(field) { return !!savedProfile.value?.[`has_${field}`] && savedProfile.value.access_key === credentials.access_key && (field !== 'identity_code' || savedProfile.value.app_id === credentials.app_id) }
+function fillProfile() { const saved = savedProfile.value || {}; credentials.access_key = saved.access_key || ''; credentials.app_id = saved.app_id || ''; credentials.access_secret = ''; credentials.identity_code = ''; credentials.access_token = '' }
+function applySettings(value, selectMode = false) { savedSettings.value = value; if (selectMode && value.mode) credentials.mode = value.mode; fillProfile() }
+function submittedCredentials() { const value = { ...credentials }; if (value.mode === 'open_live') value.access_token = ''; else { value.app_id = ''; value.identity_code = '' }; return value }
 const streamActive = computed(() => status.value.stream && !['failed', 'stopped'].includes(status.value.stream.state))
 const connected = computed(() => ['connecting', 'connected', 'reconnecting'].includes(status.value.connection.state))
 const states = { preparing: '准备中', streaming: '输出中', connecting: '连接中', connected: '已连接', reconnecting: '正在重连', failed: '失败', stopped: '已停止', disconnected: '未连接' }
@@ -36,26 +42,37 @@ async function poll() {
 }
 async function act(action, values = {}) {
   if (busy.value) return
-  busy.value = true; error.value = ''; copied.value = false
-  try { await call(action, values); await refresh(); return true } catch (e) { error.value = e.message; return false } finally { busy.value = false }
+  busy.value = true; error.value = ''; feedback.value = ''; copied.value = false
+  try { const result = await call(action, values); await refresh(); return result || true } catch (e) { error.value = e.message; return false } finally { busy.value = false }
 }
 async function startOutput() {
   const ok = await act('stream.start', { ...output, push_url: output.mode === 'local' ? '' : output.push_url })
   if (ok) output.push_url = ''
 }
 async function connect() {
-  const value = { ...credentials }
-  if (value.mode === 'open_live') value.access_token = ''
-  else { value.app_id = ''; value.identity_code = '' }
-  if (await act('connection.connect', { platform_id: 'bilibili', credentials: value })) {
-    credentials.access_secret = ''; credentials.access_token = ''; credentials.identity_code = ''
+  const result = await act('connection.connect', { platform_id: 'bilibili', credentials: submittedCredentials(), expected_version: savedSettings.value.version })
+  if (result) {
+    if (result.settings) applySettings(result.settings)
+    else { credentials.access_secret = ''; credentials.access_token = ''; credentials.identity_code = '' }
+    feedback.value = '接入配置已保存，下次连接无需重复输入'
   }
+}
+async function saveSettings(clear = false) {
+  if (busy.value) return
+  busy.value = true; error.value = ''; feedback.value = ''
+  try {
+    const values = { expected_version: savedSettings.value.version, ...(clear ? { mode: credentials.mode } : { credentials: submittedCredentials() }) }
+    const result = await call(clear ? 'connection.settings.clear' : 'connection.settings.save', values)
+    applySettings(result)
+    feedback.value = clear ? '已清除当前接入方式的配置' : '接入配置已保存，下次连接无需重复输入'
+  } catch (e) { error.value = e.message } finally { busy.value = false }
 }
 async function copySource() {
   try { await navigator.clipboard.writeText(status.value.stream.source_url); copied.value = true } catch { error.value = '复制失败，请手动选择并复制素材地址' }
 }
 onMounted(async () => {
   try { devices.value = await api.listDevices(); if (!output.device_id) output.device_id = devices.value[0]?.id || '' } catch (e) { error.value = e.message }
+  try { const saved = await call('connection.settings.read'); if (!disposed) applySettings(saved, true) } catch (e) { error.value = e.message }
   if (!disposed) poll()
 })
 onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
@@ -67,7 +84,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
       <button v-for="tab in tabs" :key="tab.key" type="button" class="tab-btn" :class="{ active: activeTab === tab.key }" :aria-pressed="activeTab === tab.key" :aria-controls="`live-${tab.key}`" @click="activeTab = tab.key">{{ tab.label }}</button>
     </nav>
     <div class="live-content">
-      <p v-if="error" role="alert" class="error">{{ error }}</p>
+      <p v-if="error" role="alert" class="error">{{ error }}</p><p v-if="feedback" role="status" class="connection-status">{{ feedback }}</p>
       <div v-show="activeTab === 'settings'" id="live-settings" class="settings-content">
       <section aria-label="音视频输出">
         <h3>音视频输出</h3>
@@ -99,16 +116,16 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
           <p class="hint">接收弹幕、礼物、点赞等已获授权的事件。开发者账号还需申请对应直播权限；两种接入方式的凭据不能混用。</p>
           <form @submit.prevent="connect" autocomplete="off">
             <fieldset :disabled="busy || connected">
-              <label>接入方式<select v-model="credentials.mode" aria-label="接入方式"><option value="open_live">直播开放平台 · 主播身份码</option><option value="oauth">开放平台 · 已授权 OAuth Token</option></select></label>
+              <label>接入方式<select v-model="credentials.mode" aria-label="接入方式" @change="fillProfile"><option value="open_live">直播开放平台 · 主播身份码</option><option value="oauth">开放平台 · 已授权 OAuth Token</option></select></label>
               <label>Access Key ID<input v-model="credentials.access_key" aria-label="Access Key ID" required autocomplete="off" /></label>
-              <label>Access Key Secret<input v-model="credentials.access_secret" aria-label="Access Key Secret" type="password" required autocomplete="new-password" /></label>
-              <template v-if="credentials.mode === 'open_live'"><label>应用 ID<input v-model="credentials.app_id" aria-label="应用 ID" required inputmode="numeric" /></label><label>主播身份码<input v-model="credentials.identity_code" aria-label="主播身份码" type="password" required autocomplete="off" /></label></template>
-              <label v-else>Access Token<input v-model="credentials.access_token" aria-label="Access Token" type="password" required autocomplete="off" /></label>
-              <button type="submit">连接互动</button>
+              <label>Access Key Secret<input v-model="credentials.access_secret" aria-label="Access Key Secret" type="password" :required="!canReuse('access_secret')" :placeholder="canReuse('access_secret') ? '已保存，留空沿用；输入可更新' : '填写 Access Key Secret'" autocomplete="new-password" /></label>
+              <template v-if="credentials.mode === 'open_live'"><label>应用 ID<input v-model="credentials.app_id" aria-label="应用 ID" required inputmode="numeric" /></label><label>主播身份码<input v-model="credentials.identity_code" aria-label="主播身份码" type="password" :required="!canReuse('identity_code')" :placeholder="canReuse('identity_code') ? '已保存，留空沿用；输入可更新' : '填写主播身份码'" autocomplete="off" /></label></template>
+              <label v-else>Access Token<input v-model="credentials.access_token" aria-label="Access Token" type="password" :required="!canReuse('access_token')" :placeholder="canReuse('access_token') ? '已保存，留空沿用；输入可更新' : '填写 Access Token'" autocomplete="off" /></label>
+              <div class="connection-actions"><button type="submit">保存并连接互动</button><button type="button" @click="saveSettings()">保存接入配置</button><button type="button" :disabled="!savedProfile" @click="saveSettings(true)">清除已保存配置</button></div>
             </fieldset>
             <button v-if="connected" type="button" :disabled="busy" @click="act('connection.disconnect')">断开互动</button>
           </form>
-          <p class="hint">凭据仅保存在本次服务进程内，不写入配置包。断开后重新连接需再次输入；每位使用者填写自己的凭据。OAuth 模式需自行取得并更新 Token。</p>
+          <p class="hint">接入配置保存在服务端本机，断开和重启后保留，不随配置包导出。密钥框显示“已保存”时留空即可沿用；Token 失效后可在此更新。</p>
           <p class="hint">断开互动只停止接收消息，已排队操作继续执行。已排队操作可在「触发日志」中移除或取消；关闭规则开关可停止后续触发。</p>
           <p v-if="status.connection.error" class="error">{{ status.connection.error }}</p>
         </section>
@@ -136,6 +153,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
 .live-content{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:16px;padding:8px;scrollbar-gutter:stable}
 .live-content>*{box-sizing:border-box;flex-shrink:0;width:100%;max-width:820px;margin-inline:auto}
 .settings-content,.interaction-content{display:grid;gap:16px}
+.connection-actions{display:flex;gap:8px;flex-wrap:wrap}
 .connection-status{font-size:12px;color:#77cbb4}
 h3,p{margin:0}section{display:grid;gap:12px}.hint{font-size:12px;opacity:.7;line-height:1.7}section{border:1px solid var(--border,#41444c);border-radius:10px;padding:16px;min-width:0}.heading,.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.heading span{font-size:12px;color:#77cbb4}.row>label{flex:1;min-width:0}fieldset{border:0;padding:0;margin:0;min-width:0;display:grid;gap:12px}label{display:grid;gap:6px;font-size:13px}input,select{box-sizing:border-box;width:100%;min-width:0;padding:8px;border:1px solid var(--border,#535762);border-radius:5px;background:var(--bg-1,#24262c);color:inherit}button{padding:7px 12px;border-radius:5px;border:1px solid var(--border,#535762);background:var(--bg-2,#292d35);color:inherit;cursor:pointer;justify-self:start}button:disabled,fieldset:disabled{opacity:.55}form,.source{display:grid;gap:12px}.check{display:flex;align-items:center}.check input{width:auto}.error{color:#f19494;font-size:13px;overflow-wrap:anywhere}ol{padding:0;margin:0;list-style:none;max-height:320px;overflow:auto}li{display:flex;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border,#41444c);font-size:12px;overflow-wrap:anywhere}time{opacity:.55}li b{color:#77cbb4}
 </style>

@@ -4,6 +4,7 @@ mod events;
 mod queue;
 mod rules;
 pub mod runtime;
+mod settings;
 use crate::{
     device::DeviceManager,
     extensions::{service::BuiltinService, ExtensionError, ExtensionResult, Permission},
@@ -26,6 +27,9 @@ pub const ACTIONS: &[&str] = &[
     "stream.stop",
     "connection.connect",
     "connection.disconnect",
+    "connection.settings.read",
+    "connection.settings.save",
+    "connection.settings.clear",
     "events.read",
     "rules.read",
     "rules.save",
@@ -49,9 +53,12 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         "queue.configure" | "queue.test" => &[Permission::RunSubmit],
         "queue.control" => &[Permission::RunSubmit, Permission::RunControl],
         "stream.start" | "stream.stop" => &[Permission::MediaStream],
-        "connection.connect" | "connection.disconnect" | "events.read" => {
-            &[Permission::LiveConnect]
-        }
+        "connection.connect"
+        | "connection.disconnect"
+        | "events.read"
+        | "connection.settings.read"
+        | "connection.settings.save"
+        | "connection.settings.clear" => &[Permission::LiveConnect],
         _ => &[],
     })
 }
@@ -107,6 +114,7 @@ pub struct LiveService {
     events: Arc<Mutex<events::EventBuffer>>,
     queue: Option<Arc<queue::Queue>>,
     queue_error: Option<String>,
+    settings: settings::Settings,
 }
 impl LiveService {
     pub fn new(runtime: runtime::Runtime, data_root: &std::path::Path) -> Result<Self> {
@@ -127,6 +135,9 @@ impl LiveService {
             events: Arc::new(Mutex::new(events::EventBuffer::default())),
             queue,
             queue_error,
+            settings: settings::Settings::new(
+                data_root.join("extension-data/gamer-live/private/connection.dat"),
+            ),
         })
     }
     fn queue(&self) -> Result<&Arc<queue::Queue>> {
@@ -233,42 +244,60 @@ impl LiveService {
                 }
                 Ok(json!({"state":"stopped"}))
             }
+            "connection.settings.read" => self.settings.read(),
+            "connection.settings.save" => {
+                let credentials = serde_json::from_value(values["credentials"].clone())
+                    .map_err(|_| anyhow::anyhow!("接入配置格式无效"))?;
+                self.settings
+                    .save(credentials, values["expected_version"].as_str())
+                    .map(|(_, public)| public)
+            }
+            "connection.settings.clear" => self.settings.clear(
+                values["mode"].as_str().unwrap_or(""),
+                values["expected_version"].as_str(),
+            ),
             "connection.connect" => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Request {
                     platform_id: String,
                     credentials: bilibili::Credentials,
+                    #[serde(default)]
+                    expected_version: Option<String>,
                 }
                 let request: Request = serde_json::from_value(values)?;
                 ensure!(request.platform_id == "bilibili", "暂不支持此直播平台");
-                request.credentials.validate()?;
-                if let Some(queue) = &self.queue {
-                    queue.new_connection().await?;
-                }
                 let mut slot = self.connection.lock().await;
                 ensure!(
                     slot.as_ref().is_none_or(|h| h.task.is_finished()),
                     "互动已连接或正在连接，请先断开"
                 );
+                if let Some(queue) = &self.queue {
+                    queue.new_connection().await?;
+                }
+                let (credentials, saved) = self
+                    .settings
+                    .save(request.credentials, request.expected_version.as_deref())?;
                 if let Some(old) = slot.take() {
                     old.stop().await;
                 }
                 *self.status.lock() = ConnectionStatus {
                     state: "connecting".into(),
-                    mode: request.credentials.mode.clone(),
+                    mode: credentials.mode.clone(),
                     ..Default::default()
                 };
                 let (stop, rx) = watch::channel(false);
                 let task = tokio::spawn(bilibili::run(
-                    request.credentials,
+                    credentials,
                     self.status.clone(),
                     self.events.clone(),
                     self.queue.clone(),
                     rx,
                 ));
                 *slot = Some(Connection { stop, task });
-                Ok(json!(self.status.lock().clone()))
+                let mut result = json!(self.status.lock().clone());
+                result["settings"] = saved;
+                Ok(result)
             }
             "connection.disconnect" => {
                 if let Some(handle) = self.connection.lock().await.take() {
@@ -316,7 +345,7 @@ impl BuiltinService for LiveService {
 }
 impl LiveService {
     async fn stop_connections(&self) {
-        // Stop both independently; neither output nor account secrets survive disable.
+        // Stop active tasks; saved local connection profiles survive disable/restart.
         tokio::join!(
             async {
                 if let Some(h) = self.output.lock().await.take() {

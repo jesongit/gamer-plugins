@@ -1,6 +1,6 @@
 # 直播助手
 
-提供设备音视频输出、直播互动接入，以及弹幕／礼物触发函数或自动化的串行队列。互动执行需要 Gamer 0.2.3+ 和已启用的 gamer-yaml；插件版本 0.2.2。
+提供设备音视频输出、直播互动接入，以及弹幕／礼物触发函数或自动化的串行队列。互动执行需要 Gamer 0.2.4+ 和已启用的 gamer-yaml；插件版本 0.2.3。
 
 ## 配合直播姬
 
@@ -24,7 +24,9 @@
 | 直播开放平台 | Access Key ID / Secret、应用 ID、主播身份码 | 对接 OpenLive `/v2/app/start`、心跳、结束与长连 |
 | 开放平台 OAuth | Client ID（填入 Access Key ID）、App Secret、Access Token | 应用需有 `LIVE_ROOM_DATA` 等权限，主播需授权；对接 `/arcopen/fn/live/room/ws-start` |
 
-开发者账号不等于直播接口权限。OAuth Token 需从自己的授权流程取得和更新；首版不内置 OAuth 回调服务或共享开发者密钥。每位 Gamer 使用者填写自己的凭据。连接成功后表单清除 Secret、Token 和身份码，服务端仅在当前连接任务内保存，断开/停用后释放，不写入配置包、浏览器存储或日志。服务重启不自动恢复带凭据的连接。
+开发者账号不等于直播接口权限。OAuth Token 需从自己的授权流程取得和更新；首版不内置 OAuth 回调服务或共享开发者密钥。每位 Gamer 使用者填写自己的凭据。点击「保存接入配置」或「保存并连接互动」会将当前接入方式的配置持久化到服务端；断开、停用或重启后仍保留。页面自动回填接入方式、Access Key ID、应用 ID，Secret、Token 和身份码显示「已保存，留空沿用」，不会把明文传回页面。更换 Access Key ID 不会沿用原账号的秘密，身份码同时绑定原应用 ID；OpenLive 与 OAuth 分别保存，互不混用。
+
+Windows 使用当前系统账号的 DPAPI 加密文件，位于 `extension-data/gamer-live/private/connection.dat`；不能直接搬到另一系统账号使用。Unix 使用仅属主可访问的目录（0700）及文件（0600），该平台文件内容未加密。不写入配置包、浏览器存储或日志。「清除已保存配置」只移除当前接入方式，保存失败或版本冲突会显示错误并保留表单输入。服务重启后点击连接即可使用已保存配置，不自动开播或自动恢复网络连接。
 
 连接具有 API 心跳、WebSocket 心跳、授权超时、断线退避重试和可见错误。OpenLive 主动断开调用结束接口；OAuth 断开关闭长连并停止心跳，由平台回收会话。平台下发哪些消息取决于权限、直播状态和事件实际发生情况。
 
@@ -65,8 +67,11 @@
 | `live.status` | `{}` | 无额外权限，仍需认证和 Running |
 | `stream.start` | `{device_id, mode:"local"或"rtmp", push_url?, audio?, fps?, bitrate_kbps?}` | `media.stream` |
 | `stream.stop` | `{}` | `media.stream` |
-| `connection.connect` | `{platform_id:"bilibili", credentials:{mode,access_key,access_secret,app_id?,identity_code?,access_token?}}` | `live.connect` |
+| `connection.connect` | `{platform_id:"bilibili", credentials:{mode,access_key,access_secret?,app_id?,identity_code?,access_token?},expected_version?}` | `live.connect` |
 | `connection.disconnect` | `{}` | `live.connect` |
+| `connection.settings.read` | `{}` → `{version,mode,profiles}`；profiles 只含公开字段及秘密存在标记 | `live.connect` |
+| `connection.settings.save` | `{credentials,expected_version}`；秘密留空沿用同模式同账号的已保存值 | `live.connect` |
+| `connection.settings.clear` | `{mode,expected_version}`；删除该模式的配置 | `live.connect` |
 | `events.read` | `{after:0}`，后续传上次 `next_seq` | `live.connect` |
 | `rules.read` | `{package_id}` → `{schema_version,rules,version}` | `resource.read` |
 | `rules.save` | `{package_id,expected_version,ruleset:{schema_version:1,rules}}` | `ui.host` + `run.submit` |

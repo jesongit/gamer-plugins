@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-live"
-version = "0.2.2"
+version = "0.2.3"
 name = "直播助手"
 description = "向直播姬提供设备音视频素材，接收 B 站直播互动；支持手动 RTMP 输出"
 permissions = ["ui.host", "media.stream", "live.connect", "resource.read", "run.submit", "run.control"]
@@ -22,7 +22,7 @@ required = false
 [execution]
 kind = "builtin"
 builtin_id = "gamer-live"
-host_version = ">=0.2.3"
+host_version = ">=0.2.4"
 
 [[ui.contributions]]
 panel_id = "live"
