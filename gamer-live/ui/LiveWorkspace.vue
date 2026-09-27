@@ -15,6 +15,7 @@ function canReuse(field) { return !!savedProfile.value?.[`has_${field}`] && save
 function fillProfile() { const saved = savedProfile.value || {}; credentials.access_key = saved.access_key || ''; credentials.app_id = saved.app_id || ''; credentials.access_secret = ''; credentials.identity_code = ''; credentials.access_token = '' }
 function applySettings(value, selectMode = false) { savedSettings.value = value; if (selectMode && value.mode) credentials.mode = value.mode; fillProfile() }
 function submittedCredentials() { const value = { ...credentials }; if (value.mode === 'open_live') value.access_token = ''; else { value.app_id = ''; value.identity_code = '' }; return value }
+const canOutput = computed(() => devices.value.find(d => d.id === output.device_id)?.capabilities?.media_output !== false)
 const streamActive = computed(() => status.value.stream && !['failed', 'stopped'].includes(status.value.stream.state))
 const connected = computed(() => ['connecting', 'connected', 'reconnecting'].includes(status.value.connection.state))
 const states = { preparing: '准备中', streaming: '输出中', connecting: '连接中', connected: '已连接', reconnecting: '正在重连', failed: '失败', stopped: '已停止', disconnected: '未连接' }
@@ -46,6 +47,7 @@ async function act(action, values = {}) {
   try { const result = await call(action, values); await refresh(); return result || true } catch (e) { error.value = e.message; return false } finally { busy.value = false }
 }
 async function startOutput() {
+  if (!canOutput.value) { error.value = '当前目标尚不支持音视频输出'; return }
   const ok = await act('stream.start', { ...output, push_url: output.mode === 'local' ? '' : output.push_url })
   if (ok) output.push_url = ''
 }
@@ -98,7 +100,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
             <p v-if="output.mode === 'rtmp'" class="hint">开始后会直接向此地址发送画面和游戏声音。需要混音时，请使用上方的多媒体素材方式。</p>
             <div class="row"><label>帧率<input v-model.number="output.fps" type="number" min="10" max="60" required /></label><label>码率 Kbps<input v-model.number="output.bitrate_kbps" type="number" min="500" max="20000" required /></label></div>
             <label class="check"><input v-model="output.audio" type="checkbox" />包含游戏声音</label>
-            <button type="submit" :disabled="!output.device_id">开始输出</button>
+            <button type="submit" :disabled="!output.device_id || !canOutput" :title="canOutput ? '' : '当前目标尚不支持音视频输出'">开始输出</button>
           </fieldset>
           <button v-if="streamActive" type="button" :disabled="busy" @click="act('stream.stop')">停止输出</button>
         </form>

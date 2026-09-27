@@ -1,3 +1,4 @@
+import { frameSource } from '../../../../../../web/src/console/frame-source'
 import { operationReporter } from '../../../../../../web/src/workspace/operation-feedback'
 import { GAMER_YAML_PLUGIN_ID } from '../../../../../../web/src/gamer-plugin-ids'
 import { computed, nextTick, onUnmounted, provide, reactive, ref, watch } from 'vue'
@@ -78,10 +79,8 @@ export function useConsoleTemplates({
   // 舞台活动画面元素：live = WebRTC video；media = 媒体 <video>（坐标参考随之切换）。
   // 未注入舞台桥时回落实时视频元素（行为与旧实现一致）。
   const surface = () => stage?.surfaceEl?.() || videoElement.value
-  const surfaceSize = el => ({
-    width: el?.naturalWidth || el?.videoWidth || stage?.displaySize?.()?.width || 0,
-    height: el?.naturalHeight || el?.videoHeight || stage?.displaySize?.()?.height || 0,
-  })
+  const frames = stage || frameSource(() => videoElement.value)
+  const surfaceSize = () => frames.displaySize()
 
   function tplPinyinInitials(name) {
     let s = tplPyCache.get(name)
@@ -217,30 +216,15 @@ export function useConsoleTemplates({
     confirmDelTpl.value = null
     crop.conflict = null
     crop.sourceLabel = ''
-    // Video can be copied synchronously. A refreshing image must use the
-    // stage's fixed displayed-frame snapshot instead of the mutable live img.
-    if (stage && stage.kind?.() === 'live' && stage.surfaceEl?.()?.tagName !== 'IMG') {
-      const video = stage.surfaceEl?.() || videoElement.value
-      if (!(video?.naturalWidth || video?.videoWidth)) return toast('无法截取画面，请稍后重试', 'error')
-      freezeCropBase(video, (video?.naturalWidth || video?.videoWidth), (video?.naturalHeight || video?.videoHeight), '实时画面当前帧', rect)
-      return
+    const genBefore = stage?.generation()
+    let frame
+    try { frame = await frames.captureFrame() }
+    catch (e) { return toast('无法截取画面：' + e.message, 'error') }
+    if (!frame) return toast('无法获取画面帧，请稍后重试', 'error')
+    if (stage && (stage.generation() !== genBefore || frame.generation !== genBefore)) {
+      return toast('画面来源已切换，请重新框选', 'warn')
     }
-    if (stage?.captureFrame) {
-      const genBefore = stage.generation()
-      let frame
-      try { frame = await stage.captureFrame() }
-      catch (e) { return toast('无法截取画面：' + e.message, 'error') }
-      if (!frame) return toast('无法获取画面帧，请稍后重试', 'error')
-      if (stage.generation() !== genBefore || frame.generation !== genBefore) {
-        return toast('画面来源已切换，请重新框选', 'warn')
-      }
-      freezeCropBase(frame.source, frame.width, frame.height, frame.label, rect)
-      return
-    }
-    // 未注入舞台桥（旧调用方兼容）：实时视频元素
-    const video = videoElement.value
-    if (!(video?.naturalWidth || video?.videoWidth)) return toast('无法截取画面，请稍后重试', 'error')
-    freezeCropBase(video, (video?.naturalWidth || video?.videoWidth), (video?.naturalHeight || video?.videoHeight), '实时画面当前帧', rect)
+    freezeCropBase(frame.source, frame.width, frame.height, frame.label, rect)
   }
 
   function cancelCrop() {
@@ -614,10 +598,15 @@ export function useConsoleTemplates({
   // ---------- 放大预览镜 ----------
 
   /** 以光标为中心放大当前画面帧：devPt 为放大中心（设备像素），rects 为要叠加显示的选区（设备像素坐标） */
-  function updateLoupe(clientX, clientY, devPt, zoom, rects) {
-    const video = surface()
+  let loupeRequest = 0
+  async function updateLoupe(clientX, clientY, devPt, zoom, rects) {
+    const request = ++loupeRequest
     const canvas = loupeCanvas.value
-    if (!(video?.naturalWidth || video?.videoWidth) || !canvas) return
+    if (!canvas) return
+    let frame
+    try { frame = await frames.captureDisplayFrame() } catch { return }
+    if (!frame || request !== loupeRequest) return
+    const video = frame.source
     const c = devPt
     const L = canvas.width
     const half = L / zoom / 2
@@ -654,7 +643,7 @@ export function useConsoleTemplates({
     loupe.y = Math.max(6, y)
   }
 
-  function hideLoupe() { loupe.show = false }
+  function hideLoupe() { loupeRequest++; loupe.show = false }
 
   function togglePick() {
     confirmDelTpl.value = null
@@ -725,7 +714,7 @@ export function useConsoleTemplates({
     const resolve = bridgeRegionResolve
     bridgeRegionResolve = null
     resolve(rect.w >= 8 && rect.h >= 8
-      ? { ...rect, width: (videoElement.value?.naturalWidth || videoElement.value?.videoWidth) || 0, height: (videoElement.value?.naturalHeight || videoElement.value?.videoHeight) || 0 }
+      ? { ...rect, ...surfaceSize() }
       : null)
     if (rect.w < 8 || rect.h < 8) toast('框选区域太小，请重新框选', 'warn')
   }
@@ -763,9 +752,12 @@ export function useConsoleTemplates({
   }
 
   /** 从当前舞台画面帧采样设备像素颜色 → 6 位 hex（画面不可用返回 null） */
-  function samplePixelHex(devX, devY) {
-    const v = surface()
-    if (!(v?.naturalWidth || v?.videoWidth)) return null
+  async function samplePixelHex(devX, devY) {
+    const frame = await frames.captureDisplayFrame()
+    if (!frame) return null
+    const v = frame.source
+    devX = Math.max(0, Math.min(frame.width - 1, Math.round(devX)))
+    devY = Math.max(0, Math.min(frame.height - 1, Math.round(devY)))
     const c = document.createElement('canvas')
     c.width = 1
     c.height = 1
@@ -776,15 +768,16 @@ export function useConsoleTemplates({
   }
 
   /** 视频画面点击 → 结束取点模式：coord 回相对坐标，color 回采样 hex */
-  function finishCellPick(e) {
-    const v = surface()
+  async function finishCellPick(e) {
+    const size = surfaceSize()
+    const generation = stage?.generation()
     const pt = toDeviceCoord(e.clientX, e.clientY)
     const mode = cellPick.mode
     cellPick.mode = null
     const resolve = cellPick.resolve
     cellPick.resolve = null
     hideLoupe()
-    if (!(v?.naturalWidth || v?.videoWidth)) {
+    if (!size.width || !size.height) {
       resolve?.(null)
       toast('设备画面不可用', 'warn')
       return
@@ -792,11 +785,13 @@ export function useConsoleTemplates({
     if (mode === 'coord') {
       feedback?.setCore({ text: '已取点', actions: [
         { label: `(${pt.x}, ${pt.y})`, copy: `[${pt.x}, ${pt.y}]` },
-        { label: `(${(pt.x / (v?.naturalWidth || v?.videoWidth)).toFixed(4)}, ${(pt.y / (v?.naturalHeight || v?.videoHeight)).toFixed(4)})`, copy: `[${(pt.x / (v?.naturalWidth || v?.videoWidth)).toFixed(4)}, ${(pt.y / (v?.naturalHeight || v?.videoHeight)).toFixed(4)}]` },
+        { label: `(${(pt.x / size.width).toFixed(4)}, ${(pt.y / size.height).toFixed(4)})`, copy: `[${(pt.x / size.width).toFixed(4)}, ${(pt.y / size.height).toFixed(4)}]` },
       ] })
-      resolve?.({ x: Number((pt.x / (v?.naturalWidth || v?.videoWidth)).toFixed(4)), y: Number((pt.y / (v?.naturalHeight || v?.videoHeight)).toFixed(4)) })
+      resolve?.({ x: Number((pt.x / size.width).toFixed(4)), y: Number((pt.y / size.height).toFixed(4)) })
     } else if (mode === 'color') {
-      const hex = samplePixelHex(pt.x, pt.y)
+      let hex
+      try { hex = await samplePixelHex(pt.x, pt.y) } catch { hex = null }
+      if (stage?.generation() !== generation) { resolve?.(null); return }
       if (hex) {
         feedback?.setCore({ text: '已取色', actions: [{ label: hex, copy: hex }, { label: `(${pt.x}, ${pt.y})`, copy: `[${pt.x}, ${pt.y}]` }] })
         resolve?.({ hex, x: pt.x, y: pt.y })

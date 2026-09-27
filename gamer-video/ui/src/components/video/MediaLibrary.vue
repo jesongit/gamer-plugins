@@ -19,7 +19,8 @@
           v-if="!session"
           class="btn btn-sm btn-primary"
           type="button"
-          :disabled="!deviceId || busy"
+          :disabled="!deviceId || busy || !canRecord"
+          :title="canRecord ? '' : '当前目标尚不支持录制'"
           data-testid="record-start"
           @click="start"
         ><UiIcon name="record" /> 开始录制</button>
@@ -202,6 +203,7 @@ const devices = devicesData
 // 设备 id 是 UUID 字符串；不能使用 v-model.number，否则以数字开头的 UUID
 // 会被 Vue 的 parseFloat 截断（例如 "831d..." → 831）。
 const deviceId = ref('')
+const canRecord = computed(() => devices.value.find(d => d.id === deviceId.value)?.capabilities?.recording !== false)
 const fileInput = ref(null)
 const importing = ref(false)
 const importingName = ref('')
@@ -314,6 +316,7 @@ onBeforeUnmount(stopPolling)
 // ---- 录制动作 ----
 
 async function start() {
+  if (!canRecord.value) { error.value = '当前目标尚不支持录制'; return }
   if (!deviceId.value || busy.value) return
   busy.value = true
   error.value = ''

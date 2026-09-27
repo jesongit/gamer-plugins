@@ -20,7 +20,7 @@ use uuid::Uuid;
 pub struct Target {
     pub device_id: String,
     pub package_id: String,
-    pub android_package: String,
+    pub android_package: Option<String>,
     pub package_stamp: String,
 }
 #[derive(Debug)]

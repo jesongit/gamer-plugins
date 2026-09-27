@@ -53,7 +53,7 @@ impl Backend for Fake {
         Ok(Target {
             device_id: device.into(),
             package_id: package.into(),
-            android_package: "app.game".into(),
+            android_package: Some("app.game".into()),
             package_stamp: "one".into(),
         })
     }

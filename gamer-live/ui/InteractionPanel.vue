@@ -131,7 +131,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); loadGeneration++ }
       <div class="head"><h3>互动执行目标</h3><span>{{ queue.target ? '已绑定' : '尚未绑定' }}</span></div>
       <div class="row"><label>目标设备<select v-model="deviceId" :disabled="!canBind || busy"><option value="">选择设备</option><option v-for="d in devices" :key="d.id" :value="d.id">{{ d.name || d.id }}</option></select></label><label>配置包<select v-model="packageId" :disabled="!canBind || dirty || busy"><option value="">选择配置包</option><option v-for="p in packages" :key="p.id" :value="p.id">{{ p.name || p.id }}</option></select></label></div>
       <div class="actions"><button :disabled="busy || !canBind || !packageId || !deviceId || dirty" @click="operate(async () => { await call('queue.configure', { device_id: deviceId, package_id: packageId }); await loadRules() }, '执行目标已保存，开启规则后自动执行')">保存执行目标</button><button :disabled="busy || dirty || !packageId" @click="operate(loadRules, '规则已读取')">读取规则</button></div>
-      <p class="hint" v-if="queue.target">队列绑定：{{ queue.target.device_id }} · {{ queue.target.package_id }} · {{ queue.target.android_package }}。切换工作台页面不会改变此目标。</p><button v-if="queue.target" :disabled="busy || !canBind" @click="control('unbind')">清除执行目标</button>
+      <p class="hint" v-if="queue.target">队列绑定：{{ queue.target.device_id }} · {{ queue.target.package_id }}<template v-if="queue.target.android_package"> · {{ queue.target.android_package }}</template>。切换工作台页面不会改变此目标。</p><button v-if="queue.target" :disabled="busy || !canBind" @click="control('unbind')">清除执行目标</button>
     </section>
 
     <p v-if="view === 'rules'" class="hint">{{ connected ? '直播已连接' : '直播未连接，请在直播设置中连接账号' }} · {{ queue.target ? '规则开启后，新消息匹配即自动排队执行' : '请先在直播设置中选择执行设备和配置包' }}</p>

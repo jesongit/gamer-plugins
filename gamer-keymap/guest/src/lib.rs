@@ -36,7 +36,7 @@ wit_bindgen::generate!({
 });
 
 use exports::gamer::keymap::keymap::{
-    DeviceAction, EventKind, Guest, InputEvent, InputResult, KeyAction,
+    DeviceAction, EventKind, Guest, InputEvent, InputResult, KeyAction, NamedKeyAction,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -68,9 +68,12 @@ enum Rule {
         to: [f64; 2],
         duration_ms: u64,
     },
-    RawKey(u32),
+    RawKey(KeyTarget),
     /// guest 自有 slot 由规则序号决定，保证按下/抬起配对稳定。
-    Hold { slot: u64, at: [f64; 2] },
+    Hold {
+        slot: u64,
+        at: [f64; 2],
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -145,24 +148,25 @@ fn parse_profile(profile: &str) -> Result<std::collections::HashMap<String, Rule
                 duration_ms: binding.action.duration_ms.unwrap_or(30).clamp(1, 60_000),
             },
             "raw_key" => {
-                let keycode = binding
-                    .action
-                    .keycode
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        let code = binding
-                            .action
-                            .code
-                            .as_deref()
-                            .ok_or("keymap profile raw_key 需要 code 或 keycode")?;
-                        android_keycode(code)
-                            .ok_or_else(|| format!("keymap profile 未知 Android key: {code}"))
-                    })?;
-                if !(1..=1000).contains(&keycode) {
-                    return Err(format!("keymap profile keycode 超出范围: {keycode}"));
-                }
-                Rule::RawKey(keycode)
+                let key = if let Some(code) = binding.action.keycode {
+                    if !(1..=1000).contains(&code) {
+                        return Err("Android keycode 超出范围".into());
+                    }
+                    KeyTarget::Android(code)
+                } else {
+                    let name = binding
+                        .action
+                        .code
+                        .clone()
+                        .ok_or("raw_key 需要 code 或 keycode")?;
+                    if name.is_empty() || name.len() > 64 {
+                        return Err("无效按键名称".into());
+                    }
+                    KeyTarget::Named(name)
+                };
+                Rule::RawKey(key)
             }
+
             "hold" => Rule::Hold {
                 // 与内置 slot（1-4）隔离的 guest 自有 slot 段。
                 slot: 100 + index as u64,
@@ -186,39 +190,26 @@ fn normalized(point: [f64; 2]) -> exports::gamer::keymap::keymap::Point {
     }
 }
 
-/// raw_key `code` 名 → Android keycode（与 host 侧 android_keycode 同表的精简版）。
-fn android_keycode(code: &str) -> Option<u32> {
-    if let Some(letter) = code.strip_prefix("Key") {
-        let byte = letter.as_bytes().first().copied()?;
-        if letter.len() == 1 && byte.is_ascii_uppercase() {
-            return Some(29 + u32::from(byte - b'A'));
+#[derive(Debug, Clone)]
+enum KeyTarget {
+    Named(String),
+    Android(u32),
+}
+impl KeyTarget {
+    fn action(&self, action: &str) -> DeviceAction {
+        match self {
+            Self::Named(name) => DeviceAction::NamedKey(NamedKeyAction {
+                name: name.clone(),
+                action: action.into(),
+            }),
+            Self::Android(code) => DeviceAction::Key(KeyAction {
+                code: *code,
+                action: action.into(),
+            }),
         }
     }
-    if let Some(digit) = code.strip_prefix("Digit") {
-        let byte = digit.as_bytes().first().copied()?;
-        if digit.len() == 1 && byte.is_ascii_digit() {
-            return Some(7 + u32::from(byte - b'0'));
-        }
-    }
-    Some(match code {
-        "ArrowUp" => 19,
-        "ArrowDown" => 20,
-        "ArrowLeft" => 21,
-        "ArrowRight" => 22,
-        "Home" => 3,
-        "Back" => 4,
-        "Space" => 62,
-        "Enter" => 66,
-        "NumpadEnter" => 160,
-        "Tab" => 61,
-        "Escape" => 111,
-        "Backspace" => 67,
-        "Delete" => 112,
-        _ => return None,
-    })
 }
 
-/// profile 规则的按下/抬起动作。返回 None 表示该 selector 没有 profile 规则。
 fn profile_action(
     guest_state: &mut GuestState,
     selector: &str,
@@ -229,24 +220,23 @@ fn profile_action(
     if press {
         match rule {
             Rule::Tap(at) => Some(vec![DeviceAction::Tap(normalized(*at))]),
-            Rule::Swipe { from, to, duration_ms } => {
-                Some(vec![DeviceAction::Swipe(
-                    exports::gamer::keymap::keymap::Swipe {
-                        from_point: normalized(*from),
-                        to: normalized(*to),
-                        duration_ms: *duration_ms,
-                    },
-                )])
-            }
+            Rule::Swipe {
+                from,
+                to,
+                duration_ms,
+            } => Some(vec![DeviceAction::Swipe(
+                exports::gamer::keymap::keymap::Swipe {
+                    from_point: normalized(*from),
+                    to: normalized(*to),
+                    duration_ms: *duration_ms,
+                },
+            )]),
             Rule::RawKey(keycode) => {
                 if guest_state.active_raw.contains(selector) {
                     Some(Vec::new())
                 } else {
                     guest_state.active_raw.insert(selector.to_string());
-                    Some(vec![DeviceAction::Key(KeyAction {
-                        code: *keycode,
-                        action: "down".to_string(),
-                    })])
+                    Some(vec![keycode.action("down")])
                 }
             }
             Rule::Hold { slot, at } => {
@@ -274,10 +264,7 @@ fn profile_action(
             }
             Rule::RawKey(keycode) => {
                 if guest_state.active_raw.remove(selector) {
-                    Some(vec![DeviceAction::Key(KeyAction {
-                        code: *keycode,
-                        action: "up".to_string(),
-                    })])
+                    Some(vec![keycode.action("up")])
                 } else {
                     Some(Vec::new())
                 }
@@ -348,6 +335,12 @@ impl Guest for KeymapGuest {
         let mut guest_state = state()
             .lock()
             .map_err(|_| "guest state poisoned".to_string())?;
+        if guest_state.rules.is_none() {
+            return Ok(InputResult {
+                consume: false,
+                actions: Vec::new(),
+            });
+        }
         let actions = match event.kind {
             EventKind::KeyDown | EventKind::KeyUp => {
                 let selector = event.code.as_deref().unwrap_or_default();
