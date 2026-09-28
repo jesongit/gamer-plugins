@@ -22,6 +22,8 @@ pnpm --dir plugins/gamer-yaml/ui test
 
 UI 与 WASM 可在现有宿主契约内独立更新，无需重编译主程序。`host/` 不是热加载 Rust 库，这部分改动需服务端构建。跨插件功能使用公开动作或共享消息通道；不能跨目录修改其他插件的数据。
 
+工作台统一使用「自动化」入口，内部提供「脚本 / 函数 / 模板」子页签；脚本与函数保留各自选择，切换时保护未保存修改，函数定义跳转与返回自动切换对应子页签。
+
 UI 与 Core 共享的模块清单在 `sdk/ui/host-modules.json`，构建时映射为宿主 SDK，不打包另一份 Vue/store。新增宿主 API 要先扩展并验证该契约。宿主 UI 声明 `ui.host` 权限，在安装确认中明确其页面访问能力；第三方需要隔离时使用原有 sandbox iframe SDK。
 
 通用说明：[插件开发指南](../../docs/guides/plugin-dev.md)，[界面设计规范](../../docs/design/gamer-ui-spec.md)。

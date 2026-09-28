@@ -231,6 +231,7 @@ async function allowSwitch() {
   if (!ownsModel || ctx.shell.dirty) ctx.shell.reset()
   return true
 }
+defineExpose({ beforeTabChange: allowSwitch })
 let selectionGeneration = 0
 async function loadSelected() {
   if (ctx.store.running || !hasTarget.value) return

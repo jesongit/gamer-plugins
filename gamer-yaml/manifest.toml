@@ -26,8 +26,7 @@ kind = "wasm"
 host_version = ">=0.2.5"
 
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端
-# core-component-registry 解释（console.scripts = 自动化编辑器、
-# console.functions = 函数库模式、console.templates = 模板框选）。
+# core-component-registry 解释（console.scripts = 自动化工作台，含脚本/函数/模板子页签）。
 
 [[ui.contributions]]
 panel_id = "automation"
@@ -40,27 +39,3 @@ entry = "ui/plugin.js"
 requires_device = true
 preferred_width = 440
 component = "console.scripts"
-
-[[ui.contributions]]
-panel_id = "functions"
-title = "函数"
-icon = "ƒ"
-order = 30
-location = "console.right"
-runtime = "core"
-entry = "ui/plugin.js"
-requires_device = false
-preferred_width = 440
-component = "console.functions"
-
-[[ui.contributions]]
-panel_id = "templates"
-title = "模板"
-icon = "🖼️"
-order = 35
-location = "console.right"
-runtime = "core"
-entry = "ui/plugin.js"
-requires_device = true
-preferred_width = 440
-component = "console.templates"

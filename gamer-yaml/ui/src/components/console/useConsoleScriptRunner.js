@@ -21,8 +21,8 @@ import { startIndexOf } from '../../script-editor/selection'
 import { buildFunctionViews, filterFunctionViews, createPinyinInitials } from '../../console/function-list'
 
 /**
- * gamer-yaml 面板运行器（console.scripts / console.functions 两个扩展面板的
- * 共享实现）：运行区（目标选择、只读摘要、从此运行）、编辑外壳
+ * gamer-yaml 自动化工作台的脚本/函数子页签共享实现：
+ * 运行区（目标选择、只读摘要、从此运行）、编辑外壳
  * （useScriptEditorShell/rawEditor/fnLib）、call/func 目标参数解析、
  * 运行参数流程、运行日志与运行状态轮询。
  *
@@ -56,6 +56,7 @@ export function useConsoleScriptRunner({
   }
   const scriptScope = createPanelScope('script')
   const funcScope = createPanelScope('func')
+  const automationTab = ref('scripts')
 
   async function refreshScripts() {
     const requestedPackage = String(packageId.value || '').trim()
@@ -641,6 +642,7 @@ export function useConsoleScriptRunner({
       selScript.value = scriptId
       if (rawEditor.resourceId.value) cancelRawScript(scriptScope)
       await editCurrentScript()
+      automationTab.value = 'scripts'
     })()
   })
 
@@ -953,7 +955,8 @@ export function useConsoleScriptRunner({
       editFocusFn.value = target
       funcScope.scriptMode.value = 'edit'
       showYaml.value = false
-      return 'gamer-yaml:functions'
+      automationTab.value = 'functions'
+      return 'gamer-yaml:automation'
     } catch (e) {
       toast('跳转失败：' + e.message, 'error')
       return null
@@ -972,10 +975,12 @@ export function useConsoleScriptRunner({
       if (scriptShell.kind === 'function_library') {
         editFocusFn.value = previous.functionName || scriptShell.model.functions[0]?.name || ''
         funcScope.scriptMode.value = 'edit'
-        return 'gamer-yaml:functions'
+        automationTab.value = 'functions'
+        return 'gamer-yaml:automation'
       }
       selScript.value = scriptShell.resourceId
       scriptScope.scriptMode.value = 'edit'
+      automationTab.value = 'scripts'
       return 'gamer-yaml:automation'
     } catch (e) {
       toast('返回失败：' + e.message, 'error')
@@ -1214,6 +1219,7 @@ export function useConsoleScriptRunner({
   function buildPanelContext(scope) {
     return {
       pendingRunLocation,
+      automationTab,
       kind: scope.kind,
       kindLocked: true,
       runKind: scope.runKind,
