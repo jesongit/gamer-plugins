@@ -1574,7 +1574,7 @@ mod tests {
             KEYMAP_EXTENSION_MANIFEST_TOML.contains("permissions = [\"ui.host\", \"input.tap\"")
         );
         assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("panel_id = \"keymaps\""));
-        assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("title = \"映射\""));
+        assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("title = \"键盘映射\""));
         assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("runtime = \"core\""));
         assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("component = \"console.keymaps\""));
         assert!(KEYMAP_EXTENSION_MANIFEST_TOML.contains("entry = \"ui/plugin.js\""));

@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-keymap"
-version = "0.1.3"
+version = "0.1.4"
 name = "键盘映射"
 description = "按键映射：键盘、鼠标、手柄动作映射为设备触控与按键"
 entry = "plugin.wasm"
@@ -24,7 +24,7 @@ kind = "wasm"
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端
 # core-component-registry 解释（console.keymaps = 映射面板）。
 panel_id = "keymaps"
-title = "映射"
+title = "键盘映射"
 icon = "⌨"
 order = 30
 location = "console.right"

@@ -4,7 +4,7 @@
       <option v-if="!packages.length" value="">（无脚本）</option>
       <option v-for="p in packages" :key="p" :value="p">{{ p }}</option>
     </select>
-    <select :disabled="disabled" v-model="sel" class="select mono sp-name" title="运行脚本">
+    <select :disabled="disabled" :value="sel" @change="selectScript" class="select mono sp-name" title="运行脚本">
       <option value="">选择脚本…</option>
       <option v-for="s in pkgScripts" :key="s.id" :value="s.id">{{ s.name }}</option>
     </select>
@@ -12,7 +12,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { scriptsData } from '../../../../../web/src/store'
 
 const props = defineProps({
@@ -41,6 +41,12 @@ const sel = computed({
   get: () => (pkgScripts.value.some(s => s.id === props.modelValue) ? props.modelValue : ''),
   set: v => emit('update:modelValue', v)
 })
+async function selectScript(event) {
+  emit('update:modelValue', event.target.value)
+  // 父层可能拒绝切换（未保存确认/运行守卫），原生 select 也需回显受控选择。
+  await nextTick()
+  event.target.value = sel.value
+}
 
 // 初始分区跟随已选脚本（id 形如 "<pkg>/<name>.yaml"）
 watch(() => props.modelValue, v => { if (v) innerPkg.value = v.split('/')[0] || '' }, { immediate: true })

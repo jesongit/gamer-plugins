@@ -1,6 +1,6 @@
 // 运行参数流程（阶段 5，plan §12.1/§12.2；P12.3 起参数声明走服务端 schema API）：
 // Console 手动运行与独立页函数测试共用的
-// 「取 schema → 有参数先弹表单 → 稀疏 args 提交 → 400 诊断回填字段 → 202 摘要+建议缓存」状态机。
+// 「取 schema → 仅补齐必填值 → 稀疏 args 提交 → 400 诊断回填字段 → 202 摘要+建议缓存」状态机。
 //
 // 宿主注入：
 // - exec({ id, name, kind, fnName, startIndex, args }) → 202 回复（宿主完成 API 调用与
@@ -16,6 +16,7 @@ import {
   mapArgDiagnostics, saveRunArgsSuggestion,
 } from '../script-editor/params'
 import { schemaToParamDecls } from '../script-editor/entrypointParams'
+import { checkLiteral, hasParamDefault } from '../script-editor/schema'
 
 /** schema 加载失败 → 结构化 Error（code/diagnostics 供宿主分型展示）。 */
 function toParamsLoadError(e, { runnerId, entrypoint }) {
@@ -45,6 +46,9 @@ function toParamsLoadError(e, { runnerId, entrypoint }) {
 export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, loadParams = undefined } = {}) {
   const loadDescriptor = loadParams
     || (({ runnerId, entrypoint }) => api.getEntrypointParams(runnerId, entrypoint))
+  let generation = 0
+  let declaredParams = []
+  let suppliedRequiredArgs = {}
   // 弹窗态（RunParamsModal props 直接绑定 modal.*）
   const modal = reactive({
     open: false,
@@ -55,6 +59,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
     targetName: '',
     kind: 'script',     // 'script' | 'function_library'
     fnName: null,       // 函数测试目标函数名
+    deviceId: null,
     startIndex: 0,
     params: [],
     initialArgs: {},
@@ -75,17 +80,21 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
   }
 
   function close() {
+    if (modal.submitting) return
+    generation++
+    modal.loading = false
     reset()
   }
 
   /**
    * 发起一次运行/测试：先经服务端 entrypoint schema API 取参数声明（404/400 等
-   * 加载失败 → 结构化 Error 上抛，宿主提示，不弹参数框）；有参数 → 打开表单
-   * （返回 {form:true} 等待用户提交）；无参数 → 跳过表单直接 exec（args 省略）。
+   * 加载失败 → 结构化 Error 上抛，宿主提示，不弹参数框）；缺少必填值 → 打开表单
+   * （返回 {form:true} 等待用户提交）；其余直接 exec，默认值交由服务端采用。
    * submitting 期间与表单打开时忽略重复发起。
    */
   async function begin(opts = {}) {
     if (modal.open || modal.submitting || modal.loading) return { form: false, busy: true }
+    const request = ++generation
     const kind = opts.kind || 'script'
     const runnerId = opts.runnerId || ''
     const entrypoint = opts.entrypoint || ''
@@ -97,14 +106,16 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       targetName: opts.name || opts.id || '',
       kind,
       fnName: opts.fnName ?? null,
+      deviceId: opts.deviceId ?? null,
       startIndex: opts.startIndex || 0,
-      initialArgs: opts.initialArgs || {},
+      initialArgs: {},
     })
     modal.loading = true
     let descriptor
     try {
       descriptor = await loadDescriptor({ runnerId, entrypoint })
     } catch (e) {
+      if (request !== generation) return { form: false, cancelled: true }
       // 加载失败：清空弹窗态（含上一次目标的参数残留）→ 结构化错误上抛交宿主提示
       modal.params = []
       modal.suggestions = {}
@@ -112,10 +123,20 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       reset()
       throw toParamsLoadError(e, { runnerId, entrypoint })
     } finally {
-      modal.loading = false
+      if (request === generation) modal.loading = false
     }
-    modal.params = schemaToParamDecls(descriptor?.schema)
-    modal.suggestions = loadRunArgsSuggestion(opts.id || '', storage)
+    if (request !== generation) return { form: false, cancelled: true }
+    declaredParams = schemaToParamDecls(descriptor?.schema)
+    const required = declaredParams.filter(param => param.required && !hasParamDefault(param))
+    suppliedRequiredArgs = Object.fromEntries(required.filter(param => {
+      const value = opts.initialArgs?.[param.name]
+      return value !== undefined && value !== null && value !== '' && !checkLiteral(param.type, value)
+    }).map(param => [param.name, opts.initialArgs[param.name]]))
+    // 手动运行直接采用声明默认值，只补齐未提供的必填值。
+    modal.params = required.filter(param => !Object.hasOwn(suppliedRequiredArgs, param.name))
+    const suggestions = loadRunArgsSuggestion(opts.id || '', storage)
+    modal.suggestions = Object.fromEntries(modal.params.filter(param => Object.hasOwn(suggestions, param.name))
+      .map(param => [param.name, suggestions[param.name]]))
     modal.templates = opts.templates || []
     if (!modal.params.length) {
       await run(undefined)
@@ -127,6 +148,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
 
   /** RunParamsModal 提交（已过客户端校验）：稀疏 args → 服务端。 */
   async function confirm(args) {
+    if (!modal.open || modal.submitting || modal.loading) return { ok: false, reason: 'inactive' }
     return run(args)
   }
 
@@ -134,6 +156,11 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
     modal.submitting = true
     modal.fieldErrors = {}
     modal.generalErrors = []
+    const explicit = { ...suppliedRequiredArgs }
+    for (const param of modal.params) {
+      if (args && Object.hasOwn(args, param.name)) explicit[param.name] = args[param.name]
+    }
+    args = Object.keys(explicit).length ? explicit : undefined
     const opts = {
       id: modal.targetId,
       name: modal.targetName,
@@ -141,16 +168,17 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       fnName: modal.fnName,
       startIndex: modal.startIndex,
       args,
+      ...(modal.deviceId ? { deviceId: modal.deviceId } : {}),
     }
     try {
       const rep = await exec(opts)
       modal.open = false
-      // 仅显式覆盖值进建议缓存；「使用默认值」不写入（默认值变化不被旧缓存遮蔽）
+      // 仅补填的必填值进建议缓存；声明默认值不写入，也不被旧覆盖缓存遮蔽。
       if (args && Object.keys(args).length) saveRunArgsSuggestion(modal.targetId, args, storage)
       notify({
         rep,
         args,
-        summary: describeResolvedArgs(modal.params, args, rep?.resolved_args),
+        summary: describeResolvedArgs(declaredParams, args, rep?.resolved_args),
       })
       return { ok: true, rep }
     } catch (e) {

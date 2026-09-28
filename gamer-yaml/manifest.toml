@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-yaml"
-version = "0.1.1"
+version = "0.1.2"
 name = "自动化"
 description = "自动化：YAML V1 脚本、函数库与模板的制作与运行"
 entry = "plugin.wasm"
@@ -23,11 +23,10 @@ log = "^1.0"
 # 独立 WASM guest：真实 plugin.wasm，按调用惰性实例化（无实例执行模型）。
 [execution]
 kind = "wasm"
-host_version = ">=0.2.5"
+host_version = ">=0.2.6"
 
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端
-# core-component-registry 解释（console.scripts = 自动化编辑器、
-# console.functions = 函数库模式、console.templates = 模板框选）。
+# core-component-registry 解释（console.scripts = 自动化工作台，含脚本/函数/模板子页签）。
 
 [[ui.contributions]]
 panel_id = "automation"
@@ -40,27 +39,3 @@ entry = "ui/plugin.js"
 requires_device = true
 preferred_width = 440
 component = "console.scripts"
-
-[[ui.contributions]]
-panel_id = "functions"
-title = "函数"
-icon = "ƒ"
-order = 30
-location = "console.right"
-runtime = "core"
-entry = "ui/plugin.js"
-requires_device = false
-preferred_width = 440
-component = "console.functions"
-
-[[ui.contributions]]
-panel_id = "templates"
-title = "模板"
-icon = "🖼️"
-order = 35
-location = "console.right"
-runtime = "core"
-entry = "ui/plugin.js"
-requires_device = true
-preferred_width = 440
-component = "console.templates"

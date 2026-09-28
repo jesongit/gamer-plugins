@@ -19,15 +19,12 @@
 
     <template v-if="isRef">
       <!-- v3 表达式引用：自由属性路径（$reward.center / $list[0]）+ 声明参数联想 -->
-      <input
-        class="cell-input ref-input mono" :value="refPath" :list="listId"
+      <ThemedCombobox
+        class="cell-input ref-input mono" :model-value="refPath" :options="referenceOptions"
         :placeholder="placeholder || '变量路径，如 reward.center'" :aria-label="`${label}引用`"
         spellcheck="false" autocomplete="off"
-        @input.stop="onRefInput(($event.target as HTMLInputElement).value)"
+        @update:model-value="onRefInput"
       />
-      <datalist :id="listId">
-        <option v-for="p in params" :key="p.name" :value="p.name">{{ p.remark || p.desc || p.type }}</option>
-      </datalist>
     </template>
 
     <template v-else>
@@ -138,15 +135,17 @@
         />
       </template>
 
-      <!-- key：枚举下拉 -->
+      <!-- key：主题下拉 + 一次按键录入 -->
       <template v-else-if="controlType === 'key'">
-        <input
-          class="cell-input" :value="litString" :list="keyListId" :aria-label="label"
-          placeholder="按键名或数字 keycode" @input.stop="onText($event, (v) => emitLit(v))"
+        <ThemedCombobox ref="keyInput" class="cell-input" :model-value="litString" :options="KEY_ENUM" :aria-label="label"
+          :suggestions-enabled="!recordingKey" :readonly="recordingKey"
+          :data-key-recording="recordingKey || undefined"
+          :placeholder="recordingKey ? '请按下一个键…' : '按键名或数字 keycode'"
+          @update:model-value="emitLit" @keydown.capture="captureKey" @keyup.capture="releaseRecordedKey" @blur="stopKeyCapture"
         />
-        <datalist :id="keyListId">
-          <option v-for="k in KEY_ENUM" :key="k" :value="k" />
-        </datalist>
+        <button type="button" class="cell-tool live key-record" :class="{ active: recordingKey }"
+          :aria-pressed="recordingKey" @mousedown.prevent @click.stop="toggleKeyCapture">{{ recordingKey ? '取消录入' : '录入按键' }}</button>
+        <span v-if="recordingKey" class="key-record-hint" role="status">{{ keyCaptureError || '请按下一个键…' }}</span>
       </template>
 
       <!-- bool：下拉 真/假 -->
@@ -163,7 +162,7 @@
       <!-- expr：通用表达式字面量（true/false/数字自动识别，其余按字符串） -->
       <template v-else-if="controlType === 'expr'">
         <input
-          class="cell-input mono" :value="litString" :list="listId"
+          class="cell-input mono" :value="litString"
           :placeholder="placeholder || '字面量或 $引用'" :aria-label="label"
           spellcheck="false" autocomplete="off"
           @input.stop="onText($event, (v) => emitLit(parseExprText(v)))"
@@ -199,13 +198,6 @@
   </div>
 </template>
 
-<script lang="ts">
-/** 模块级实例计数（datalist id 唯一化；script setup 内变量每实例重置，须放这里）。 */
-let listIdSeq = 0
-function nextListId(): number {
-  return ++listIdSeq
-}
-</script>
 <script setup lang="ts">
 /**
  * 取值单元格编辑器（v3）：字面量 ↔ $属性路径引用 切换（$reward.center、$list[0]）。
@@ -214,12 +206,13 @@ function nextListId(): number {
  * 字面量控件：模板短名 / 坐标双数字 / 数值+单位 / 按键枚举 / 布尔 / 通用表达式 / 数字 / 文本。
  * v3 表达式动态类型：引用下拉不再按参数类型过滤，全部声明仅作联想。
  */
-import { computed, inject, ref } from 'vue'
+import { computed, inject, nextTick, ref } from 'vue'
+import ThemedCombobox from '../../../../../ui-shared/ThemedCombobox.vue'
 import type { PropType } from 'vue'
 import { pinyin } from 'pinyin-pro'
 import { isRefCell, type Cell, type ParamDecl } from '../model'
 import { SE_TEMPLATE_MATCH_OPTIONS, type TemplateMatchOptions } from '../targets'
-import { checkLiteral, isRefPath, isCoordObject, KEY_ENUM, paramControlType, normalizeParamType, TIME_UNITS, type ParamControlType, type ParamType } from '../schema'
+import { checkLiteral, isRefPath, isCoordObject, isKnownKey, KEY_ENUM, paramControlType, normalizeParamType, TIME_UNITS, type ParamControlType, type ParamType } from '../schema'
 
 const props = defineProps({
   cell: { type: Object as PropType<Cell>, required: true },
@@ -263,9 +256,33 @@ function removeTemplateItem(index: number): void {
   emitLit(templateItems.value.filter((_, i) => i !== index))
 }
 
-/** datalist id 每实例唯一，避免多实例互相覆盖联想列表。 */
-const listId = `se-params-${nextListId()}`
-const keyListId = `se-keys-${nextListId()}`
+const referenceOptions = computed(() => props.params.map(p => ({ value: p.name, label: p.name, hint: p.remark || p.desc || p.type })))
+const keyInput = ref<InstanceType<typeof ThemedCombobox> | null>(null)
+const recordingKey = ref(false), keyCaptureError = ref('')
+let recordedCode = ''
+function stopKeyCapture() { recordingKey.value = false; keyCaptureError.value = ''; recordedCode = '' }
+async function toggleKeyCapture() {
+  if (recordingKey.value) { stopKeyCapture(); return }
+  recordingKey.value = true; keyCaptureError.value = ''; recordedCode = ''
+  await nextTick()
+  keyInput.value?.focus()
+}
+function captureKey(event: KeyboardEvent) {
+  if (!recordingKey.value && (!recordedCode || event.code !== recordedCode)) return
+  event.preventDefault(); event.stopImmediatePropagation()
+  if (!recordingKey.value || event.repeat || event.isComposing || event.key === 'Process' || event.key === 'Dead') return
+  // Physical codes distinguish digit keys from Android numeric keycodes and work on both target types.
+  const key = event.code || (event.key === ' ' ? 'SPACE' : event.key)
+  if (!isKnownKey(key)) { keyCaptureError.value = '暂不支持此按键，请重新按键'; return }
+  recordedCode = event.code
+  emitLit(key)
+  recordingKey.value = false; keyCaptureError.value = ''
+}
+function releaseRecordedKey(event: KeyboardEvent) {
+  if (!recordingKey.value && (!recordedCode || event.code !== recordedCode)) return
+  event.preventDefault(); event.stopImmediatePropagation()
+  recordedCode = ''
+}
 
 /** 正式 V1 类型统一在 CellEditor 入口适配；旧控件别名仅为已有编辑态兼容。 */
 function controlTypeFor(raw: string): ParamControlType {
@@ -554,6 +571,8 @@ function onNum(e: Event): void {
 .tpl-drop-name { font-size: 12px; color: var(--text-0); word-break: break-all; }
 .tpl-drop-empty { padding: 10px; font-size: 12px; color: var(--text-2); text-align: center; }
 .cell-err-msg { font-size: 12px; color: var(--danger); }
+.key-record { flex: none; white-space: nowrap; }
+.key-record-hint { color: var(--accent); font-size: 12px; }
 .mono { font-family: var(--mono); }
 .cell-input{min-height:28px;padding:3px 7px;font-size:13px;border-color:var(--control-border);background:var(--field)}.cell-tool,.mode-btn{height:26px;min-width:26px;font-size:12px;padding:3px 6px}.cell-editor{gap:5px}.cell-mode{flex:none}.tmpl-wrap{flex:1;min-width:110px}.tmpl-wrap .cell-input{width:100%}
 </style>

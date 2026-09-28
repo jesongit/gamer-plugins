@@ -41,7 +41,7 @@ impl Settings {
         );
         anyhow::ensure!(
             self.before_click_ms <= 60_000 && self.after_click_ms <= 60_000,
-            "点击前后延迟须为 0～60000 毫秒的整数"
+            "点击/按键前后延迟须为 0～60000 毫秒的整数"
         );
         Ok(())
     }
@@ -92,10 +92,10 @@ fn view(settings: Settings) -> Value {
         "fields": [{"key":"default_timeout_secs", "label":"默认模板等待超时", "unit":"秒",
             "min":1, "max":3600, "effect":"下次运行生效",
             "help":"用于 wait_find、tap_template、wait_disappear；步骤指定的 timeout 优先，正在运行的任务不受影响。"},
-            {"key":"before_click_ms", "label":"点击前延迟", "unit":"毫秒", "min":0, "max":60000,
-                "effect":"下次运行生效", "help":"自动化确定点击位置后、按下前等待；0 表示关闭，不影响投屏手动操作。"},
-            {"key":"after_click_ms", "label":"点击后延迟", "unit":"毫秒", "min":0, "max":60000,
-                "effect":"下次运行生效", "help":"自动化点击松开后等待；适用于坐标点击、模板自动点击和障碍模板点击，0 表示关闭。"}]
+            {"key":"before_click_ms", "label":"点击/按键前延迟", "unit":"毫秒", "min":0, "max":60000,
+                "effect":"下次运行生效", "help":"自动化确定点击位置后或发送按键前等待；0 表示关闭，不影响投屏手动操作。"},
+            {"key":"after_click_ms", "label":"点击/按键后延迟", "unit":"毫秒", "min":0, "max":60000,
+                "effect":"下次运行生效", "help":"自动化点击或按键动作完成后等待；适用于坐标点击、模板自动点击、障碍模板点击及 key 的 press/down/up，0 表示关闭。"}]
     })
 }
 
