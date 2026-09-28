@@ -201,7 +201,9 @@ export function useConsoleTemplates({
     cropBaseCanvas.height = crop.baseH
     cropBaseCanvas.getContext('2d').drawImage(source, crop.originX, crop.originY, crop.baseW, crop.baseH, 0, 0, crop.baseW, crop.baseH)
     crop.rect = { x: 0, y: 0, w: crop.baseW, h: crop.baseH }
-    crop.name = crop.replacement?.shortName || defaultTplName(rect)
+    crop.name = crop.replacement
+      ? defaultTemplateName(rect, imgW, imgH, crop.replacement.shortName.replace(/\.(png|jpe?g)$/i, ''))
+      : defaultTplName(rect)
     crop.active = true
     nextTick(() => {
       renderCropFrame()
