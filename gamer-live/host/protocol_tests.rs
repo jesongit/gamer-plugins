@@ -54,24 +54,25 @@ async fn signed_http_uses_empty_oauth_body_and_never_returns_remote_secret_text(
     let error = c.post("/test", Value::Null).await.unwrap_err().to_string();
     assert!(error.contains("123"));
     assert!(!error.contains("do-not-leak"));
-    let rows = captured.lock();
-    let (headers, body) = &rows[0];
-    assert!(body.is_empty());
-    assert_eq!(
-        headers["x-bili-content-md5"],
-        "d41d8cd98f00b204e9800998ecf8427e"
-    );
-    assert_eq!(headers["access-token"], "token");
-    assert_eq!(headers["x-bili-signature-version"], "2.0");
-    let expected = signed_headers(
-        &c.credentials,
-        body,
-        headers["x-bili-timestamp"].to_str().unwrap(),
-        headers["x-bili-signature-nonce"].to_str().unwrap(),
-    )
-    .unwrap();
-    assert_eq!(headers["authorization"], expected["authorization"]);
-    drop(rows);
+    {
+        let rows = captured.lock();
+        let (headers, body) = &rows[0];
+        assert!(body.is_empty());
+        assert_eq!(
+            headers["x-bili-content-md5"],
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(headers["access-token"], "token");
+        assert_eq!(headers["x-bili-signature-version"], "2.0");
+        let expected = signed_headers(
+            &c.credentials,
+            body,
+            headers["x-bili-timestamp"].to_str().unwrap(),
+            headers["x-bili-signature-nonce"].to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(headers["authorization"], expected["authorization"]);
+    }
     task.abort();
     let _ = task.await;
 }

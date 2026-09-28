@@ -1,6 +1,13 @@
 {
   "plugins": [
     {
+      "id": "gamer-package-publisher",
+      "version": "0.1.0",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-package-publisher-v0.1.0/gamer-package-publisher-0.1.0.gplugin",
+      "size": 5120,
+      "sha256": "de16d36c1b99c1253992b6d4412b70ce19a9f9dec0d878dc75020c850eb613a9"
+    },
+    {
       "id": "gamer-keymap",
       "version": "0.1.0",
       "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.0/gamer-keymap-0.1.0.gplugin",
