@@ -22,7 +22,6 @@
         <button class="btn btn-sm" :class="{ active: ctx.picking }" :disabled="!ctx.stageReady" title="在当前舞台画面上框选（实时投屏或视频来源均可）" @click="ctx.togglePick">✂️ 框选</button>
         <button class="btn btn-sm" @click="tplUpload.click()" title="选择图片或多选；zip 压缩包自动解压导入（已存在同名跳过）"><UiIcon name="upload" /> 上传</button>
         <input ref="tplUpload" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,.zip" multiple hidden @change="ctx.onTplUpload" />
-        <input ref="tplReplaceUpload" type="file" accept="image/png,image/jpeg" hidden @change="onReplaceUpload" />
       </div>
 
       <div class="tpl-list-wrap">
@@ -67,7 +66,7 @@
                 <span v-if="moreOpenName === t.name" class="tpl-more-mask" @click.stop="closeMore"></span>
                 <span v-if="moreOpenName === t.name" ref="moreMenuEls" class="tpl-more-dropdown action-menu" :style="moreMenuStyle" role="menu" @keydown.esc.stop.prevent="dismissMore">
                   <button class="tpl-more-item action-menu-item" role="menuitem" @click.stop="openRename(t)">重命名</button>
-                  <button class="tpl-more-item action-menu-item" role="menuitem" @click.stop="replaceTemplate(t)">替换</button>
+                  <button class="tpl-more-item action-menu-item" role="menuitem" :disabled="!ctx.stageReady || ctx.saving" @click.stop="replaceTemplate(t)">替换</button>
                   <span class="action-menu-separator" role="separator"></span>
                   <button class="tpl-more-item action-menu-item danger" role="menuitem" @click.stop="deleteTemplate(t)">删除</button>
                 </span>
@@ -98,8 +97,6 @@ import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 const props = defineProps({ context: { type: Object, required: true } })
 const ctx = reactive(props.context)
 const tplUpload = ref(null)
-const tplReplaceUpload = ref(null)
-const replaceTarget = ref(null)
 const moreOpenName = ref(null)
 const moreMenuEls = ref([])
 const moreMenuStyle = ref({})
@@ -148,16 +145,7 @@ async function deleteTemplate(t) {
 
 function replaceTemplate(t) {
   closeMore()
-  replaceTarget.value = t
-  tplReplaceUpload.value?.click()
-}
-
-async function onReplaceUpload(e) {
-  const file = e.target.files?.[0]
-  e.target.value = ''
-  const target = replaceTarget.value
-  replaceTarget.value = null
-  if (file && target) await ctx.replaceTemplateImage(target, file)
+  ctx.replaceTemplate(t)
 }
 </script>
 

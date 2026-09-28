@@ -4,7 +4,7 @@
   <div v-if="ctx.crop.active" class="modal-mask" @click.self="ctx.cancelCrop">
     <div class="modal crop-modal" ref="cropSec">
       <div class="modal-head">
-        <span class="title">{{ ctx.crop.conflict ? '⚠️ 模板短名冲突' : '✂️ 二次裁切' }}</span>
+        <span class="title">{{ ctx.crop.conflict ? '⚠️ 模板短名冲突' : ctx.crop.replacement ? '✂️ 替换模板' : '✂️ 二次裁切' }}</span>
         <span v-if="!ctx.crop.conflict" class="mono crop-meta">{{ ctx.crop.sourceLabel ? ctx.crop.sourceLabel + ' · ' : '' }}{{ ctx.cropSize }} · {{ ctx.cropZoomPct }}</span>
         <button class="btn btn-ghost btn-sm" :disabled="ctx.saving" @click="ctx.cancelCrop">✕</button>
       </div>
