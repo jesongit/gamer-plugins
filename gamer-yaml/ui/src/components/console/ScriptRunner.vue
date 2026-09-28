@@ -275,7 +275,7 @@ async function saveRawAndReturn() { await ctx.saveRawScript(); if (ctx.scriptMod
 async function backFromRaw() { if (ctx.raw.dirty && !await confirmDialog('原文有未保存修改，放弃后将返回可视化编辑。', { title: '放弃修改', confirmText: '放弃修改', danger: true })) return; ctx.cancelRawScript(); await loadSelected() }
 async function save() {
   if (!rename()) return false
-  const result = await ctx.saveEditScript({ keepOpen: true })
+  const result = await ctx.saveEditScript()
   return result?.ok === true && !ctx.shell.dirty
 }
 async function run(fromUuid = null) {

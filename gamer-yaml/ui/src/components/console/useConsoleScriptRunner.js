@@ -677,12 +677,12 @@ export function useConsoleScriptRunner({
   async function finishShellSave(scope, result) {
     if (!result?.ok || result._postProcessed) return
     result._postProcessed = true
-    await afterScriptSaved(scope, result.result, result._savedSnapshot, result._keepOpen)
+    await afterScriptSaved(scope, result.result, result._savedSnapshot)
   }
 
   /** 保存编辑中的脚本：shell.save() 序列化模型并携带 expected_version；
    *  校验失败 → 提示前 3 条诊断；409 version_conflict → shell.conflict 置位，SaveConflictModal 弹出。 */
-  async function saveEditScript(scope, { keepOpen = false } = {}) {
+  async function saveEditScript(scope) {
     if (!scriptShell.hasModel) return
     if (scriptShell.kind === 'function_library') {
       // 分类名 = 存储文件名（<分类>.yaml），落盘前必填
@@ -694,7 +694,6 @@ export function useConsoleScriptRunner({
     const r = await saveShell()
     if (r.ok) {
       clearCallParamsCache()
-      if (keepOpen) r._keepOpen = true
       await finishShellSave(scope, r)
     } else if (r.reason === 'invalid') {
       toast('校验未通过：' + r.diagnostics.slice(0, 3).map(d => d.message).join('；'), 'error')
@@ -736,8 +735,8 @@ export function useConsoleScriptRunner({
     }
   }
 
-  /** 保存成功后置：刷新列表、选中保存后的资源（按外壳实际类型归位到对应面板的选择）、退出编辑回到运行视图 */
-  async function afterScriptSaved(scope, rep, savedSnapshot = null, keepOpen = false) {
+  /** 保存只更新快照和资源列表；保留当前画布、函数选择与撤销历史。 */
+  async function afterScriptSaved(scope, rep, savedSnapshot = null) {
     await refreshScripts()
     if (rep?.id) {
       if (scriptShell.kind === 'function_library') {
@@ -760,7 +759,6 @@ export function useConsoleScriptRunner({
       toast('已保存先前修改；当前新修改仍未保存', 'warn')
       return
     }
-    if (!keepOpen) { scriptShell.reset(); scope.scriptMode.value = 'run'; showYaml.value = false }
     toast('已保存', 'success')
   }
 
@@ -906,7 +904,7 @@ export function useConsoleScriptRunner({
   const currentEditScope = () => scriptShell.kind === 'function_library' ? funcScope : scriptScope
   async function saveBeforeNavigation() {
     if (store.running || startPending.value || scriptShell.saving || !scriptShell.hasModel) return false
-    const result = await saveEditScript(currentEditScope(), { keepOpen: true })
+    const result = await saveEditScript(currentEditScope())
     return result?.ok === true && !scriptShell.dirty
   }
 
@@ -1210,7 +1208,7 @@ export function useConsoleScriptRunner({
       runArgsFlow, onRunArgsSubmit,
       // 编辑视图：共享编辑器外壳 + 保存/取消/409 冲突回调
       shell: scriptShell, raw: rawEditor,
-      saveEditScript: options => saveEditScript(scope, options),
+      saveEditScript: () => saveEditScript(scope),
       cancelEditScript: () => cancelEditScript(scope),
       saveRawScript: () => saveRawScript(scope),
       cancelRawScript: () => cancelRawScript(scope),
