@@ -378,30 +378,30 @@ export function useConsoleScriptRunner({
     return editCurrentScript()
   }
 
-  function loadRawSession(kind, id) {
+  function loadRawSession(kind, id, options = {}) {
     const seq = ++rawLoadSeq
     const request = rawLoadTail.catch(() => {}).then(async () => {
       // 若请求尚未开始时已经有更新选择，直接跳过旧目标；正在进行的请求
       // 会自然完成，随后队列中的最后目标再成为编辑器内容。
       if (seq !== rawLoadSeq) return null
-      const data = await rawEditor.load(kind, id)
+      const data = await rawEditor.load(kind, id, options)
       return seq === rawLoadSeq ? data : null
     })
     rawLoadTail = request.catch(() => {})
     return request
   }
 
-  /** 进入原文编辑态：直接读取资源原文，不经过前端 YAML codec，保存仍由服务端校验。
-   *  函数面板编辑当前所属函数库；脚本面板编辑当前脚本。 */
+  /** 进入原文编辑态：读取当前资源，保存仍由服务端校验。
+   *  函数面板只编辑选中函数，保存时合并回所属库；脚本面板编辑当前脚本。 */
   async function editRawCurrentTarget(scope, view = null) {
     const id = scope.kind === 'func' ? view?.fileId : selScript.value
     if (!id) return toast(scope.kind === 'func' ? '请先选择函数' : '请先选择脚本', 'error')
     scope.scriptMode.value = 'raw'
     const loadSeqAtStart = rawLoadSeq + 1
     try {
-      const data = await loadRawSession(scope.kind === 'func' ? 'function' : 'script', id)
+      const data = await loadRawSession(scope.kind === 'func' ? 'function' : 'script', id, { functionName: scope.kind === 'func' ? view?.name : '' })
       if (!data) return
-      rawSavedSnapshot = data.content ?? ''
+      rawSavedSnapshot = rawEditor.content.value
     } catch (e) {
       if (rawLoadSeq === loadSeqAtStart) {
         rawEditor.reset()
@@ -435,7 +435,10 @@ export function useConsoleScriptRunner({
       clearCallParamsCache()
       fnParamsMemo.clear()
       const changedDuringSave = rawEditor.content.value !== r._contentAtStart
-      if (rawEditor.kind.value === 'function') await fnLib.refresh(packageId.value)
+      if (rawEditor.kind.value === 'function') {
+        if (r.functionName) editFocusFn.value = r.functionName
+        await fnLib.refresh(packageId.value)
+      }
       else await refreshScripts()
       rawSavedSnapshot = changedDuringSave ? rawSavedSnapshot : r._contentAtStart
       if (!changedDuringSave) {

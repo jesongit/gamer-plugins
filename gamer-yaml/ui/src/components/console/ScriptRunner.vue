@@ -78,7 +78,7 @@
     </div>
     <div v-else-if="ctx.store.running && !isFunction && ctx.summaryModel" class="sum-wrap"><ScriptSummary :model="ctx.summaryModel" :readonly="true" :active-top="activeTop" :error-top="errorTop" /></div>
     <div v-else class="script-view-empty">编辑器加载中…</div>
-    <YamlPreview v-if="ctx.showYaml && ctx.shell.hasModel" :model="ctx.shell.model" :filename="ctx.shell.name || 'script.yaml'" @close="ctx.showYaml = false" />
+    <YamlPreview v-if="ctx.showYaml && previewModel" :model="previewModel" :filename="isFunction ? `${ctx.editFocusFn}.yaml` : ctx.shell.name || 'script.yaml'" @close="ctx.showYaml = false" />
     <SaveConflictModal
       :open="!!ctx.shell.conflict"
       :resource="ctx.shell.conflict?.resource || ''"
@@ -145,6 +145,12 @@ const fnParamsPath = computed(() => {
 })
 
 const isFunction = computed(() => ctx.runKind === 'func')
+const previewModel = computed(() => {
+  const model = ctx.shell.model
+  if (!model || !isFunction.value) return model
+  const fn = model.functions?.find(fn => fn.name === ctx.editFocusFn)
+  return fn ? { ...model, functions: [fn] } : null
+})
 const editing = computed(() => ctx.scriptMode === 'edit' && ctx.shell.hasModel && (ctx.shell.kind === 'function_library') === isFunction.value)
 const loading = ref(false), loadError = ref(''), selectedFunctionKey = ref(''), moreEl = ref(null), showRunDetails = ref(false)
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
@@ -174,7 +180,7 @@ const namePending = computed(() => editing.value && renameDraft.value.trim() !==
 function resetName() { renameDraft.value = editingName.value; nameError.value = '' }
 // 改名撤销/重做仍跟随同一个函数对象，避免焦点落到库中第一个函数。
 watch(() => ctx.shell.model?.functions?.find(fn => fn.name === ctx.editFocusFn), (fn, previous) => {
-  if (!fn && previous && ctx.shell.model?.functions?.includes(previous)) ctx.editFocusFn = previous.name
+  if (editing.value && !fn && previous && ctx.shell.model?.functions?.includes(previous)) ctx.editFocusFn = previous.name
 }, { flush: 'sync' })
 watch([editingName, () => ctx.shell.model, editing], resetName, { immediate: true })
 const fnKey = view => `${view.fileId}#${view.name}`
@@ -271,7 +277,16 @@ async function selectFunction(key) {
   selectedFunctionKey.value = key
   if (key) await loadSelected()
 }
-async function saveRawAndReturn() { await ctx.saveRawScript(); if (ctx.scriptMode === 'run') await loadSelected() }
+async function saveRawAndReturn() {
+  await ctx.saveRawScript()
+  if (ctx.scriptMode === 'run') {
+    if (isFunction.value) {
+      const current = ctx.filteredFnViews.find(v => v.name === ctx.editFocusFn && v.fileId === ctx.shell.resourceId)
+      if (current) selectedFunctionKey.value = fnKey(current)
+    }
+    await loadSelected()
+  }
+}
 async function backFromRaw() { if (ctx.raw.dirty && !await confirmDialog('原文有未保存修改，放弃后将返回可视化编辑。', { title: '放弃修改', confirmText: '放弃修改', danger: true })) return; ctx.cancelRawScript(); await loadSelected() }
 async function save() {
   if (!rename()) return false
@@ -292,7 +307,15 @@ async function run(fromUuid = null) {
 }
 function runFrom(uuid) { return run(uuid) }
 async function newTarget() { closeMore(); if (await allowSwitch()) await ctx.startNewTarget() }
-async function openRaw() { closeMore(); if (await allowSwitch()) await ctx.editRawCurrentTarget(selectedFunction.value) }
+async function openRaw() {
+  closeMore()
+  if (navigationBusy.value || !rename()) return
+  // Keep the current function (including a new/renamed one) when changing editor modes.
+  if (editing.value && ctx.shell.dirty && !await save()) return
+  const view = isFunction.value && editing.value
+    ? { fileId: ctx.shell.resourceId, name: ctx.editFocusFn } : selectedFunction.value
+  await ctx.editRawCurrentTarget(view)
+}
 async function openRename() { closeMore(); showRunDetails.value = false; await nextTick(); renameInput.value?.focus(); renameInput.value?.select() }
 function rename() {
   if (!namePending.value) return true
