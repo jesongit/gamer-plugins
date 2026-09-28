@@ -76,10 +76,7 @@
           <div class="side-block">
             <div class="side-title">离线测试匹配</div>
             <div class="side-hint">在当前确定帧上按模板规则匹配（不触设备）；结果记录帧身份与坐标空间。</div>
-            <input v-model.trim="testName" class="input mono" list="studio-template-options" placeholder="模板短名（留空 = 刚保存的模板）" data-testid="studio-test-name" />
-            <datalist id="studio-template-options">
-              <option v-for="name in templateOptions" :key="name" :value="name" />
-            </datalist>
+            <ThemedCombobox :model-value="testName" @update:model-value="testName = $event.trim()" :options="templateOptions" class="input mono" aria-label="测试模板" placeholder="模板短名（留空 = 刚保存的模板）" data-testid="studio-test-name" />
             <div class="test-row">
               <label class="check-row"><input v-model="useSelectionAsRegion" type="checkbox" data-testid="studio-region-check" /> 选框作搜索区</label>
               <label class="check-row num">阈值 <input v-model.number="threshold" class="input num" type="number" min="0" max="1" step="0.01" data-testid="studio-threshold" /></label>
@@ -99,6 +96,7 @@
 </template>
 
 <script setup>
+import ThemedCombobox from '../../../../../ui-shared/ThemedCombobox.vue'
 // 模板工作台弹窗（Phase 7 §10.2）：视频模式从确定帧框选创建模板 + 离线匹配测试。
 // - 底图 = 服务端确定帧 PNG（按帧身份寻址，字节级可重复；**保存绝不重抓画面**）；
 // - 创建经 gamer-yaml 动作清单缝 template.create_from_frame（服务端命名规则 +
