@@ -19,6 +19,7 @@ impl Fake {
             rules: SyncMutex::new(RuleSet {
                 schema_version: 1,
                 rules: vec![Rule {
+                    public_name: String::new(),
                     id: "jump".into(),
                     name: "跳跃".into(),
                     enabled: true,
@@ -127,6 +128,171 @@ async fn setup() -> (tempfile::TempDir, Arc<Fake>, Arc<Queue>) {
     let q = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
     q.configure("phone", "default").await.unwrap();
     (dir, f, q)
+}
+
+#[tokio::test]
+async fn journal_cursors_and_refresh_follow_one_interaction_without_reordering() {
+    let (_dir, f, q) = setup().await;
+    f.busy.store(true, Ordering::SeqCst);
+    let mut e = event("rich");
+    e.actor = Some(
+        json!({"id":"viewer","name":"观众","medal_level":12,"medal_name":"测试牌","medal_wearing":true}),
+    );
+    q.receive(e).await;
+    for n in 0..60 {
+        let mut e = event(&format!("chat-{n}"));
+        e.payload["text"] = json!("聊天");
+        q.receive(e).await;
+    }
+    let first = q.logs(0, 0, "all", "", &[]).await;
+    assert_eq!(first["rows"].as_array().unwrap().len(), 50);
+    assert_eq!(first["has_more"], true);
+    q.receive(event("new")).await;
+    let burst = q.logs(0, 1, "all", "", &[]).await;
+    assert_eq!(burst["rows"][0]["seq"], 2);
+    assert_eq!(burst["next_after"], 51);
+    assert_eq!(burst["has_more"], true);
+    let remaining = q.logs(0, 51, "all", "", &[]).await;
+    assert_eq!(remaining["rows"].as_array().unwrap().len(), 11);
+    assert_eq!(remaining["next_after"], 62);
+    let second = q
+        .logs(first["next"].as_u64().unwrap(), 0, "all", "", &[])
+        .await;
+    assert_eq!(second["rows"].as_array().unwrap().len(), 11);
+    assert_eq!(
+        second["rows"].as_array().unwrap().last().unwrap()["event"]["actor"]["medal_level"],
+        12
+    );
+    f.busy.store(false, Ordering::SeqCst);
+    q.tick().await;
+    let updated = q.logs(0, 0, "trigger", "", &[1]).await;
+    assert_eq!(updated["updates"][0]["item"]["state"], "running");
+    f.finish("run-0", "success");
+    q.tick().await;
+    assert_eq!(
+        q.logs(0, 0, "trigger", "", &[1]).await["updates"][0]["item"]["state"],
+        "success"
+    );
+    assert_eq!(
+        q.logs(0, 0, "all", "聊天", &[]).await["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+}
+
+#[tokio::test]
+async fn unavailable_target_has_a_public_decline_and_withdrawals_stay_display_only() {
+    let (_dir, f, q) = setup().await;
+    f.offline.store(true, Ordering::SeqCst);
+    q.receive(event("offline")).await;
+    let logs = q.logs(0, 0, "trigger", "", &[]).await;
+    assert_eq!(logs["rows"][0]["reason"], "target_unavailable");
+    assert_eq!(logs["rows"][0]["rule"], "跳跃");
+    assert_eq!(q.audience().await["notices"][0]["state"], "unavailable");
+    let mut message = event("sc");
+    message.kind = "super_chat".into();
+    message.payload = json!({"message_id":123,"text":"醒目留言","rmb":30});
+    q.receive(message).await;
+    let mut removed = event("removed");
+    removed.kind = "message.removed".into();
+    removed.payload = json!({"removed_ids":["123"]});
+    q.receive(removed).await;
+    let rows = q.logs(0, 0, "all", "", &[]).await;
+    assert_eq!(rows["rows"][1]["withdrawn"], true);
+    assert_eq!(rows["rows"][1]["reason"], "display_only");
+    assert!(q.status(0, "").await["waiting"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn audience_is_read_only_revocable_and_whitelists_fields() {
+    let (_dir, f, q) = setup().await;
+    f.rules.lock().rules[0].public_name = "公开操作".into();
+    q.receive(event("secret-event-id")).await;
+    q.tick().await;
+    let projection = q.audience().await;
+    assert_eq!(projection["current"]["name"], "公开操作");
+    assert_eq!(projection["current"]["number"], 1);
+    let text = projection.to_string();
+    for forbidden in [
+        "secret-event-id",
+        "entrypoint",
+        "run_id",
+        "actor_id",
+        "args",
+        "default#jump",
+        "phone",
+        "error",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden}");
+    }
+    let connection = Arc::new(SyncMutex::new(super::super::ConnectionStatus::default()));
+    let window = super::super::audience::Window::open(q.clone(), connection)
+        .await
+        .unwrap();
+    let (base, token) = window.url.split_once('#').unwrap();
+    let url = format!("{base}state");
+    let client = reqwest::Client::new();
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 403);
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("invalid")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(token)
+            .header("Origin", "https://example.com")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let response = client.get(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["current"]["name"],
+        "公开操作"
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        405
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}api/runs"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let token = token.to_owned();
+    drop(window);
+    tokio::task::yield_now().await;
+    if let Ok(response) = client.get(&url).bearer_auth(token).send().await {
+        assert_eq!(response.status(), 403);
+    }
+    assert_eq!(q.status(0, "").await["current"]["state"], "running");
 }
 
 #[tokio::test]

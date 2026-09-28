@@ -1,0 +1,28 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gamer 互动反馈 · 直播姬采集</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101820;color:#f1f5f8;font-family:system-ui,"Microsoft YaHei",sans-serif;font-size:22px;overflow-wrap:anywhere}main{padding:22px;max-width:1000px;margin:auto}header{display:flex;justify-content:space-between;gap:12px;color:#83d6c4;font-size:.7em;margin-bottom:18px}h1{font-size:1em;margin:0}p{margin:8px 0}.dim{color:#a7b7c8;font-size:.7em}.current{padding:20px;border:1px solid #378a78;border-radius:14px;background:#182c30}.current strong{font-size:1.2em}ol{list-style:none;margin:16px 0;padding:0}li{padding:12px 0;border-bottom:1px solid #30404d;display:flex;gap:10px;align-items:baseline}li b{color:#83d6c4;font-size:.7em;white-space:nowrap}li span{flex:1}small{display:block;color:#a7b7c8;font-size:.65em;margin-top:4px}#toast{border-left:3px solid #83d6c4;padding:12px 15px;background:#20363b;font-size:.8em;margin-top:18px}#toast:empty{display:none}body.strip main{max-width:none;padding:14px 20px}body.strip #content{display:flex;gap:18px;align-items:center}body.strip .current{flex:1;padding:12px;min-width:0}body.strip ol{flex:1;margin:0;min-width:0}body.strip li{padding:6px 0}body.strip header{margin-bottom:8px}body.strip #toast{margin-top:10px}body.stale #content{opacity:.4}@media(max-width:420px){main{padding:14px}body.strip #content{display:block}.current{padding:14px}}
+</style>
+<main><header><h1>直播互动</h1><span id="status">正在连接…</span></header><div id="content"><section class="current" id="current"></section><ol id="waiting"></ol></div><p class="dim" id="remaining"></p><div id="toast" role="status"></div></main>
+<script>
+const token=location.hash.slice(1)||sessionStorage.getItem('read-token')||'';sessionStorage.setItem('read-token',token);history.replaceState(null,'',location.pathname+location.search);
+const options=new URLSearchParams(location.search),limit=Math.max(1,Math.min(10,Number(options.get('rows'))||3));
+document.body.classList.toggle('strip',options.get('layout')==='strip');document.body.style.fontSize=Math.max(16,Math.min(40,Number(options.get('font'))||22))+'px';
+const labels={waiting:'已入队',starting:'正在启动',running:'执行中',cancelling:'正在取消',review:'等待主播核对',success:'已完成',failed:'执行未完成，请等待主播处理',cancelled:'已取消',removed:'已移出队列',acknowledged:'主播已核对结束',cooldown:'操作冷却中，请稍后再试',queue_full:'等待队列已满，请稍后再试',unavailable:'暂时无法受理，请等待主播处理'};
+const el=id=>document.getElementById(id),node=(tag,text)=>{const e=document.createElement(tag);e.textContent=text;return e};
+let seen=new Map(),ready=false,last=0,toastUntil=0;
+function render(s){
+ last=Date.now();document.body.classList.remove('stale');
+ el('status').textContent=s.paused?'队列暂停 · 等待主播处理':!s.configured?'等待主播设置':s.connection==='connected'?'互动已连接':s.connection==='reconnecting'?'互动重连中':'互动未连接';
+ const c=el('current');c.replaceChildren();
+ if(s.current){const i=s.current;c.append(node('p',labels[i.state]||'处理中'),node('strong',`${i.test?'[测试] ':''}#${i.number} ${i.name}`),node('small',i.viewer));if(i.started_at)c.append(node('p',`已运行 ${Math.max(0,Math.floor((s.time-i.started_at)/1000))} 秒`));}
+ else{c.append(node('strong',s.paused?'队列暂停':s.device_busy?'等待当前操作结束':'等待下一次互动'));}
+ const list=el('waiting');list.replaceChildren();
+ for(const i of s.waiting.slice(0,limit)){const li=node('li','');li.append(node('b',`等待 ${i.position}`));const span=node('span',`${i.test?'[测试] ':''}#${i.number} ${i.name}`);span.append(node('small',i.viewer));li.append(span);list.append(li);}
+ el('remaining').textContent=s.waiting_count?`共 ${s.waiting_count} 项等待${s.waiting_count>limit?' · 另有 '+(s.waiting_count-limit)+' 项未展开':''}`:'等待队列为空';
+ const next=new Map(s.notices.map(n=>[n.number,n.state]));
+ if(ready){const changes=s.notices.filter(n=>seen.get(n.number)!==n.state && s.time-n.changed_at<15000);if(changes.length){const n=changes[0];el('toast').textContent=`${n.test?'[测试] ':''}${n.viewer} · #${n.number} ${n.name}：${labels[n.state]||'状态已更新'}${n.position?'，等待第 '+n.position+' 位':''}${changes.length>1?'（另有 '+(changes.length-1)+' 条更新）':''}`;toastUntil=Date.now()+6000;}}
+ ready=true;seen=next;
+}
+async function poll(){try{const response=await fetch('/state',{headers:{Authorization:'Bearer '+token},cache:'no-store',signal:AbortSignal.timeout(4000)});if(!response.ok)throw Error();render(await response.json());}catch{if(!last||Date.now()-last>5000){document.body.classList.add('stale');el('status').textContent='更新中断 · 等待恢复';ready=false;}}finally{setTimeout(poll,1000)}}
+setInterval(()=>{if(Date.now()>toastUntil)el('toast').textContent='';if(last&&Date.now()-last>5000){document.body.classList.add('stale');el('status').textContent='更新中断 · 等待恢复';ready=false}},1000);poll();
+</script></html>

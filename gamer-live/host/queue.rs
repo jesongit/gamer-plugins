@@ -58,11 +58,17 @@ pub struct Item {
     #[serde(default)]
     pub rule_version: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub public_name: String,
+    #[serde(default)]
+    pub number: u64,
     pub entrypoint: String,
     pub args: Map<String, Value>,
     pub event: Value,
     pub state: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub run_id: Option<String>,
@@ -80,6 +86,12 @@ impl Item {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub public_name: String,
     pub at: i64,
     pub event: Value,
     pub rule: Option<String>,
@@ -89,6 +101,8 @@ pub struct Receipt {
 #[derive(Clone, Serialize, Deserialize)]
 struct State {
     schema_version: u8,
+    #[serde(default)]
+    next_seq: u64,
     revision: u64,
     target: Option<Target>,
     paused: bool,
@@ -105,6 +119,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            next_seq: 1,
             revision: 0,
             target: None,
             paused: false,
@@ -133,11 +148,15 @@ fn summary(e: &LiveEvent) -> Value {
             .map(|s| Value::String(s.chars().take(512).collect()))
             .unwrap_or_else(|| v.clone())
     };
-    let actor = e
-        .actor
-        .as_ref()
-        .map(|a| json!({"id":short(&a["id"]),"name":short(&a["name"])}));
-    json!({"kind":e.kind,"actor":actor,"payload":{"text":short(&e.payload["text"]),"gift_id":short(&e.payload["gift_id"]),"gift_name":short(&e.payload["gift_name"]),"count":e.payload["count"]},"room_id":e.room_id,"event_id":e.event_id})
+    let mut payload = e.payload.clone();
+    if let Some(fields) = payload.as_object_mut() {
+        for v in fields.values_mut() {
+            *v = short(v);
+        }
+    }
+    json!({"kind":e.kind,"actor":e.actor,"payload":payload,"room_id":e.room_id,
+        "event_id":e.event_id,"connection_id":e.connection_id,"seq":e.seq,
+        "received_at":e.received_at,"occurred_at":e.occurred_at})
 }
 impl Queue {
     pub fn open(path: PathBuf, backend: Arc<dyn Backend>) -> Result<Arc<Self>> {
@@ -152,6 +171,32 @@ impl Queue {
             State::default()
         };
         ensure!(state.schema_version == 1, "不支持此互动队列版本");
+        // Assign stable journal cursors once to records saved by earlier versions.
+        let mut next = state.next_seq.max(1);
+        for r in &mut state.receipts {
+            if r.seq == 0 {
+                r.seq = next;
+            }
+            next = next.max(r.seq + 1);
+        }
+        for i in &mut state.items {
+            if i.number == 0 {
+                i.number = state
+                    .receipts
+                    .iter()
+                    .find(|r| r.item_id.as_deref() == Some(&i.id))
+                    .map_or_else(
+                        || {
+                            let n = next;
+                            next += 1;
+                            n
+                        },
+                        |r| r.seq,
+                    );
+            }
+            next = next.max(i.number + 1);
+        }
+        state.next_seq = next;
         state.paused = state.items.iter().any(|i| i.pending() || i.active());
         state.blocked = state
             .paused
@@ -228,6 +273,19 @@ impl Queue {
         crate::core::fs::atomic_write(&self.path, &bytes)
     }
     fn commit(&self, current: &mut State, mut next: State) -> Result<()> {
+        let previous: BTreeMap<_, _> = current
+            .items
+            .iter()
+            .map(|i| (i.id.as_str(), i.state.as_str()))
+            .collect();
+        for i in &mut next.items {
+            if previous
+                .get(i.id.as_str())
+                .is_none_or(|old| *old != i.state)
+            {
+                i.updated_at = now();
+            }
+        }
         if let Err(e) = self.persist(&mut next) {
             current.paused = true;
             current.blocked = Some(format!("队列保存失败：{e}"));
@@ -251,6 +309,134 @@ impl Queue {
             "current":current,"waiting":waiting,"capacity":100,"history":history.iter().skip(offset).take(30).collect::<Vec<_>>(),"has_more":history.len()>offset+30,
             "receipts":s.receipts.iter().rev().take(100).collect::<Vec<_>>(),
             "device_run":s.target.as_ref().and_then(|t|self.backend.active(&t.device_id))})
+    }
+    pub async fn logs(
+        &self,
+        before: u64,
+        after: u64,
+        filter: &str,
+        search: &str,
+        refresh: &[u64],
+    ) -> Value {
+        let s = self.state.lock().await;
+        let items: BTreeMap<_, _> = s.items.iter().map(|i| (i.id.as_str(), i)).collect();
+        let removed: std::collections::HashSet<_> = s
+            .receipts
+            .iter()
+            .filter(|r| r.event["kind"] == "message.removed")
+            .flat_map(|r| {
+                r.event["payload"]["removed_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|id| {
+                        format!(
+                            "{}:{}",
+                            r.event["room_id"],
+                            id.as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| id.to_string())
+                        )
+                    })
+            })
+            .collect();
+        let row = |r: &Receipt| {
+            let item = r.item_id.as_deref().and_then(|id| items.get(id));
+            let id = &r.event["payload"]["message_id"];
+            let withdrawn = r.event["kind"] == "super_chat"
+                && removed.contains(&format!(
+                    "{}:{}",
+                    r.event["room_id"],
+                    id.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| id.to_string())
+                ));
+            json!({"seq":r.seq,"at":r.at,"event":r.event,"rule":r.rule,"result":r.result,
+                "reason":r.reason,"item":item,"withdrawn":withdrawn})
+        };
+        let search = search.to_lowercase();
+        let matches = |r: &&Receipt| {
+            let item = r.item_id.as_deref().and_then(|id| items.get(id));
+            let related =
+                r.rule.is_some() || !["unmatched", "display_only", ""].contains(&r.reason.as_str());
+            let system = r.event["kind"].as_str().is_some_and(|k| {
+                k.starts_with("room.")
+                    || k.starts_with("connection.")
+                    || k == "platform.event"
+                    || k == "user.blocked"
+            });
+            (match filter {
+                "trigger" => related,
+                "rejected" => related && r.item_id.is_none(),
+                "errors" => item.is_some_and(|i| ["failed", "review"].contains(&i.state.as_str())),
+                "system" => system,
+                _ => true,
+            }) && (search.is_empty()
+                || format!(
+                    "{} {} {} {}",
+                    r.event["actor"]["name"],
+                    r.event["payload"]["text"],
+                    r.event["payload"]["gift_name"],
+                    r.rule.as_deref().unwrap_or("")
+                )
+                .to_lowercase()
+                .contains(&search))
+        };
+        let page: Vec<_> = if after > 0 {
+            s.receipts
+                .iter()
+                .filter(|r| r.seq > after)
+                .filter(matches)
+                .take(51)
+                .collect()
+        } else {
+            s.receipts
+                .iter()
+                .rev()
+                .filter(|r| before == 0 || r.seq < before)
+                .filter(matches)
+                .take(51)
+                .collect()
+        };
+        let rows: Vec<_> = page.iter().take(50).map(|r| row(r)).collect();
+        json!({"rows":rows,"next":rows.last().map(|r| &r["seq"]),"has_more":page.len()>50,
+            "next_after":if after>0 && page.len()>50 {page[49].seq} else {s.next_seq.saturating_sub(1)},
+            "gap":after>0 && s.receipts.first().is_some_and(|r|after.saturating_add(1)<r.seq),
+            "updates":s.receipts.iter().filter(|r|refresh.contains(&r.seq)).map(row).collect::<Vec<_>>(),
+            "oldest":s.receipts.first().map(|r|r.seq),"revision":s.revision})
+    }
+    /// Explicit audience whitelist. Never serialize an Item/Receipt into this surface.
+    pub async fn audience(&self) -> Value {
+        let s = self.state.lock().await;
+        let item = |i: &Item, position: usize| {
+            json!({"number":i.number,
+            "name":if i.public_name.is_empty(){&i.name}else{&i.public_name},
+            "viewer":i.event["message"]["actor"]["name"].as_str().unwrap_or("观众"),
+            "state":i.state,"position":position,"started_at":i.started_at,
+            "changed_at":i.updated_at.max(i.finished_at.or(i.started_at).unwrap_or(i.created_at)),"test":i.event["test"] == true})
+        };
+        let waiting: Vec<_> = s.items.iter().filter(|i| i.pending()).collect();
+        let current = s.items.iter().find(|i| i.active());
+        let mut notices: Vec<Value> = s
+            .items
+            .iter()
+            .filter(|i| !i.pending())
+            .rev()
+            .take(20)
+            .map(|i| item(i, 0))
+            .collect();
+        notices.extend(waiting.iter().enumerate().map(|(p, i)| item(i, p + 1)));
+        notices.extend(s.receipts.iter().rev().filter(|r|r.rule.is_some() && r.item_id.is_none()).take(20).map(|r|json!({
+            "number":r.seq,"viewer":r.event["actor"]["name"].as_str().unwrap_or("观众"),
+            "name":r.public_name,"state":if r.reason=="cooldown" {"cooldown"} else if r.reason=="queue_full" {"queue_full"} else {"unavailable"},
+            "changed_at":r.at})));
+        notices.sort_by_key(|v| std::cmp::Reverse(v["changed_at"].as_i64().unwrap_or(0)));
+        notices.truncate(20);
+        json!({"revision":s.revision,"time":now(),"paused":s.paused || s.blocked.is_some(),
+            "configured":s.target.is_some(),"current":current.map(|i|item(i,0)),
+            "waiting":waiting.iter().enumerate().take(10).map(|(p,i)|item(i,p+1)).collect::<Vec<_>>(),
+            "waiting_count":waiting.len(),"device_busy":s.target.as_ref().is_some_and(|t|self.backend.active(&t.device_id).is_some()) && current.is_none(),
+            "notices":notices})
     }
     pub async fn configure(&self, device: &str, package: &str) -> Result<()> {
         let target = self.backend.target(device, package)?;
@@ -379,6 +565,8 @@ impl Queue {
         }
         let mut n = s.clone();
         let mut matched = None;
+        let mut reason = "unavailable";
+        let mut public_name = String::new();
         let mut item_id = None;
         let mut resolved = None;
         let event_key = e.event_id.as_ref().map(|id| {
@@ -398,24 +586,35 @@ impl Queue {
         let result: Result<String> = async {
             if !test && !e.room_id.is_empty() {
                 if n.room_id.as_ref().is_some_and(|room| room != &e.room_id) {
+                    reason = "room_changed";
                     n.paused = true;
                     n.blocked = Some("直播间发生变化，请处理旧队列后重新连接".into());
                     anyhow::bail!("直播间与当前队列会话不一致");
                 }
                 n.room_id = Some(e.room_id.clone());
             }
-            ensure!(
-                e.kind == "message" || e.kind == "gift",
-                "此事件仅展示，不触发操作"
-            );
+            if e.kind != "message" && e.kind != "gift" {
+                reason = "display_only";
+                return Ok("仅展示".into());
+            }
+            reason = "target_unavailable";
             let target = n.target.as_ref().context("请先绑定设备和配置包")?;
-            self.backend.check(target)?;
+            reason = "rules_invalid";
             let (rules, rule_version) = self.backend.rules(&target.package_id)?;
             rules.validate(&target.package_id)?;
             let Some(rule) = rules.rules.iter().find(|r| r.matches(&e)) else {
+                reason = "unmatched";
                 return Ok("未匹配".into());
             };
             matched = Some(rule.name.clone());
+            public_name = if rule.public_name.trim().is_empty() {
+                rule.name.clone()
+            } else {
+                rule.public_name.clone()
+            };
+            reason = "target_unavailable";
+            self.backend.check(target)?;
+            reason = "invalid_args";
             let args = self.backend.bind(&rule.entrypoint, rule.bind(&e)?)?;
             ensure!(
                 serde_json::to_vec(&args)?.len() <= 16 * 1024,
@@ -428,13 +627,16 @@ impl Queue {
                 .get(&rule.id)
                 .is_some_and(|at| now() - at < rule.cooldown_secs as i64 * 1000)
             {
+                reason = "cooldown";
                 return Ok("冷却中，未入队".into());
             }
+            reason = "queue_full";
             ensure!(
                 n.items.iter().filter(|i| i.pending()).count() < 100,
                 "队列已满，未入队"
             );
             if !enqueue {
+                reason = "preview";
                 return Ok("匹配成功（预览，未入队）".into());
             }
             let id = Uuid::new_v4().to_string();
@@ -446,11 +648,14 @@ impl Queue {
                 rule_id: rule.id.clone(),
                 rule_version,
                 name: rule.name.clone(),
+                public_name: public_name.clone(),
+                number: n.next_seq,
                 entrypoint: rule.entrypoint.clone(),
                 args,
                 event: json!({"test":test,"session":n.session,"message":summary(&e)}),
                 state: "waiting".into(),
                 created_at: now(),
+                updated_at: now(),
                 started_at: None,
                 finished_at: None,
                 run_id: None,
@@ -459,21 +664,26 @@ impl Queue {
                 retry_of: None,
             });
             n.cooldowns.insert(rule.id.clone(), now());
+            reason = "accepted";
             Ok("已入队".into())
         }
         .await;
         let result = result.unwrap_or_else(|e| format!("未入队：{e}"));
         if enqueue {
             n.receipts.push(Receipt {
+                seq: n.next_seq,
+                reason: reason.into(),
+                public_name,
                 at: now(),
                 event: summary(&e),
                 rule: matched,
                 result: result.clone(),
                 item_id: item_id.clone(),
             });
+            n.next_seq += 1;
             self.commit(&mut s, n)?;
         }
-        Ok(json!({"result":result,"item_id":item_id,"resolved":resolved}))
+        Ok(json!({"reason":reason,"result":result,"item_id":item_id,"resolved":resolved}))
     }
     pub async fn control(&self, op: &str, ids: &[String], request_id: &str) -> Result<Value> {
         let mut s = self.state.lock().await;
@@ -580,6 +790,18 @@ impl Queue {
                 item.finished_at = None;
                 item.run_id = None;
                 item.error = None;
+                item.number = n.next_seq;
+                n.receipts.push(Receipt {
+                    seq: n.next_seq,
+                    reason: "accepted".into(),
+                    public_name: item.public_name.clone(),
+                    at: item.created_at,
+                    event: item.event["message"].clone(),
+                    rule: Some(item.name.clone()),
+                    result: "手动重试，已排到队尾".into(),
+                    item_id: Some(item.id.clone()),
+                });
+                n.next_seq += 1;
                 outcomes.push(json!({"item_id":item.id}));
                 n.items.push(item);
             }
@@ -606,6 +828,7 @@ impl Queue {
                 .find(|i| i.run_id.as_deref() == Some(&id))
             {
                 i.state = "cancelling".into();
+                i.updated_at = now();
             }
             let next = s.clone();
             self.commit(&mut s, next)?;

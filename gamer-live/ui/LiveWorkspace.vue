@@ -1,11 +1,12 @@
 <script setup>
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { api } from '../../../web/src/api'
+import AudienceSettings from './AudienceSettings.vue'
 import InteractionPanel from './InteractionPanel.vue'
 
-const devices = ref([]), status = ref({ stream: null, connection: {} }), events = ref([])
+const devices = ref([]), status = ref({ stream: null, connection: {} })
 const feedback = ref(''), savedSettings = ref({ version: null, profiles: {} })
-const error = ref(''), busy = ref(false), gap = ref(false), copied = ref(false)
+const error = ref(''), busy = ref(false), copied = ref(false)
 const activeTab = ref('settings')
 const tabs = [{ key: 'settings', label: '直播设置' }, { key: 'rules', label: '互动规则' }, { key: 'logs', label: '触发日志' }]
 const output = reactive({ device_id: '', mode: 'local', push_url: '', audio: true, fps: 30, bitrate_kbps: 4000 })
@@ -19,12 +20,10 @@ const canOutput = computed(() => devices.value.find(d => d.id === output.device_
 const streamActive = computed(() => status.value.stream && !['failed', 'stopped'].includes(status.value.stream.state))
 const connected = computed(() => ['connecting', 'connected', 'reconnecting'].includes(status.value.connection.state))
 const states = { preparing: '准备中', streaming: '输出中', connecting: '连接中', connected: '已连接', reconnecting: '正在重连', failed: '失败', stopped: '已停止', disconnected: '未连接' }
-const kinds = { message: '弹幕', 'message.mirror': '镜像弹幕', gift: '礼物', super_chat: '醒目留言', membership: '舰长', like: '点赞', enter: '进入', follow: '关注', 'room.started': '开播', 'room.ended': '下播', 'message.removed': '留言删除' }
-let timer, disposed = false, cursor = 0
+let timer, disposed = false
 const call = (action, values = {}) => api.callExtension('gamer-live', action, values)
 async function refresh() {
   const snapshot = await call('live.status')
-  const page = await call('events.read', { after: cursor })
   if (disposed) return
   status.value = snapshot
   if (streamActive.value) {
@@ -33,9 +32,6 @@ async function refresh() {
     }
   }
   if (connected.value && snapshot.connection.mode) credentials.mode = snapshot.connection.mode
-  if (page.gap) gap.value = true
-  cursor = page.next_seq
-  events.value = [...events.value, ...page.events].slice(-100)
 }
 async function poll() {
   try { if (!busy.value) await refresh() } catch (e) { if (!disposed) error.value = e.message }
@@ -132,15 +128,8 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
           <p v-if="status.connection.error" class="error">{{ status.connection.error }}</p>
         </section>
       </div>
-      <InteractionPanel :devices="devices" :view="activeTab" :connected="connected" />
-      <div v-show="activeTab === 'logs'" class="interaction-content">
-        <section>
-          <div class="heading"><h3>最近互动</h3><button @click="events = []; gap = false">清空显示</button></div>
-          <p v-if="gap" class="hint">连接期间有部分旧事件超出缓存，只显示仍保留的记录。</p>
-          <p v-if="!events.length" class="hint">等待直播间事件。配置并启用互动规则后，新消息可进入执行队列。</p>
-          <ol><li v-for="event in [...events].reverse()" :key="event.seq"><time>{{ new Date(event.received_at).toLocaleTimeString() }}</time><b>{{ kinds[event.kind] || event.kind }}</b><span>{{ event.actor?.name || '匿名观众' }}</span><span>{{ event.payload.text || event.payload.gift_name || '' }}{{ event.payload.count != null ? ` × ${event.payload.count}` : '' }}</span><span v-if="event.kind === 'gift'">礼物 ID：{{ event.payload.gift_id }}</span></li></ol>
-        </section>
-      </div>
+      <InteractionPanel :devices="devices" :view="activeTab" :connected="connected" :connection-state="status.connection.state" :connection-error="status.connection.error" />
+      <AudienceSettings v-show="activeTab === 'settings'" />
       <p class="hint">关闭此面板不会停止连接；停用插件或退出 Gamer 会停止全部输出和互动。</p>
     </div>
   </div>

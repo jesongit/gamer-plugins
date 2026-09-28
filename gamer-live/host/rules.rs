@@ -30,6 +30,8 @@ pub struct Rule {
     pub id: String,
     pub name: String,
     #[serde(default)]
+    pub public_name: String,
+    #[serde(default)]
     pub enabled: bool,
     pub kind: String,
     #[serde(default = "equals")]
@@ -83,6 +85,7 @@ impl RuleSet {
                 !r.name.trim().is_empty() && r.name.len() <= 160,
                 "请填写规则名称"
             );
+            ensure!(r.public_name.len() <= 160, "公开显示名过长");
             ensure!(
                 ["message", "gift"].contains(&r.kind.as_str()),
                 "仅支持弹幕和礼物规则"
