@@ -14,6 +14,7 @@ let wrapper
 beforeEach(() => {
   mock.rules = []; mock.status = { revision: 1, waiting: [], history: [], receipts: [], paused: false, target: { device_id: 'phone', package_id: 'default', android_package: 'game' } }
   mock.call.mockReset().mockImplementation(async (_, action) => {
+    if (action === 'logs.read') return { rows: mock.status.history.map((item, i) => ({ seq: i + 1, at: Date.now(), event: { kind: 'message', payload: { text: '跳' } }, item })), updates: [], has_more: false }
     if (action === 'queue.status') return structuredClone(mock.status)
     if (action === 'rules.read') return { rules: structuredClone(mock.rules), version: 'v1' }
     if (action === 'rules.save' || action === 'rules.toggle') return { version: 'v2' }
@@ -70,7 +71,9 @@ it('保存冲突保留修改，日志按服务端 next 游标取到末页', asyn
   await button('保存规则').trigger('click'); await flushPromises()
   expect(wrapper.text()).toContain('有未保存修改'); expect(wrapper.get('[role="alert"]').text()).toContain('version_conflict')
   mock.events.mockResolvedValueOnce({ events: [{ id: 2, message: '第一页' }], next: 2, has_more: true }).mockResolvedValueOnce({ events: [{ id: 3, message: '第二页' }], next: 3, has_more: false })
-  await button('详情与日志').trigger('click'); await flushPromises()
+  await wrapper.setProps({ view: 'logs' }); await flushPromises()
+  await wrapper.get('.record').trigger('click')
+  await button('查看运行日志').trigger('click'); await flushPromises()
   expect(mock.events.mock.calls).toEqual([['r1', 0], ['r1', 2]])
   expect(wrapper.text()).toContain('第二页')
 })

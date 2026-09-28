@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-keymap"
-version = "0.1.0"
+version = "0.1.3"
 name = "键盘映射"
 description = "按键映射：键盘、鼠标、手柄动作映射为设备触控与按键"
 entry = "plugin.wasm"
@@ -12,8 +12,8 @@ permissions = ["ui.host", "input.tap", "input.swipe", "input.key", "touch"]
 packages = ["*"]
 
 [host_api]
-ui = "^1.0"
-input = "^1.0"
+ui = "^1.1"
+input = "^1.2"
 touch = "^1.0"
 
 # 独立 WASM guest：真实 plugin.wasm，常驻实例模型（start 持有实例）。

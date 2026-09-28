@@ -1,4 +1,5 @@
 //! Live workspace: platform sessions belong here; media transport belongs to Core.
+mod audience;
 mod bilibili;
 mod events;
 mod queue;
@@ -31,6 +32,9 @@ pub const ACTIONS: &[&str] = &[
     "connection.settings.save",
     "connection.settings.clear",
     "events.read",
+    "logs.read",
+    "audience.open",
+    "audience.close",
     "rules.read",
     "rules.save",
     "rules.toggle",
@@ -56,6 +60,9 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         "connection.connect"
         | "connection.disconnect"
         | "events.read"
+        | "logs.read"
+        | "audience.open"
+        | "audience.close"
         | "connection.settings.read"
         | "connection.settings.save"
         | "connection.settings.clear" => &[Permission::LiveConnect],
@@ -115,6 +122,7 @@ pub struct LiveService {
     queue: Option<Arc<queue::Queue>>,
     queue_error: Option<String>,
     settings: settings::Settings,
+    audience: AsyncMutex<Option<audience::Window>>,
 }
 impl LiveService {
     pub fn new(runtime: runtime::Runtime, data_root: &std::path::Path) -> Result<Self> {
@@ -130,6 +138,7 @@ impl LiveService {
         Ok(Self {
             devices,
             output: AsyncMutex::new(None),
+            audience: AsyncMutex::new(None),
             connection: AsyncMutex::new(None),
             status: Arc::new(Mutex::new(ConnectionStatus::default())),
             events: Arc::new(Mutex::new(events::EventBuffer::default())),
@@ -150,6 +159,38 @@ impl LiveService {
     }
     async fn dispatch(&self, action: &str, values: Value) -> Result<Value> {
         match action {
+            "audience.open" => {
+                let mut window = self.audience.lock().await;
+                if window.is_none() {
+                    *window = Some(
+                        audience::Window::open(self.queue()?.clone(), self.status.clone()).await?,
+                    );
+                }
+                Ok(json!({"url":window.as_ref().unwrap().url}))
+            }
+            "audience.close" => {
+                self.audience.lock().await.take();
+                Ok(json!({"ok":true}))
+            }
+            "logs.read" => {
+                let refresh: Vec<u64> = values["refresh"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(500)
+                    .filter_map(Value::as_u64)
+                    .collect();
+                Ok(self
+                    .queue()?
+                    .logs(
+                        values["before"].as_u64().unwrap_or(0),
+                        values["after"].as_u64().unwrap_or(0),
+                        values["filter"].as_str().unwrap_or("trigger"),
+                        values["search"].as_str().unwrap_or(""),
+                        &refresh,
+                    )
+                    .await)
+            }
             "queue.status" => Ok(self
                 .queue()?
                 .status(
@@ -345,6 +386,7 @@ impl BuiltinService for LiveService {
 }
 impl LiveService {
     async fn stop_connections(&self) {
+        self.audience.lock().await.take();
         // Stop active tasks; saved local connection profiles survive disable/restart.
         tokio::join!(
             async {

@@ -1,3 +1,4 @@
+import { frameSource } from '../../../../../../web/src/console/frame-source'
 import { operationReporter } from '../../../../../../web/src/workspace/operation-feedback'
 import { GAMER_YAML_PLUGIN_ID } from '../../../../../../web/src/gamer-plugin-ids'
 import { computed, nextTick, onUnmounted, provide, reactive, ref, watch } from 'vue'
@@ -78,6 +79,8 @@ export function useConsoleTemplates({
   // 舞台活动画面元素：live = WebRTC video；media = 媒体 <video>（坐标参考随之切换）。
   // 未注入舞台桥时回落实时视频元素（行为与旧实现一致）。
   const surface = () => stage?.surfaceEl?.() || videoElement.value
+  const frames = stage || frameSource(() => videoElement.value)
+  const surfaceSize = () => frames.displaySize()
 
   function tplPinyinInitials(name) {
     let s = tplPyCache.get(name)
@@ -132,8 +135,8 @@ export function useConsoleTemplates({
     const rect = vw.getBoundingClientRect()
     const vw_ = rect.width, vh = rect.height
     const el = surface()
-    const sw = el?.videoWidth || 1920
-    const sh = el?.videoHeight || 1080
+    const sw = surfaceSize(el).width || 1920
+    const sh = surfaceSize(el).height || 1080
     const ratio = Math.min(vw_ / sw, vh / sh)
     const w = hit.w * ratio, h = hit.h * ratio
     const x = (hit.x * ratio) + (vw_ - sw * ratio) / 2
@@ -147,14 +150,14 @@ export function useConsoleTemplates({
     if (!vw) return {}
     const rect = vw.getBoundingClientRect()
     const el = surface()
-    return mapDeviceRectStyle(x, y, w, h, rect, el?.videoWidth, el?.videoHeight)
+    return mapDeviceRectStyle(x, y, w, h, rect, surfaceSize(el).width, surfaceSize(el).height)
   }
 
   /** 鼠标坐标 → 设备坐标（object-fit: contain 换算；随舞台来源切换参考尺寸） */
   function toDeviceCoord(clientX, clientY) {
     const el = surface()
     const rect = el.getBoundingClientRect()
-    return mapToDeviceCoord(clientX, clientY, rect, el.videoWidth, el.videoHeight)
+    return mapToDeviceCoord(clientX, clientY, rect, surfaceSize(el).width, surfaceSize(el).height)
   }
 
   // ---------- 框选保存模板 ----------
@@ -163,13 +166,13 @@ export function useConsoleTemplates({
   function selToDeviceRect() {
     const el = surface()
     const rect = videoWrap.value.getBoundingClientRect()
-    return selectionToDeviceRect(selStart, selEnd, rect, el?.videoWidth, el?.videoHeight)
+    return selectionToDeviceRect(selStart, selEnd, rect, surfaceSize(el).width, surfaceSize(el).height)
   }
 
   /** 生成默认模板名：随机名字#x1_y1_x2_y2（相对坐标 0~1，×1000 存 3 位整数，如 0.123→123，不带 .png 后缀） */
   function defaultTplName(rect) {
     const el = surface()
-    return defaultTemplateName(rect, el?.videoWidth, el?.videoHeight)
+    return defaultTemplateName(rect, surfaceSize(el).width, surfaceSize(el).height)
   }
 
   // ---------- 二次裁切 ----------
@@ -213,26 +216,15 @@ export function useConsoleTemplates({
     confirmDelTpl.value = null
     crop.conflict = null
     crop.sourceLabel = ''
-    if (stage && stage.kind?.() === 'live') {
-      const video = stage.surfaceEl?.() || videoElement.value
-      if (!video?.videoWidth) return toast('无法截取画面，请稍后重试', 'error')
-      freezeCropBase(video, video.videoWidth, video.videoHeight, '实时画面当前帧', rect)
-      return
+    const genBefore = stage?.generation()
+    let frame
+    try { frame = await frames.captureFrame() }
+    catch (e) { return toast('无法截取画面：' + e.message, 'error') }
+    if (!frame) return toast('无法获取画面帧，请稍后重试', 'error')
+    if (stage && (stage.generation() !== genBefore || frame.generation !== genBefore)) {
+      return toast('画面来源已切换，请重新框选', 'warn')
     }
-    if (stage?.captureFrame) {
-      const genBefore = stage.generation()
-      const frame = await stage.captureFrame()
-      if (!frame) return toast('无法获取画面帧，请稍后重试', 'error')
-      if (stage.generation() !== genBefore || frame.generation !== genBefore) {
-        return toast('画面来源已切换，请重新框选', 'warn')
-      }
-      freezeCropBase(frame.source, frame.width, frame.height, frame.label, rect)
-      return
-    }
-    // 未注入舞台桥（旧调用方兼容）：实时视频元素
-    const video = videoElement.value
-    if (!video?.videoWidth) return toast('无法截取画面，请稍后重试', 'error')
-    freezeCropBase(video, video.videoWidth, video.videoHeight, '实时画面当前帧', rect)
+    freezeCropBase(frame.source, frame.width, frame.height, frame.label, rect)
   }
 
   function cancelCrop() {
@@ -606,10 +598,15 @@ export function useConsoleTemplates({
   // ---------- 放大预览镜 ----------
 
   /** 以光标为中心放大当前画面帧：devPt 为放大中心（设备像素），rects 为要叠加显示的选区（设备像素坐标） */
-  function updateLoupe(clientX, clientY, devPt, zoom, rects) {
-    const video = surface()
+  let loupeRequest = 0
+  async function updateLoupe(clientX, clientY, devPt, zoom, rects) {
+    const request = ++loupeRequest
     const canvas = loupeCanvas.value
-    if (!video?.videoWidth || !canvas) return
+    if (!canvas) return
+    let frame
+    try { frame = await frames.captureDisplayFrame() } catch { return }
+    if (!frame || request !== loupeRequest) return
+    const video = frame.source
     const c = devPt
     const L = canvas.width
     const half = L / zoom / 2
@@ -646,7 +643,7 @@ export function useConsoleTemplates({
     loupe.y = Math.max(6, y)
   }
 
-  function hideLoupe() { loupe.show = false }
+  function hideLoupe() { loupeRequest++; loupe.show = false }
 
   function togglePick() {
     confirmDelTpl.value = null
@@ -717,7 +714,7 @@ export function useConsoleTemplates({
     const resolve = bridgeRegionResolve
     bridgeRegionResolve = null
     resolve(rect.w >= 8 && rect.h >= 8
-      ? { ...rect, width: videoElement.value?.videoWidth || 0, height: videoElement.value?.videoHeight || 0 }
+      ? { ...rect, ...surfaceSize() }
       : null)
     if (rect.w < 8 || rect.h < 8) toast('框选区域太小，请重新框选', 'warn')
   }
@@ -755,9 +752,12 @@ export function useConsoleTemplates({
   }
 
   /** 从当前舞台画面帧采样设备像素颜色 → 6 位 hex（画面不可用返回 null） */
-  function samplePixelHex(devX, devY) {
-    const v = surface()
-    if (!v?.videoWidth) return null
+  async function samplePixelHex(devX, devY) {
+    const frame = await frames.captureDisplayFrame()
+    if (!frame) return null
+    const v = frame.source
+    devX = Math.max(0, Math.min(frame.width - 1, Math.round(devX)))
+    devY = Math.max(0, Math.min(frame.height - 1, Math.round(devY)))
     const c = document.createElement('canvas')
     c.width = 1
     c.height = 1
@@ -768,15 +768,16 @@ export function useConsoleTemplates({
   }
 
   /** 视频画面点击 → 结束取点模式：coord 回相对坐标，color 回采样 hex */
-  function finishCellPick(e) {
-    const v = surface()
+  async function finishCellPick(e) {
+    const size = surfaceSize()
+    const generation = stage?.generation()
     const pt = toDeviceCoord(e.clientX, e.clientY)
     const mode = cellPick.mode
     cellPick.mode = null
     const resolve = cellPick.resolve
     cellPick.resolve = null
     hideLoupe()
-    if (!v?.videoWidth) {
+    if (!size.width || !size.height) {
       resolve?.(null)
       toast('设备画面不可用', 'warn')
       return
@@ -784,11 +785,13 @@ export function useConsoleTemplates({
     if (mode === 'coord') {
       feedback?.setCore({ text: '已取点', actions: [
         { label: `(${pt.x}, ${pt.y})`, copy: `[${pt.x}, ${pt.y}]` },
-        { label: `(${(pt.x / v.videoWidth).toFixed(4)}, ${(pt.y / v.videoHeight).toFixed(4)})`, copy: `[${(pt.x / v.videoWidth).toFixed(4)}, ${(pt.y / v.videoHeight).toFixed(4)}]` },
+        { label: `(${(pt.x / size.width).toFixed(4)}, ${(pt.y / size.height).toFixed(4)})`, copy: `[${(pt.x / size.width).toFixed(4)}, ${(pt.y / size.height).toFixed(4)}]` },
       ] })
-      resolve?.({ x: Number((pt.x / v.videoWidth).toFixed(4)), y: Number((pt.y / v.videoHeight).toFixed(4)) })
+      resolve?.({ x: Number((pt.x / size.width).toFixed(4)), y: Number((pt.y / size.height).toFixed(4)) })
     } else if (mode === 'color') {
-      const hex = samplePixelHex(pt.x, pt.y)
+      let hex
+      try { hex = await samplePixelHex(pt.x, pt.y) } catch { hex = null }
+      if (stage?.generation() !== generation) { resolve?.(null); return }
       if (hex) {
         feedback?.setCore({ text: '已取色', actions: [{ label: hex, copy: hex }, { label: `(${pt.x}, ${pt.y})`, copy: `[${pt.x}, ${pt.y}]` }] })
         resolve?.({ hex, x: pt.x, y: pt.y })
@@ -1073,8 +1076,8 @@ export function useConsoleTemplates({
     // 实际舞台画面尺寸优先：虚拟屏分辨率/方向会被游戏改变，设备配置里的
     // width/height 可能过期（随舞台来源切换：live = 视频，media = 媒体画面）
     const el = surface()
-    const vw = el?.videoWidth || current.value?.width || 1920
-    const vh = el?.videoHeight || current.value?.height || 1080
+    const vw = surfaceSize(el).width || current.value?.width || 1920
+    const vh = surfaceSize(el).height || current.value?.height || 1080
     if (testRegion.value) return regionCodePixels(testRegion.value, vw, vh)
     const nums = parseTplRegion(name)
     if (nums) {
@@ -1121,8 +1124,8 @@ export function useConsoleTemplates({
       // 模板列表测试允许用户用测试区覆盖；步骤预览不覆盖，交给服务端按引擎规则
       // 从实际模板文件名解析 #区域（短名也由服务端统一消歧）。
       const el = surface()
-      const width = el?.videoWidth || current.value?.width || 1920
-      const height = el?.videoHeight || current.value?.height || 1080
+      const width = surfaceSize(el).width || current.value?.width || 1920
+      const height = surfaceSize(el).height || current.value?.height || 1080
       const region = stepSemantics
         ? matchOptions.region?.map((v, i) => Math.round(v * (i % 2 ? height : width)))
         : templateRegionPixels(name)
@@ -1142,8 +1145,8 @@ export function useConsoleTemplates({
       } else {
         // 未命中也画框：显示本次搜索区域（与引擎 miss 可视化同语义，便于发现区域配错）
         const el = surface()
-        const vw2 = el?.videoWidth || current.value?.width || 1920
-        const vh2 = el?.videoHeight || current.value?.height || 1080
+        const vw2 = surfaceSize(el).width || current.value?.width || 1920
+        const vh2 = surfaceSize(el).height || current.value?.height || 1080
         const [rx, ry, rw2, rh2] = region || r.region || [0, 0, vw2, vh2]
         hit.x = rx; hit.y = ry; hit.w = rw2; hit.h = rh2
         hitLabel.value = `${name} 未命中`

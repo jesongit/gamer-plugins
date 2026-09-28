@@ -13,6 +13,7 @@ fn split_libraries_reject_duplicate_names_and_removed_references() {
     store
         .create_package(PackageInput {
             id: "qa".into(),
+            android_targets: vec!["*".into()],
             ..Default::default()
         })
         .unwrap();

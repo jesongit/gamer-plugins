@@ -25,3 +25,7 @@ UI 与 WASM 可在现有宿主契约内独立更新，无需重编译主程序�
 UI 与 Core 共享的模块清单在 `sdk/ui/host-modules.json`，构建时映射为宿主 SDK，不打包另一份 Vue/store。新增宿主 API 要先扩展并验证该契约。宿主 UI 声明 `ui.host` 权限，在安装确认中明确其页面访问能力；第三方需要隔离时使用原有 sandbox iframe SDK。
 
 通用说明：[插件开发指南](../../docs/guides/plugin-dev.md)，[界面设计规范](../../docs/design/gamer-ui-spec.md)。
+
+## 浏览器目标
+
+配合提供 CDP 浏览器目标的 Gamer 宿主，原有截图识别、tap/swipe、key、input_text 与定时 runner 可用于无窗口页面；`key` 使用浏览器逻辑键名，Android 数字键码语义保留。匹配对象及 `center` 携带帧来源，导航或改绑后旧坐标会被拒绝。登录和进入游戏流程仍由 YAML 编排，launch/stop_app 仅用于 Android。此接入修改了 `host/`，必须同时更新宿主，单独更新插件归档不能给旧宿主增加 CDP 能力；公开 WIT/UI SDK 未变更。

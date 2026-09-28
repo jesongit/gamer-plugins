@@ -508,6 +508,7 @@ mod tests {
             version: version.into(),
             author: String::new(),
             android_targets: vec![],
+            web_url_prefixes: vec![],
             required_plugins: vec![],
             optional_plugins: vec![],
             asset_name: format!("{id}-{version}.gamerpkg"),

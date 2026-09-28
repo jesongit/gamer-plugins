@@ -4,8 +4,8 @@ use super::{
     rules::{self, RuleSet, RULE_PATH, RUNNER},
 };
 use crate::{
-    core::{AndroidPackageName, AppContext, AppPackageId, DeviceId, RunPayload, RunRequest},
-    device::{DeviceManager, DeviceStatus},
+    core::{AppPackageId, RunPayload, RunRequest},
+    device::DeviceManager,
     resources::PackageStore,
     run_manager::RunManager,
     scheduler::Scheduler,
@@ -27,23 +27,17 @@ pub struct Runtime {
 impl Backend for Runtime {
     fn target(&self, device: &str, package: &str) -> Result<Target> {
         self.packages.manifest(package)?;
-        let (device, _, _) = self.devices.snapshot(device).context("设备不存在")?;
-        let android = device
-            .pkg
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .context("请先为设备选择 Android 应用")?
-            .to_owned();
+        let context =
+            crate::targets::app_context(&self.devices, device, Some(AppPackageId::new(package)?))?;
         // Package directory birth identity detects atomic import/replacement without coupling to plugin internals.
         let path = self.packages.resource_path(package, super::ID, RULE_PATH)?;
         let root = path.ancestors().nth(4).context("配置包路径无效")?;
         let meta = std::fs::metadata(root)?;
         let stamp = format!("{:?}", meta.created().or_else(|_| meta.modified())?);
         Ok(Target {
-            device_id: device.id,
+            device_id: device.into(),
             package_id: package.into(),
-            android_package: android,
+            android_package: context.android_package.map(|p| p.as_str().to_owned()),
             package_stamp: stamp,
         })
     }
@@ -56,13 +50,7 @@ impl Backend for Runtime {
             self.scheduler.runner_registry().supports(RUNNER),
             "自动化插件未启用，请启用后继续队列"
         );
-        if let Some((_, status, error)) = self.devices.snapshot(&target.device_id) {
-            ensure!(
-                status != DeviceStatus::Offline || error.is_none(),
-                "设备离线：{}",
-                error.unwrap_or_default()
-            );
-        }
+        crate::targets::check_available(&self.devices, &target.device_id)?;
         Ok(())
     }
     fn rules(&self, package: &str) -> Result<(RuleSet, Option<String>)> {
@@ -108,11 +96,11 @@ impl Backend for Runtime {
         let request = (|| -> Result<RunRequest> {
             rules::validate_entrypoint(&t.package_id, entry)?;
             let bound = self.bind(entry, args.clone())?;
-            let app = AppContext::new(
-                DeviceId::new(&t.device_id)?,
-                AndroidPackageName::new(&t.android_package)?,
+            let app = crate::targets::app_context(
+                &self.devices,
+                &t.device_id,
                 Some(AppPackageId::new(&t.package_id)?),
-            );
+            )?;
             Ok(RunRequest::for_app(
                 app,
                 RUNNER,

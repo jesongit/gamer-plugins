@@ -2,7 +2,7 @@
   "schema_version": 1,
   "host_api": "1.0.0",
   "repository": "https://github.com/jesongit/gamer.git",
-  "commit": "ca12b1278154f8fa506f6acf0287f59d8ee80e5e",
+  "commit": "3de0c7e7e21ef3ad78f3c8604fd09f225bc5ee73",
   "files": [
     {
       "source": "sdk/ui/module-build.mjs",
@@ -12,7 +12,7 @@
     {
       "source": "sdk/ui/host-modules.json",
       "path": "ui/host-modules.json",
-      "sha256": "d8d88cde7c5ce09f2e9daf6ac2d30ebdc4d59affacebe725a054bd4e50c5c7db"
+      "sha256": "3fedd9bba67c2ae3bd23f207361659b03bec852982f099246c07ba4000a234de"
     },
     {
       "source": "server/wit/gamer/host.wit",
@@ -22,7 +22,7 @@
     {
       "source": "server/wit/keymap/keymap.wit",
       "path": "wit/keymap/keymap.wit",
-      "sha256": "6e0aa50f6205de0e95d37924347e51a4aab1132a52815fbf1984ed69e468f50f"
+      "sha256": "d0989b83387a0d834972604d1983a704235c9144a58505be23c5e2f0233717f5"
     },
     {
       "source": "tools/plugin-packer/Cargo.lock",

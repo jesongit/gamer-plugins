@@ -9,7 +9,7 @@ beforeEach(() => {
 })
 it('打开面板只读取状态，离开不停止服务端输出', async () => {
   const w = mountWorkspace(); await flushPromises()
-  expect(mocks.call.mock.calls.map(c => c[1])).toEqual(['connection.settings.read', 'live.status', 'events.read'])
+  expect(mocks.call.mock.calls.map(c => c[1])).toEqual(['connection.settings.read', 'live.status'])
   w.unmount()
   expect(mocks.call.mock.calls.every(c => !c[1].endsWith('stop') && !c[1].endsWith('disconnect'))).toBe(true)
 })

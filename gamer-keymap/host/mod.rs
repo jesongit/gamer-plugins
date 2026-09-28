@@ -353,6 +353,10 @@ pub enum DeviceAction {
     Key {
         input: KeyInput,
     },
+    NamedKey {
+        name: String,
+        action: KeyAction,
+    },
     Text {
         input: TextInput,
     },
@@ -476,6 +480,14 @@ impl CapabilityDeviceActionExecutor {
                     .ok_or_else(|| Self::unavailable("input.key"))?;
                 service
                     .key(device, *input)
+                    .await
+                    .map_err(Self::map_capability_error)?;
+            }
+            DeviceAction::NamedKey { name, action } => {
+                self.capabilities
+                    .input()
+                    .ok_or_else(|| Self::unavailable("input.key"))?
+                    .key_named(device, name, *action)
                     .await
                     .map_err(Self::map_capability_error)?;
             }
@@ -1253,7 +1265,7 @@ mod keymap_wasmtime {
         match action {
             GuestAction::Tap(_) => Permission::InputTap,
             GuestAction::Swipe(_) => Permission::InputSwipe,
-            GuestAction::Key(_) => Permission::InputKey,
+            GuestAction::Key(_) | GuestAction::NamedKey(_) => Permission::InputKey,
             GuestAction::Text(_) => Permission::InputText,
             GuestAction::TouchBegin(_) | GuestAction::TouchMove(_) | GuestAction::TouchEnd(_) => {
                 Permission::Touch
@@ -1314,6 +1326,25 @@ mod keymap_wasmtime {
                     Permission::InputKey,
                     DeviceAction::Key {
                         input: KeyInput::new(KeyCode::new(key.code), action),
+                    },
+                    None,
+                )
+            }
+            GuestAction::NamedKey(key) => {
+                if key.name.is_empty() || key.name.len() > 64 {
+                    return Err(ExtensionError::Runtime("无效按键名称".into()));
+                }
+                let action = match key.action.as_str() {
+                    "down" => KeyAction::Down,
+                    "up" => KeyAction::Up,
+                    "press" => KeyAction::Press,
+                    _ => return Err(ExtensionError::Runtime("未知按键操作".into())),
+                };
+                (
+                    Permission::InputKey,
+                    DeviceAction::NamedKey {
+                        name: key.name,
+                        action,
                     },
                     None,
                 )
@@ -1510,95 +1541,7 @@ fn format_diagnostics(diagnostics: &[KeymapDiagnostic]) -> String {
         .join("；")
 }
 
-pub(crate) fn android_keycode(code: &str) -> Option<u32> {
-    if let Some(letter) = code.strip_prefix("Key") {
-        let byte = letter.as_bytes().first().copied()?;
-        if letter.len() == 1 && byte.is_ascii_uppercase() {
-            return Some(29 + u32::from(byte - b'A'));
-        }
-    }
-    if let Some(digit) = code.strip_prefix("Digit") {
-        let byte = digit.as_bytes().first().copied()?;
-        if digit.len() == 1 && byte.is_ascii_digit() {
-            return Some(7 + u32::from(byte - b'0'));
-        }
-    }
-    Some(match code {
-        "ArrowUp" => 19,
-        "ArrowDown" => 20,
-        "ArrowLeft" => 21,
-        "ArrowRight" => 22,
-        "Home" => 122,
-        "End" => 123,
-        "PageUp" => 92,
-        "PageDown" => 93,
-        "Insert" => 124,
-        "Delete" => 112,
-        "Space" => 62,
-        "Enter" => 66,
-        "NumpadEnter" => 160,
-        "Tab" => 61,
-        "Escape" => 111,
-        "Backspace" => 67,
-        "AltLeft" => 57,
-        "AltRight" => 58,
-        "ShiftLeft" => 59,
-        "ShiftRight" => 60,
-        "ControlLeft" => 113,
-        "ControlRight" => 114,
-        "MetaLeft" => 117,
-        "MetaRight" => 118,
-        "CapsLock" => 115,
-        "NumLock" => 143,
-        "ScrollLock" => 116,
-        "PrintScreen" => 120,
-        "Pause" => 121,
-        "ContextMenu" => 82,
-        "Backquote" => 68,
-        "Minus" => 69,
-        "Equal" => 70,
-        "BracketLeft" => 71,
-        "BracketRight" => 72,
-        "Backslash" | "IntlBackslash" => 73,
-        "Semicolon" => 74,
-        "Quote" => 75,
-        "Comma" => 55,
-        "Period" => 56,
-        "Slash" => 76,
-        "F1" => 131,
-        "F2" => 132,
-        "F3" => 133,
-        "F4" => 134,
-        "F5" => 135,
-        "F6" => 136,
-        "F7" => 137,
-        "F8" => 138,
-        "F9" => 139,
-        "F10" => 140,
-        "F11" => 141,
-        "F12" => 142,
-        "Numpad0" => 144,
-        "Numpad1" => 145,
-        "Numpad2" => 146,
-        "Numpad3" => 147,
-        "Numpad4" => 148,
-        "Numpad5" => 149,
-        "Numpad6" => 150,
-        "Numpad7" => 151,
-        "Numpad8" => 152,
-        "Numpad9" => 153,
-        "NumpadDivide" => 154,
-        "NumpadMultiply" => 155,
-        "NumpadSubtract" => 156,
-        "NumpadAdd" => 157,
-        "NumpadDecimal" => 158,
-        "NumpadComma" => 159,
-        "NumpadEqual" => 161,
-        "NumpadParenLeft" => 162,
-        "NumpadParenRight" => 163,
-        _ => return None,
-    })
-}
+pub(crate) use crate::capabilities::input::android_keycode;
 
 #[cfg(test)]
 mod tests {
@@ -1756,6 +1699,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.example.game".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -1809,6 +1753,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "official.game".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -2010,7 +1955,11 @@ mod wasm_component_tests {
         assert!(service.ui_contributions().unwrap().is_empty());
 
         let running = service
-            .start_with_context(&id, Some(app_context()), None)
+            .start_with_context(
+                &id,
+                Some(app_context()),
+                Some("version: 1\nbindings: []".into()),
+            )
             .await
             .unwrap();
         assert_eq!(running.state(), ExtensionState::Running);
@@ -2204,6 +2153,30 @@ mod wasm_component_tests {
             .dispatch_keymap_input(device(), screen, InputEvent::key_up("KeyW"), None)
             .await
             .unwrap();
+        // A repeated mapped key remains consumed even without a new device action.
+        service
+            .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyW"), None)
+            .await
+            .unwrap();
+        let repeated = service
+            .dispatch_keymap_input(
+                device(),
+                screen,
+                InputEvent::KeyDown {
+                    code: "KeyW".into(),
+                    repeat: true,
+                    meta: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(repeated.consume);
+        assert!(repeated.actions.is_empty());
+        service
+            .dispatch_keymap_input(device(), screen, InputEvent::key_up("KeyW"), None)
+            .await
+            .unwrap();
         // KeyQ raw_key Enter(66)：down/up 配对。
         service
             .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyQ"), None)
@@ -2218,6 +2191,21 @@ mod wasm_component_tests {
             .dispatch_keymap_input(device(), screen, InputEvent::key_down("KeyA"), None)
             .await
             .unwrap();
+        let builtin_repeat = service
+            .dispatch_keymap_input(
+                device(),
+                screen,
+                InputEvent::KeyDown {
+                    code: "KeyA".into(),
+                    repeat: true,
+                    meta: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(builtin_repeat.consume);
+        assert!(builtin_repeat.actions.is_empty());
         let events = trace.snapshot();
         assert!(events
             .iter()
@@ -2265,7 +2253,11 @@ mod wasm_component_tests {
         let id = ExtensionId::parse(KEYMAP_EXTENSION_ID).unwrap();
         service.enable(&id).await.unwrap();
         service
-            .start_with_context(&id, Some(app_context()), None)
+            .start_with_context(
+                &id,
+                Some(app_context()),
+                Some("version: 1\nbindings: []".into()),
+            )
             .await
             .unwrap();
 
@@ -2307,7 +2299,11 @@ mod wasm_component_tests {
         let id = ExtensionId::parse(KEYMAP_EXTENSION_ID).unwrap();
         service.enable(&id).await.unwrap();
         service
-            .start_with_context(&id, Some(app_context()), None)
+            .start_with_context(
+                &id,
+                Some(app_context()),
+                Some("version: 1\nbindings: []".into()),
+            )
             .await
             .unwrap();
 

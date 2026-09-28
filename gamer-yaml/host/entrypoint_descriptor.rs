@@ -219,6 +219,7 @@ mod tests {
         let pkg = "com.test.app";
         let _ = store.create_package(crate::resources::PackageInput {
             id: pkg.into(),
+            android_targets: vec!["*".into()],
             ..Default::default()
         });
         store

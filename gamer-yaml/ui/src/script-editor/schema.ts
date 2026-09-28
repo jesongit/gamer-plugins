@@ -210,17 +210,20 @@ export function coordInRange(x: number, y: number): boolean {
 
 // ---------- 按键 ----------
 
-/** 命名按键（与宿主 key_code 接受表同步）+ 任意数字 keycode。 */
+/** Android / browser 按键词汇并集；具体目标在输入能力边界判定支持性。 */
 export const KEY_ENUM: readonly string[] = [
   'HOME', 'BACK', 'MENU', 'APP_SWITCH', 'RECENTS',
   'VOL_UP', 'VOLUME_UP', 'VOL_DOWN', 'VOLUME_DOWN',
   'ESC', 'ESCAPE', 'ENTER', 'RETURN', 'SPACE', 'TAB', 'BACKSPACE', 'DEL',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift', 'Control', 'Alt', 'Meta',
+  'UP', 'DOWN', 'LEFT', 'RIGHT', 'CTRL', 'DELETE', 'END', 'PAGEUP', 'PAGEDOWN', 'INSERT',
 ]
 
 /** 是否为服务端可解析的按键：命名枚举（大小写不敏感）或纯数字 keycode。 */
 export function isKnownKey(value: string): boolean {
   if (/^[0-9]+$/.test(value)) return true
-  return (KEY_ENUM as readonly string[]).includes(value.toUpperCase())
+  if (/^[!-~]$/.test(value) || /^F(?:[1-9]|1[0-9]|2[0-4])$/i.test(value)) return true
+  return KEY_ENUM.some(key => key.toUpperCase() === value.toUpperCase())
 }
 
 // ---------- 字面量校验（V1 参数类型口径） ----------

@@ -125,6 +125,7 @@ pub(crate) struct NativeYamlHost {
     runtime: Arc<dyn RuntimeService>,
     /// 设备坐标系（相对坐标 ⇄ 像素）：capture 后以真实帧分辨率刷新。
     screen: RwLock<FrameSize>,
+    frame_stamp: RwLock<Option<crate::capabilities::FrameStamp>>,
     sink: Option<Arc<dyn EventSink>>,
 }
 
@@ -282,6 +283,7 @@ impl NativeYamlHost {
             device,
             runtime: Arc::new(crate::capabilities::adapters::RuntimeAdapter::new(stop)),
             screen: RwLock::new(FrameSize::new(0, 0)),
+            frame_stamp: RwLock::new(None),
             sink,
         })
     }
@@ -306,7 +308,11 @@ impl NativeYamlHost {
                     if point_components(center).is_none() {
                         bail!("点击目标的 center 必须是 0..1 范围内的中心坐标");
                     }
-                    *position = center.clone();
+                    let mut center = center.clone();
+                    if let Some(stamp) = position.get("_frame") {
+                        center["_frame"] = stamp.clone();
+                    }
+                    *position = center;
                 }
             }
         }
@@ -401,6 +407,10 @@ impl NativeYamlHost {
     async fn tap(&self, args: &BoundArgs) -> Result<Value> {
         self.refresh_input_screen().await?;
         let point = self.touch_point(args.point("position")?)?;
+        let stamp = args.values.get("position").and_then(|p| p.get("_frame"));
+        if let Some(stamp) = stamp {
+            *self.frame_stamp.write().unwrap() = Some(serde_json::from_value(stamp.clone())?);
+        }
         self.click_point(point).await?;
         Ok(Value::Null)
     }
@@ -409,10 +419,11 @@ impl NativeYamlHost {
     async fn click_point(&self, point: TouchPoint) -> Result<()> {
         self.click_delay("before", self.settings.before_click_ms)
             .await?;
+        let stamp = self.frame_stamp.read().unwrap().clone();
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
-            .tap(&self.device, point)
+            .tap_from_frame(&self.device, point, stamp.as_ref())
             .await
             .map_err(anyhow::Error::new)?;
         self.emit_event(RuntimeEventKind::Tap {
@@ -455,12 +466,22 @@ impl NativeYamlHost {
         let from = self.touch_point(args.point("from")?)?;
         let to = self.touch_point(args.point("to")?)?;
         let duration = args.duration_ms("duration")?;
+        let stamps = ["from", "to"]
+            .into_iter()
+            .filter_map(|name| args.values.get(name).and_then(|v| v.get("_frame")))
+            .map(|v| serde_json::from_value::<crate::capabilities::FrameStamp>(v.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if stamps.len() == 2 && stamps[0] != stamps[1] {
+            bail!("滑动起止点来自不同画面")
+        }
+        let current_stamp = self.frame_stamp.read().unwrap().clone();
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
-            .swipe(
+            .swipe_from_frame(
                 &self.device,
                 SwipeGesture::new(from, to, Duration::from_millis(duration)),
+                stamps.first().or(current_stamp.as_ref()),
             )
             .await
             .map_err(anyhow::Error::new)?;
@@ -476,7 +497,7 @@ impl NativeYamlHost {
 
     async fn key(&self, args: &BoundArgs) -> Result<Value> {
         let key = args.string("key")?;
-        let code = key_code(&Value::String(key))?;
+
         let action = match args.opt_string("action")?.unwrap_or_else(|| "press".into()) {
             value if value == "down" => KeyAction::Down,
             value if value == "up" => KeyAction::Up,
@@ -486,7 +507,7 @@ impl NativeYamlHost {
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
-            .key(&self.device, KeyInput::new(KeyCode::new(code), action))
+            .key_named(&self.device, &key, action)
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Value::Null)
@@ -568,7 +589,7 @@ impl NativeYamlHost {
         self.emit_vision_outcome(&template_name, outcome, effective_px)
             .await;
         Ok(match outcome {
-            MatchOutcome::Found(_) => Self::match_value(outcome, region, self.screen()),
+            MatchOutcome::Found(_) => self.match_value(outcome, region, self.screen()),
             MatchOutcome::NotFound => Value::Null,
         })
     }
@@ -734,7 +755,7 @@ impl NativeYamlHost {
                     self.screen().width,
                     self.screen().height,
                 );
-                let mut result = Self::match_value(outcome, region, self.screen());
+                let mut result = self.match_value(outcome, region, self.screen());
                 result["index"] = json!(index);
                 result["template"] = template.clone();
                 return Ok(result);
@@ -783,7 +804,7 @@ impl NativeYamlHost {
                         self.screen().width,
                         self.screen().height,
                     );
-                    self.tap_match(&Self::match_value(outcome, region, self.screen()))
+                    self.tap_match(&self.match_value(outcome, region, self.screen()))
                         .await?;
                     cleared = true;
                     break;
@@ -807,7 +828,7 @@ impl NativeYamlHost {
                     .await;
             }
             if let MatchOutcome::Found(_) = outcome {
-                return Ok(Some(Self::match_value(outcome, region, self.screen())));
+                return Ok(Some(self.match_value(outcome, region, self.screen())));
             }
             if started.elapsed().as_millis() as u64 >= timeout_ms {
                 return Ok(None);
@@ -829,7 +850,12 @@ impl NativeYamlHost {
     fn package(&self, args: &BoundArgs) -> Result<String> {
         match args.opt_string("package")? {
             Some(value) if !value.trim().is_empty() => Ok(value),
-            _ => Ok(self.context.android_package.as_str().to_string()),
+            _ => self
+                .context
+                .android_package
+                .as_ref()
+                .map(|p| p.as_str().to_string())
+                .ok_or_else(|| anyhow!("当前目标不支持 Android 应用操作")),
         }
     }
 
@@ -895,19 +921,27 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         self.refresh_screen(&frame).await?;
+        *self.frame_stamp.write().unwrap() = self
+            .registry
+            .frame()
+            .unwrap()
+            .stamp(frame)
+            .await
+            .map_err(anyhow::Error::new)?;
         Ok(frame)
     }
 
     /// Each __fn call creates a host. Input must read the active coordinate
     /// space itself, including taps before any find and rotation between calls.
     async fn refresh_input_screen(&self) -> Result<()> {
-        let size = self
+        let (size, stamp) = self
             .registry
             .frame()
             .ok_or_else(|| anyhow!("frame capability 未注册"))?
-            .device_size(&self.device)
+            .coordinate_space(&self.device)
             .await
             .map_err(anyhow::Error::new)?;
+        *self.frame_stamp.write().unwrap() = stamp;
         self.set_screen(size)
     }
 
@@ -947,14 +981,14 @@ impl NativeYamlHost {
             .ok()
     }
 
-    fn match_value(outcome: MatchOutcome, region: Value, screen: FrameSize) -> Value {
+    fn match_value(&self, outcome: MatchOutcome, region: Value, screen: FrameSize) -> Value {
         match outcome {
             MatchOutcome::Found(found) => {
                 let center = [
                     (found.x + found.width / 2) as f64 / screen.width as f64,
                     (found.y + found.height / 2) as f64 / screen.height as f64,
                 ];
-                json!({
+                let mut value = json!({
                     "x": found.x,
                     "y": found.y,
                     "width": found.width,
@@ -962,7 +996,12 @@ impl NativeYamlHost {
                     "score": found.score,
                     "center": { "x": center[0], "y": center[1] },
                     "region": region,
-                })
+                });
+                if let Some(stamp) = self.frame_stamp.read().unwrap().clone() {
+                    value["_frame"] = json!(stamp);
+                    value["center"]["_frame"] = json!(stamp);
+                }
+                value
             }
             MatchOutcome::NotFound => Value::Null,
         }
@@ -1089,29 +1128,6 @@ fn check_schema_type(param: &ParamSchema, value: &Value) -> Result<()> {
     }
 }
 
-fn key_code(value: &Value) -> Result<u32> {
-    let text = value
-        .as_str()
-        .ok_or_else(|| anyhow!("key 必须是按键名字符串或数字字符串"))?;
-    if let Ok(code) = text.parse::<u32>() {
-        return Ok(code);
-    }
-    Ok(match text.to_ascii_uppercase().as_str() {
-        "HOME" => 3,
-        "BACK" => 4,
-        "MENU" => 82,
-        "APP_SWITCH" | "RECENTS" => 187,
-        "VOL_UP" | "VOLUME_UP" => 24,
-        "VOL_DOWN" | "VOLUME_DOWN" => 25,
-        "ESC" | "ESCAPE" => 111,
-        "ENTER" | "RETURN" => 66,
-        "SPACE" => 62,
-        "TAB" => 61,
-        "BACKSPACE" | "DEL" => 67,
-        other => bail!("不支持的 Android key: {other}"),
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1233,6 +1249,7 @@ pub(crate) mod tests {
         pub(crate) match_calls: AtomicU64,
         frames: Mutex<Vec<FrameHandle>>,
         regions: Mutex<Vec<Option<SearchRegion>>>,
+        stamp: Mutex<Option<crate::capabilities::FrameStamp>>,
     }
 
     impl VisionStub {
@@ -1245,6 +1262,7 @@ pub(crate) mod tests {
                 match_calls: AtomicU64::new(0),
                 frames: Mutex::new(Vec::new()),
                 regions: Mutex::new(Vec::new()),
+                stamp: Mutex::new(None),
             })
         }
 
@@ -1255,6 +1273,12 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl FrameService for VisionStub {
+        async fn stamp(
+            &self,
+            _frame: FrameHandle,
+        ) -> CapabilityResult<Option<crate::capabilities::FrameStamp>> {
+            Ok(self.stamp.lock().unwrap().clone())
+        }
         async fn device_size(&self, _device: &DeviceHandle) -> CapabilityResult<FrameSize> {
             Ok(*self.input_size.read().unwrap())
         }
@@ -1478,6 +1502,35 @@ log = "^1.0"
         );
         let error = call("gt", json!({"a": "x", "b": 2}), &host).unwrap_err();
         assert!(error.to_string().contains("number"), "{error}");
+    }
+
+    #[test]
+    fn matched_coordinates_retain_frame_identity_when_center_is_extracted() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let stamp = crate::capabilities::FrameStamp {
+            target: "browser-a".into(),
+            epoch: "epoch".into(),
+            revision: 7,
+        };
+        *stub.stamp.lock().unwrap() = Some(stamp.clone());
+        stub.push_outcome(stub_outcome());
+        let host = vision_host(
+            trace.clone(),
+            &stub,
+            LogTrace::new(),
+            &["vision.match", "resource.read", "input.tap"],
+        );
+        let found = call("find", json!({"template":"reward.png"}), &host).unwrap();
+        assert_eq!(found["_frame"], json!(stamp));
+        assert_eq!(found["center"]["_frame"], json!(stamp));
+        // An input implementation without this frame source must reject both forms.
+        for point in [found.clone(), found["center"].clone()] {
+            assert!(call("tap", json!({"position":point}), &host).is_err());
+        }
+        assert!(trace.taps.lock().unwrap().is_empty());
+        call("tap", json!({"position":{"x":0.2,"y":0.3}}), &host).unwrap();
+        assert_eq!(trace.taps.lock().unwrap().len(), 1);
     }
 
     #[test]

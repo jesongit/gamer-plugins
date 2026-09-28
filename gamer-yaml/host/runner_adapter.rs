@@ -150,9 +150,7 @@ impl RunExecutor for EngineExecutor {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let device_id = context.device_id().as_str();
-            if self.devices.session(device_id).is_none() {
-                self.devices.connect_device(device_id).await?;
-            }
+            crate::targets::prepare(&self.devices, device_id).await?;
             Ok(())
         })
     }
@@ -184,10 +182,7 @@ impl RunExecutor for EngineExecutor {
     }
 
     fn acquire(&self, context: &RunContext) -> anyhow::Result<Box<dyn ActivityLease>> {
-        Ok(Box::new(self.devices.acquire_activity(
-            context.device_id().as_str(),
-            ActivityKind::Run,
-        )))
+        crate::targets::acquire(&self.devices, context.device_id().as_str())
     }
 }
 
@@ -501,6 +496,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.test.app".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -629,6 +625,7 @@ mod tests {
             store
                 .create_package(crate::resources::PackageInput {
                     id: package.into(),
+                    android_targets: vec!["*".into()],
                     ..Default::default()
                 })
                 .unwrap();
@@ -662,6 +659,7 @@ mod tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.stable".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -731,6 +729,7 @@ mod tests {
         source
             .create_package(crate::resources::PackageInput {
                 id: "com.archive".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();

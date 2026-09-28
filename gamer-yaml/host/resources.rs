@@ -442,6 +442,7 @@ mod rename_tests {
         store
             .create_package(crate::resources::PackageInput {
                 id: "com.test.app".into(),
+                android_targets: vec!["*".into()],
                 ..Default::default()
             })
             .unwrap();

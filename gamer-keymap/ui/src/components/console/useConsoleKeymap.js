@@ -1,3 +1,4 @@
+import { frameSource } from '../../../../../../web/src/console/frame-source'
 import { computed, ref } from 'vue'
 import { load as loadYaml } from 'js-yaml'
 import { api } from '../../../../../../web/src/api'
@@ -30,6 +31,7 @@ export function useConsoleKeymap({
   keymapPressed,
   // 投屏几何（templates composable）
   videoElement,
+  stage,
   videoWrap,
   deviceRectStyle,
   // 步骤编辑器选点（templates composable）
@@ -209,8 +211,10 @@ export function useConsoleKeymap({
   const keymapOverlay = computed(() => {
     const bindings = activeKeymapModel.value?.bindings
     if (!Array.isArray(bindings)) return []
-    const vw = videoElement.value?.videoWidth || 1920
-    const vh = videoElement.value?.videoHeight || 1080
+    const size = (stage || frameSource(() => videoElement.value)).displaySize()
+    const vw = size.width
+    const vh = size.height
+    if (!vw || !vh) return []
     return bindings.map((binding, index) => {
       const action = binding?.action || {}
       const type = String(action.type || 'raw_key')
