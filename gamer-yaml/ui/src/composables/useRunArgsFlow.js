@@ -45,6 +45,7 @@ function toParamsLoadError(e, { runnerId, entrypoint }) {
 export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, loadParams = undefined } = {}) {
   const loadDescriptor = loadParams
     || (({ runnerId, entrypoint }) => api.getEntrypointParams(runnerId, entrypoint))
+  let generation = 0
   // 弹窗态（RunParamsModal props 直接绑定 modal.*）
   const modal = reactive({
     open: false,
@@ -55,6 +56,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
     targetName: '',
     kind: 'script',     // 'script' | 'function_library'
     fnName: null,       // 函数测试目标函数名
+    deviceId: null,
     startIndex: 0,
     params: [],
     initialArgs: {},
@@ -75,6 +77,9 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
   }
 
   function close() {
+    if (modal.submitting) return
+    generation++
+    modal.loading = false
     reset()
   }
 
@@ -86,6 +91,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
    */
   async function begin(opts = {}) {
     if (modal.open || modal.submitting || modal.loading) return { form: false, busy: true }
+    const request = ++generation
     const kind = opts.kind || 'script'
     const runnerId = opts.runnerId || ''
     const entrypoint = opts.entrypoint || ''
@@ -97,6 +103,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       targetName: opts.name || opts.id || '',
       kind,
       fnName: opts.fnName ?? null,
+      deviceId: opts.deviceId ?? null,
       startIndex: opts.startIndex || 0,
       initialArgs: opts.initialArgs || {},
     })
@@ -105,6 +112,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
     try {
       descriptor = await loadDescriptor({ runnerId, entrypoint })
     } catch (e) {
+      if (request !== generation) return { form: false, cancelled: true }
       // 加载失败：清空弹窗态（含上一次目标的参数残留）→ 结构化错误上抛交宿主提示
       modal.params = []
       modal.suggestions = {}
@@ -112,8 +120,9 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       reset()
       throw toParamsLoadError(e, { runnerId, entrypoint })
     } finally {
-      modal.loading = false
+      if (request === generation) modal.loading = false
     }
+    if (request !== generation) return { form: false, cancelled: true }
     modal.params = schemaToParamDecls(descriptor?.schema)
     modal.suggestions = loadRunArgsSuggestion(opts.id || '', storage)
     modal.templates = opts.templates || []
@@ -127,6 +136,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
 
   /** RunParamsModal 提交（已过客户端校验）：稀疏 args → 服务端。 */
   async function confirm(args) {
+    if (!modal.open || modal.submitting || modal.loading) return { ok: false, reason: 'inactive' }
     return run(args)
   }
 
@@ -141,6 +151,7 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       fnName: modal.fnName,
       startIndex: modal.startIndex,
       args,
+      ...(modal.deviceId ? { deviceId: modal.deviceId } : {}),
     }
     try {
       const rep = await exec(opts)

@@ -1,8 +1,8 @@
 <template>
   <section class="runner-workspace">
     <div class="resource-toolbar">
-      <ScriptPicker v-if="ctx.runKind === 'script' && !(editing && !ctx.shell.resourceId)" :model-value="ctx.selScript" :package="ctx.packageId" :lock-package="true" :auto-pick="!editing" :disabled="ctx.store.running || ctx.startPending || ctx.shell.saving || ctx.navigationPending" @update:model-value="selectScript" />
-      <select v-else-if="isFunction" class="select resource-select" :value="functionPickerValue" aria-label="选择函数" :disabled="loading || ctx.store.running || ctx.startPending || ctx.shell.saving || ctx.navigationPending" @change="selectFunction($event.target.value)">
+      <ScriptPicker v-if="ctx.runKind === 'script' && !(editing && !ctx.shell.resourceId)" :model-value="ctx.selScript" :package="ctx.packageId" :lock-package="true" :auto-pick="!editing" :disabled="navigationBusy" @update:model-value="selectScript" />
+      <select v-else-if="isFunction" class="select resource-select" :value="functionPickerValue" aria-label="选择函数" :disabled="navigationBusy" @change="changeFunction">
         <option value="">选择函数…</option><option v-if="editing && !ctx.filteredFnViews.some(v => v.name === ctx.editFocusFn && v.fileId === ctx.shell.resourceId)" :value="functionPickerValue">{{ ctx.editFocusFn }}（未保存）</option><option v-for="view in ctx.filteredFnViews" :key="fnKey(view)" :value="fnKey(view)">{{ view.name }}{{ fnIsDefault(view) ? '' : ` · ${view.category}` }}</option>
       </select>
       <span v-else class="resource-select">{{ ctx.shell.scriptDisplayName || '新脚本' }}</span>
@@ -154,7 +154,8 @@ const previewModel = computed(() => {
 const editing = computed(() => ctx.scriptMode === 'edit' && ctx.shell.hasModel && (ctx.shell.kind === 'function_library') === isFunction.value)
 const loading = ref(false), loadError = ref(''), selectedFunctionKey = ref(''), moreEl = ref(null), showRunDetails = ref(false)
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
-const navigationBusy = computed(() => !!(ctx.store.running || ctx.startPending || ctx.shell.saving || ctx.shell.loading || ctx.navigationPending || loading.value))
+const deleting = ref(false)
+const navigationBusy = computed(() => !!(ctx.store.running || ctx.startPending || ctx.raw.loading || ctx.raw.saving || ctx.shell.saving || ctx.shell.loading || ctx.navigationPending || loading.value || deleting.value))
 watch(showRunDetails, () => canvasEl.value?.closeAdd())
 async function openSteps(target) {
   if (navigationBusy.value) return
@@ -225,8 +226,8 @@ function closeMore() { if (moreEl.value) moreEl.value.open = false }
 async function allowSwitch() {
   if (navigationBusy.value) return false
   const ownsModel = (ctx.shell.kind === 'function_library') === isFunction.value
-  if ((ctx.shell.dirty || namePending.value || (ctx.scriptMode === 'raw' && ctx.raw.dirty)) && !await confirmDialog('有未保存修改，放弃后将切换编辑内容。', { title: '放弃修改', confirmText: '放弃并切换', danger: true })) return false
-  if (ctx.scriptMode === 'raw') ctx.cancelRawScript()
+  if ((ctx.shell.dirty || namePending.value || ctx.raw.dirty) && !await confirmDialog('有未保存修改，放弃后将切换编辑内容。', { title: '放弃修改', confirmText: '放弃并切换', danger: true })) return false
+  if (ctx.raw.resourceId || ctx.scriptMode === 'raw') ctx.cancelRawScript()
   if (!ownsModel || ctx.shell.dirty) ctx.shell.reset()
   return true
 }
@@ -267,8 +268,13 @@ function retryEditor() { autoOpenRequested = true; loadError.value = ''; return 
 async function selectScript(id) {
   if (id === ctx.selScript && editing.value) return
   if (!await allowSwitch()) return
+  if (ctx.shell.hasModel) ctx.shell.reset()
   ctx.selScript = id
   if (id) await loadSelected()
+}
+async function changeFunction(event) {
+  await selectFunction(event.target.value)
+  event.target.value = functionPickerValue.value
 }
 async function selectFunction(key) {
   if (key === selectedFunctionKey.value && editing.value) return
@@ -287,7 +293,7 @@ async function saveRawAndReturn() {
     await loadSelected()
   }
 }
-async function backFromRaw() { if (ctx.raw.dirty && !await confirmDialog('原文有未保存修改，放弃后将返回可视化编辑。', { title: '放弃修改', confirmText: '放弃修改', danger: true })) return; ctx.cancelRawScript(); await loadSelected() }
+async function backFromRaw() { if (navigationBusy.value) return; if (ctx.raw.dirty && !await confirmDialog('原文有未保存修改，放弃后将返回可视化编辑。', { title: '放弃修改', confirmText: '放弃修改', danger: true })) return; ctx.cancelRawScript(); await loadSelected() }
 async function save() {
   if (!rename()) return false
   const result = await ctx.saveEditScript()
@@ -295,6 +301,11 @@ async function save() {
 }
 async function run(fromUuid = null) {
   if (navigationBusy.value) return
+  if (ctx.scriptMode === 'raw') {
+    await saveRawAndReturn()
+    if (!editing.value) return
+  }
+  if (!editing.value) return
   if (editing.value && !rename()) return
   const functionName = editing.value ? ctx.editFocusFn : selectedFunction.value?.name
   const steps = isFunction.value ? ctx.shell.model?.functions?.find(f => f.name === functionName)?.run || selectedFunction.value?.model?.run || [] : ctx.shell.model?.run || []
@@ -309,6 +320,7 @@ function runFrom(uuid) { return run(uuid) }
 async function newTarget() { closeMore(); if (await allowSwitch()) await ctx.startNewTarget() }
 async function openRaw() {
   closeMore()
+  if (ctx.scriptMode === 'raw') return
   if (navigationBusy.value || !rename()) return
   // Keep the current function (including a new/renamed one) when changing editor modes.
   if (editing.value && ctx.shell.dirty && !await save()) return
@@ -331,13 +343,28 @@ function rename() {
 }
 async function removeTarget() {
   closeMore()
+  if (navigationBusy.value) return
   const target = ctx.shell.resourceId, script = ctx.selScript, fn = selectedFunctionKey.value
+  const model = ctx.shell.model, focus = ctx.editFocusFn
+  // 选择器可能还指向旧函数；新建/重命名以当前模型的已保存身份为准。
+  const currentFunction = editing.value && isFunction.value
+    ? { fileId: target, name: ctx.shell.savedFunctionName(focus) } : selectedFunction.value
+  const unsaved = editing.value && (isFunction.value ? !currentFunction.name : !target)
   if (!await confirmDialog(`删除当前${isFunction.value ? '函数' : '脚本'}？未保存修改也会丢弃。`, { title: '删除资源', confirmText: '删除', danger: true })) return
-  if (ctx.shell.resourceId !== target || ctx.selScript !== script || selectedFunctionKey.value !== fn || ctx.store.running) return
-  let deleted
-  if (isFunction.value) deleted = await ctx.deleteFunction(selectedFunction.value)
-  else { deleted = await ctx.deleteCurrentTarget(); if (!deleted && ctx.scriptDeleteConfirmId === ctx.selScript) deleted = await ctx.deleteCurrentTarget() }
-  if (deleted) { ctx.shell.reset(); selectedFunctionKey.value = ''; ctx.scriptMode = 'run'; await loadSelected() }
+  if (ctx.shell.model !== model || ctx.editFocusFn !== focus || ctx.shell.resourceId !== target || ctx.selScript !== script || selectedFunctionKey.value !== fn || navigationBusy.value) return
+  deleting.value = true
+  ctx.navigationPending = true
+  let deleted = unsaved
+  try {
+    if (!unsaved && isFunction.value) deleted = await ctx.deleteFunction(currentFunction)
+    else if (!unsaved) { deleted = await ctx.deleteCurrentTarget(); if (!deleted && ctx.scriptDeleteConfirmId === script) deleted = await ctx.deleteCurrentTarget() }
+    if (deleted) {
+      if (ctx.scriptMode === 'raw') ctx.cancelRawScript()
+      ctx.shell.reset(); selectedFunctionKey.value = ''; ctx.scriptMode = 'run'
+      await nextTick()
+    }
+  } finally { deleting.value = false; ctx.navigationPending = false }
+  if (deleted) await loadSelected()
 }
 
 function locateError() {

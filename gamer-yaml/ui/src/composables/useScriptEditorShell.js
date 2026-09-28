@@ -45,6 +45,13 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
 
   let offChange = null
   let loadGeneration = 0
+  let savedFunctions = new WeakMap()
+
+  // 函数改名后仍能定位磁盘定义；新插入的函数没有已保存身份。
+  function savedFunctionName(currentName) {
+    const fn = model.value?.functions?.find(fn => fn.name === currentName)
+    return fn ? savedFunctions.get(fn) || '' : ''
+  }
 
   // ---- 派生 ----
   const hasModel = computed(() => !!model.value && !!stack.value)
@@ -123,6 +130,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
     stack.value = new CommandStack(model.value)
     bindStackNotifications()
     resourceId.value = meta.resourceId ?? null
+    savedFunctions = new WeakMap(meta.resourceId ? (model.value.functions || []).map(fn => [fn, fn.name]) : [])
     pkg.value = meta.pkg ?? ''
     name.value = meta.name ?? ''
     version.value = meta.version ?? null
@@ -150,6 +158,9 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
         version: s.version ?? null,
       })
       return parsed
+    } catch (error) {
+      if (generation !== loadGeneration) return null
+      throw error
     } finally {
       if (generation === loadGeneration) loading.value = false
     }
@@ -174,6 +185,9 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
         version: f.version ?? null,
       })
       return parsed
+    } catch (error) {
+      if (generation !== loadGeneration) return null
+      throw error
     } finally {
       if (generation === loadGeneration) loading.value = false
     }
@@ -213,6 +227,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
     if (diags.length) return { ok: false, reason: 'invalid', diagnostics: diags }
     const yaml = serialize(m)
     const submittedName = name.value
+    const submittedFunctions = (m.functions || []).map(fn => [fn, fn.name])
     saving.value = true
     try {
       const expected = opts.force || !version.value ? undefined : version.value
@@ -242,6 +257,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
         version.value = rep.version ?? null
       }
       savedYaml.value = yaml
+      savedFunctions = new WeakMap(submittedFunctions)
       savedName.value = rep.name ?? rep.file ?? submittedName
       conflict.value = null
       return { ok: true, result: rep }
@@ -390,7 +406,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
   return reactive({
     kind, resourceId, pkg, name, scriptDisplayName, model, stack, version, loading, saving,
     selectedUuid, conflict, jumpStack, parseDiags, savedYaml,
-    hasModel, dirty, editorContext, diagnostics, canUndo, canRedo,
+    hasModel, dirty, editorContext, diagnostics, canUndo, canRedo, savedFunctionName,
     canJumpBack, jumpBackLabel,
     loadScript, loadFunctionFile, newScript, newFunctionFile,
     save, reload, overwrite, dismissConflict, reset, undo, redo,

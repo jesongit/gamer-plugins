@@ -364,7 +364,7 @@ export function useConsoleScriptRunner({
     funcScope.scriptMode.value = 'edit'
     showYaml.value = false
     try {
-      await scriptShell.loadFunctionFile(f.id)
+      await scriptShell.loadFunctionFile(f.id, view.name)
     } catch (e) {
       scriptShell.reset()
       funcScope.scriptMode.value = 'run'
@@ -466,6 +466,9 @@ export function useConsoleScriptRunner({
     rawEditor.reset()
     rawSavedSnapshot = ''
     scope.scriptMode.value = 'run'
+    for (const panel of [scriptScope, funcScope]) {
+      if (panel.scriptMode.value === 'raw') panel.scriptMode.value = 'run'
+    }
   }
 
   // ---------- 新建函数（无弹窗、无分类概念）：直接进入默认函数库编辑态 ----------
@@ -490,7 +493,7 @@ export function useConsoleScriptRunner({
       if (requestedPackage !== packageId.value) return
       const existing = (files || []).find(f => f.file === FUNCTION_LIBRARY_DEFAULT)
       if (existing) {
-        await scriptShell.loadFunctionFile(existing.id)
+        if (!await scriptShell.loadFunctionFile(existing.id)) return
       } else {
         // 空默认函数库 + 预置空函数 func1：保存时落盘为 automations/_function.yaml
         const name = uniqueFunctionName('func1')
@@ -616,16 +619,27 @@ export function useConsoleScriptRunner({
   // 面板切换由发起方（VideoDraft）经路由 query 完成，此处不重复导航。
   watch(() => automationEditorRequest.seq, () => {
     const scriptId = automationEditorRequest.scriptId
-    if (!scriptId) return
+    const request = automationEditorRequest.seq
+    const requestedPackage = automationEditorRequest.packageId
+    const selectedAtStart = selScript.value
+    const focusAtStart = editFocusFn.value
+    if (!scriptId || requestedPackage !== packageId.value) return
     void (async () => {
       try {
         await refreshScripts()
       } catch { /* 列表刷新失败时下方查找仍可能命中旧缓存 */ }
+      if (request !== automationEditorRequest.seq || requestedPackage !== packageId.value
+        || selectedAtStart !== selScript.value || focusAtStart !== editFocusFn.value) return
+      if (scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value || store.running) {
+        toast('请先保存或结束当前操作，再打开草稿脚本', 'warn')
+        return
+      }
       if (!scripts.value.some(x => x.id === scriptId)) {
         toast(`未找到已保存的草稿脚本：${scriptId}`, 'warn')
         return
       }
       selScript.value = scriptId
+      if (rawEditor.resourceId.value) cancelRawScript(scriptScope)
       await editCurrentScript()
     })()
   })
@@ -728,7 +742,7 @@ export function useConsoleScriptRunner({
       // 新建脚本落盘后刷新脚本列表（call 目标下拉候选）
       if (scriptShell.kind === 'function_library') await fnLib.refresh(packageId.value)
       else if (wasNew || previousId !== scriptShell.resourceId) await refreshScripts()
-      if (wasNew || previousId !== scriptShell.resourceId) selScript.value = scriptShell.resourceId
+      if (scriptShell.kind === 'script' && (wasNew || previousId !== scriptShell.resourceId)) selScript.value = scriptShell.resourceId
     } else if (r.reason === 'invalid') {
       toast('自动保存未通过：' + (r.diagnostics?.[0]?.message || '存在校验问题'), 'warn')
     } else if (r.reason === 'conflict') {
@@ -767,8 +781,18 @@ export function useConsoleScriptRunner({
 
   /** 409 冲突弹窗：重载磁盘版本（放弃本地修改） */
   async function onConflictReload() {
+    const functionName = scriptShell.savedFunctionName(editFocusFn.value) || editFocusFn.value
     try {
       const r = await scriptShell.reload()
+      if (r.ok && scriptShell.kind === 'function_library') {
+        if (scriptShell.model.functions.some(fn => fn.name === functionName)) editFocusFn.value = functionName
+        else {
+          scriptShell.reset()
+          funcScope.scriptMode.value = 'run'
+          editFocusFn.value = ''
+          await fnLib.refresh(packageId.value)
+        }
+      }
       if (r.ok) toast('已恢复磁盘版本', 'success')
     } catch (e) {
       toast('重载失败：' + e.message, 'error')
@@ -893,7 +917,9 @@ export function useConsoleScriptRunner({
     try {
       const parsed = fnLib.parseFunctionFile(entry.content ?? '', entry.file || '')
       if (!parsed?.model) throw new Error('资源内容为空或无法解析')
-      resourcePreview.model = parsed.model
+      const fn = parsed.model.functions.find(fn => fn.name === fnName)
+      if (!fn) throw new Error(`函数 ${fnName} 已不存在，请刷新列表`)
+      resourcePreview.model = { ...parsed.model, functions: [fn] }
       if (parsed.diagnostics?.length) {
         resourcePreview.error = parsed.diagnostics[0].message || '资源解析失败'
         resourcePreview.model = null
@@ -976,7 +1002,8 @@ export function useConsoleScriptRunner({
   // ---------- 运行参数流程（阶段 5）：目标声明 params 时先弹参数表单，稀疏 args 提交 ----------
   // exec 完成 API 调用与 run_id 登记；flow 负责表单开关/400 诊断回填字段/覆盖建议缓存/摘要
   const runArgsFlow = useRunArgsFlow({
-    exec: async ({ id, name, kind, fnName, startIndex, args }) => {
+    exec: async ({ id, name, kind, fnName, startIndex, args, deviceId }) => {
+      if (!deviceId || deviceId !== store.deviceId) throw new Error('运行设备已切换，请在当前设备重新点击运行')
       startPending.value = true
       // 每次运行清空日志区域，只显示本次运行产生的日志
       runStartTime = Date.now()
@@ -985,10 +1012,10 @@ export function useConsoleScriptRunner({
       try {
         // 函数面板（运行目标=函数库文件）：走函数测试入口运行单个函数
         const rep = kind === 'function_library'
-          ? await runYamlFunction(id, store.deviceId, { function: fnName || undefined, start_index: startIndex, args })
-          : await runYamlScript(id, store.deviceId, startIndex, args)
+          ? await runYamlFunction(id, deviceId, { function: fnName || undefined, start_index: startIndex, args })
+          : await runYamlScript(id, deviceId, startIndex, args)
         // 当前运行响应固定含 run_id；启动即登记实例，后续查询只按该主键进行。
-        applyRunRecord({ ...rep, device_id: store.deviceId, entrypoint: kind === 'function_library' ? `${id}#${fnName}` : id, script_id: id, source: 'manual', display: name })
+        applyRunRecord({ ...rep, device_id: deviceId, entrypoint: kind === 'function_library' ? `${id}#${fnName}` : id, script_id: id, source: 'manual', display: name })
         return rep
       } finally {
         startPending.value = false
@@ -1030,9 +1057,11 @@ export function useConsoleScriptRunner({
     if (!store.deviceId) return toast('请先在上方选择设备再运行', 'warn')
     if (!packageId.value) return toast('请先在右上选择配置包', 'warn')
     if (!fnName) return toast('缺少要运行的函数名', 'warn')
+    startPending.value = true
     try {
       await runArgsFlow.begin({
         id: packageId.value,
+        deviceId: store.deviceId,
         name: `${fnName}()`,
         kind: 'function_library',
         fnName,
@@ -1046,7 +1075,7 @@ export function useConsoleScriptRunner({
       })
     } catch (e) {
       handleRunStartError(e)
-    }
+    } finally { startPending.value = false }
   }
 
   async function runScript(scope, opts = {}) {
@@ -1061,9 +1090,11 @@ export function useConsoleScriptRunner({
     const startIndex = Number.isInteger(opts.startIndex) && opts.startIndex >= 0 ? opts.startIndex : opts.fromUuid && summaryModel.value
       ? (startIndexOf(summaryModel.value, opts.fromUuid) ?? 0)
       : 0
+    startPending.value = true
     try {
       await runArgsFlow.begin({
         id: s.id,
+        deviceId: store.deviceId,
         name: s.name,
         runnerId: GAMER_YAML_RUNNER_ID,
         entrypoint: s.id,
@@ -1073,7 +1104,7 @@ export function useConsoleScriptRunner({
       })
     } catch (e) {
       handleRunStartError(e)
-    }
+    } finally { startPending.value = false }
   }
 
   /** RunParamsModal 提交（客户端校验已过）：稀疏 args 提交；400 invalid_args 由 flow 回填表单标红 */
@@ -1105,19 +1136,18 @@ export function useConsoleScriptRunner({
    * GET /api/devices/:id/run → {active:true,run:RunRecord}；无活动/请求失败静默跳过。 */
   async function restoreRunState() {
     if (!store.deviceId || store.running) return
+    const deviceId = store.deviceId
     let rep = null
     try {
-      rep = await api.deviceRun(store.deviceId)
+      rep = await api.deviceRun(deviceId)
     } catch (e) { /* 恢复失败不影响进入页面 */ return }
-    if (!rep.active) return // {active:false}：无活动 run，保持空闲展示
+    if (deviceId !== store.deviceId || store.running || !rep.active) return
     const rec = rep.run
     if (!rec?.run_id) return
     // 运行目标展示名：entrypoint 为主（runner 语义），script_id 为服务端保留的兼容展示字段
     const target = rec.entrypoint || rec.script_id || ''
     const srcTag = sourceLabel(rec.source)
-    applyRunRecord({ ...rec, device_id: store.deviceId, display: srcTag ? `${target}（${srcTag}）` : target })
-    selScript.value = target
-    scriptScope.scriptMode.value = 'run'
+    applyRunRecord({ ...rec, device_id: deviceId, display: srcTag ? `${target}（${srcTag}）` : target })
     runStartTime = 0   // 不按开始时间过滤，恢复最近日志
     startLogPolling()
     startRunStatusPoll()
@@ -1145,9 +1175,10 @@ export function useConsoleScriptRunner({
   async function beforePackageChange(next) {
     const previous = packageId.value
     if (next === packageId.value) return true
+    if (navigationPending.value) { toast('正在切换或删除资源，请稍后切换配置包', 'warn'); return false }
     if (scriptShell.saving || rawEditor.saving.value) { toast('正在保存，请稍后切换配置包', 'warn'); return false }
     if ((scriptShell.dirty || rawEditor.dirty.value) && !await confirmDialog('当前编辑有未保存修改，放弃后将切换配置包。', { title: '切换配置包', confirmText: '放弃并切换', danger: true })) return false
-    if (packageId.value !== previous || scriptShell.saving || rawEditor.saving.value) return false
+    if (packageId.value !== previous || scriptShell.saving || rawEditor.saving.value || navigationPending.value) return false
     scriptShell.reset()
     rawEditor.reset()
     scriptScope.scriptMode.value = 'run'
@@ -1160,7 +1191,7 @@ export function useConsoleScriptRunner({
   let restoringPackage = false
   watch(packageId, (next, previous) => {
     if (restoringPackage || next === previous) return
-    if (scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value) {
+    if (scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value) {
       restoringPackage = true
       restorePackage(previous)
       restoringPackage = false
@@ -1169,6 +1200,7 @@ export function useConsoleScriptRunner({
     }
     scriptShell.reset()
     rawEditor.reset()
+    runArgsFlow.close()
     selScript.value = ''
     editFocusFn.value = ''
     scriptScope.scriptMode.value = 'run'

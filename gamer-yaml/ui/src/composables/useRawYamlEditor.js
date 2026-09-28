@@ -15,6 +15,7 @@ export function useRawYamlEditor({ api } = {}) {
   const saving = ref(false)
   const functionName = ref('')
   let functionLibrary = null
+  let generation = 0
 
   const dirty = computed(() => content.value !== savedContent.value)
 
@@ -23,11 +24,13 @@ export function useRawYamlEditor({ api } = {}) {
       throw new Error('不支持的原文资源类型')
     }
     if (!id) throw new Error('原文资源不能为空')
+    const request = ++generation
     loading.value = true
     try {
       const data = nextKind === 'script'
         ? await api.getScript(id)
         : await api.getFunction(id)
+      if (request !== generation) return null
       let nextContent = data.content ?? ''
       let library = null
       if (nextKind === 'function' && options.functionName) {
@@ -46,8 +49,11 @@ export function useRawYamlEditor({ api } = {}) {
       savedContent.value = content.value
       version.value = data.version ?? null
       return data
+    } catch (error) {
+      if (request !== generation) return null
+      throw error
     } finally {
-      loading.value = false
+      if (request === generation) loading.value = false
     }
   }
 
@@ -94,6 +100,7 @@ export function useRawYamlEditor({ api } = {}) {
   }
 
   function reset() {
+    generation++
     kind.value = null
     resourceId.value = null
     content.value = ''
