@@ -291,8 +291,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     context,
                     cancelled,
                     sink,
-                    &name,
-                    &serde_json::to_string(&args)?,
+                    (&name, &serde_json::to_string(&args)?),
                     settings,
                     notification,
                 )
