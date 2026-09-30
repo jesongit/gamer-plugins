@@ -71,6 +71,7 @@ const MAX_SLEEP_MS: u64 = 3_600_000;
 /// 一次 YAML 运行的请求：`program` 是宿主 lowering 产出的解释器 wire JSON
 /// （含冻结的 Package 函数表、绑定参数与可选 start_index）。
 pub(crate) struct YamlWasmRunRequest {
+    pub(crate) notification: Option<super::notification::Sender>,
     pub(crate) wasm: Vec<u8>,
     pub(crate) program: Value,
     pub(crate) host: HostApi,
@@ -117,6 +118,7 @@ impl YamlWasmRuntime for NoYamlWasmRuntime {
 /// 权限：每个函数声明所需权限，派发前逐项 `HostApi::authorize`——函数调用
 /// 不能绕过插件权限（计划 Phase 3.2）。
 pub(crate) struct NativeYamlHost {
+    notification: Option<super::notification::Sender>,
     settings: super::settings::Settings,
     host: HostApi,
     registry: CapabilityRegistry,
@@ -246,11 +248,13 @@ impl NativeYamlHost {
         name: &str,
         args_json: &str,
         settings: super::settings::Settings,
+        notification: Option<super::notification::Sender>,
     ) -> Result<Value> {
         let args: Value = serde_json::from_str(args_json)
             .map_err(|error| anyhow!("函数 {name} 参数不是合法 JSON: {error}"))?;
         let mut host = Self::new(host, context, stop, sink).await?;
         host.settings = settings;
+        host.notification = notification;
         // 录制输入来源标注：guest 实例线程内执行点（task-local 不跨线程），
         // 在此线程内把 YAML runner 注入的输入标为 "runner"。
         crate::capabilities::adapters::with_caller_input_source("runner", async {
@@ -276,6 +280,7 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Self {
+            notification: None,
             settings: super::settings::Settings::default(),
             host,
             registry,
@@ -323,6 +328,7 @@ impl NativeYamlHost {
         })
         .await;
         match name {
+            "notify" => self.notify(&bound).await,
             "tap" => self.tap(&bound).await,
             "swipe" => self.swipe(&bound).await,
             "key" => self.key(&bound).await,
@@ -553,6 +559,28 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Value::Null)
+    }
+
+    async fn notify(&self, args: &BoundArgs) -> Result<Value> {
+        if self.runtime.cancelled() {
+            return Err(anyhow::Error::new(
+                crate::capabilities::CapabilityError::Cancelled,
+            ));
+        }
+        let values = json!({"content":args.string("content")?, "title":args.opt_string("title")?.unwrap_or_default(), "channel":args.opt_string("channel")?.filter(|s| !s.is_empty())});
+        let result = match &self.notification {
+            Some(sender) => sender(values).await,
+            None => super::notification::skipped("通知发送能力不可用"),
+        };
+        self.emit_event(RuntimeEventKind::Detail {
+            name: "notification".into(),
+            data: result.clone(),
+        })
+        .await;
+        if result["accepted"] != true && self.host.authorize(Permission::LogWrite).is_ok() {
+            let _ = self.log(&BoundArgs { values: serde_json::from_value(json!({"message":format!("通知未发送：{}", result["reason"].as_str().unwrap_or("能力不可用")), "level":"warn"}))? }).await;
+        }
+        Ok(result)
     }
 
     async fn log(&self, args: &BoundArgs) -> Result<Value> {
@@ -1505,6 +1533,18 @@ log = "^1.0"
     }
 
     #[test]
+    fn notification_function_remains_callable_without_optional_plugin() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(trace, &stub, LogTrace::new(), &[]);
+        let result = call("notify", json!({"content":"完成"}), &host).unwrap();
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["status"], "skipped");
+        assert_eq!(call("eq", json!({"a":1,"b":1}), &host).unwrap(), true);
+        assert!(call("notify", json!({"content":42}), &host).is_err());
+    }
+
+    #[test]
     fn matched_coordinates_retain_frame_identity_when_center_is_extracted() {
         let trace = Arc::new(Trace::default());
         let stub = VisionStub::new(FrameSize::new(1000, 1000));
@@ -2366,6 +2406,7 @@ runtime = "^1.0"
         sink: Option<Arc<dyn EventSink>>,
     ) -> YamlWasmRunRequest {
         YamlWasmRunRequest {
+            notification: None,
             wasm: guest_component(),
             program,
             host,
@@ -2621,8 +2662,13 @@ runtime = "^1.0"
             )
             .with_log_service(logs.clone() as Arc<dyn crate::capabilities::LogService>)
             .build();
-        let service = crate::extensions::ExtensionService::for_data_root(temp.path(), registry)
-            .with_runner_registrar(Arc::new(InstanceFreeRegistrar));
+        let service = Arc::new(
+            crate::extensions::ExtensionService::for_data_root(temp.path(), registry)
+                .with_runner_registrar(Arc::new(InstanceFreeRegistrar))
+                .with_builtin_service(Arc::new(
+                    crate::extensions::notify::NotifyService::new(temp.path()).unwrap(),
+                )),
+        );
 
         let mut archive = Vec::new();
         {
@@ -2645,15 +2691,53 @@ runtime = "^1.0"
 
         let value = super::super::run_yaml_program(
             &service,
-            wire("run:\n  - log: from-v1-e2e\n  - return: true\n"),
+            wire("run:\n  - notify: {content: 通知测试}\n    as: delivery\n  - log: from-v1-e2e\n  - return: $delivery.status\n"),
             AppContext::for_test("device-1", "com.example.game").unwrap(),
             Arc::new(AtomicBool::new(false)),
             None,
         )
         .await
         .unwrap();
-        assert_eq!(value, Value::Bool(true));
-        assert_eq!(logs.messages(), vec!["from-v1-e2e".to_string()]);
+        assert_eq!(value, json!("skipped"));
+        assert_eq!(logs.messages().last().unwrap(), "from-v1-e2e");
+
+        // The same step reaches the optional plugin once it is installed,
+        // without changing the script or its Package dependencies.
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("manifest.toml", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(include_str!("../../gamer-notify/manifest.toml").as_bytes())
+            .unwrap();
+        writer
+            .start_file("ui/plugin.js", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"export const sdkVersion = 1;").unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let notify_id = crate::extensions::ExtensionId::parse("gamer-notify").unwrap();
+        service.install(&archive).await.unwrap();
+        service.enable(&notify_id).await.unwrap();
+        service.start(&notify_id).await.unwrap();
+        let delivery = super::super::run_yaml_program(
+            &service,
+            wire(
+                "run:\n  - notify: {content: 缺少通道}\n    as: delivery\n  - return: $delivery\n",
+            ),
+            AppContext::for_test("device-1", "com.example.game").unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivery["status"], "skipped");
+        assert!(delivery["id"].is_string());
+        let history = service
+            .call_extension(&notify_id, "records.read", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(history["records"][0]["source"], "script");
+        service.disable(&notify_id).await.unwrap();
 
         service.disable(&id).await.unwrap();
         assert!(service

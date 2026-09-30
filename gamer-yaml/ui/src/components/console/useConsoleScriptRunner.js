@@ -166,8 +166,13 @@ export function useConsoleScriptRunner({
   function loadNativeFunctions(force = false) {
     if (nativeFunctionsLoaded.value && !force) return
     if (nativeFunctionsRequest) return nativeFunctionsRequest
-    nativeFunctionsRequest = api.getRunnerFunctions(GAMER_YAML_RUNNER_ID).then(rep => {
+    nativeFunctionsRequest = api.getRunnerFunctions(GAMER_YAML_RUNNER_ID).then(async rep => {
       nativeFunctions.value = Array.isArray(rep?.functions) ? rep.functions : []
+      if (nativeFunctions.value.some(f => f.optional_extension)) {
+        let running = new Set()
+        try { const list = await api.listExtensions(); running = new Set((Array.isArray(list) ? list : list.extensions || []).filter(e => e.state === 'running').map(e => e.id)) } catch {}
+        nativeFunctions.value = nativeFunctions.value.map(f => ({ ...f, available: !f.optional_extension || running.has(f.optional_extension) }))
+      }
       nativeFunctionsLoaded.value = true
     }).catch(() => {
       nativeFunctions.value = []
@@ -176,14 +181,14 @@ export function useConsoleScriptRunner({
   }
   void loadNativeFunctions()
   // 首次加载时插件可能尚未启用；进入编辑和切换 Package 时允许重试。
-  watch([packageId, scriptScope.scriptMode, funcScope.scriptMode], () => { void loadNativeFunctions() })
+  watch([packageId, scriptScope.scriptMode, funcScope.scriptMode], () => { void loadNativeFunctions(true) })
 
   const callTargets = computed(() => {
     const nativeOpts = nativeFunctions.value.map(f => ({
       target: f.name,
       label: f.name,
       group: 'plugin',
-      hint: f.description || '',
+      hint: (f.description || '') + (f.available === false ? '（通知插件不可用，运行时跳过发送；步骤仍可编辑）' : ''),
     }))
     const liveFunctions = scriptShell.kind === 'function_library' && scriptShell.hasModel && Array.isArray(scriptShell.model.functions)
       ? scriptShell.model.functions

@@ -47,4 +47,9 @@ run:
       - log: 相等
     else:
       - log: 不相等
+  - notify:
+      title: 完成
+      content: 测试通知
+      channel: wechat
+    as: notification
   - return: $same
