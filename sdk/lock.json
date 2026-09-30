@@ -2,7 +2,7 @@
   "schema_version": 1,
   "host_api": "1.0.0",
   "repository": "https://github.com/jesongit/gamer.git",
-  "commit": "6370d2c10f0a61da2e21e30a2cddd31ccabc6e9d",
+  "commit": "95c666403fa30d902f52e637ffec7e4cb10d3b00",
   "files": [
     {
       "source": "sdk/ui/module-build.mjs",
@@ -37,7 +37,7 @@
     {
       "source": "tools/plugin-packer/src/main.rs",
       "path": "plugin-packer/src/main.rs",
-      "sha256": "3a25ca9c51ff78ee8eb6084cd8f8df3c6f74aac4eff490ce9033174871be4c0d"
+      "sha256": "ec9435e60cb262dc07fceaa0b8c1bbc61cd07d87f01fd6a7d7ae69c08f1975ea"
     }
   ]
 }

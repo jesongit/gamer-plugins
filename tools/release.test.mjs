@@ -50,3 +50,16 @@ test('live plugin tag accepts its packaged builtin catalog', () => {
   writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
   assert.equal(spawnSync(process.execPath, [script, 'gamer-live-v1.2.3', root]).status, 0)
 })
+
+test('notify release accepts the complete catalog and emits immutable notification URLs', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  const yaml = registry.plugins[0]
+  registry.plugins.push({ ...yaml, id: 'gamer-notify', version: '0.1.0' })
+  writeFileSync(resolve(root, 'plugins/gamer-notify-0.1.0.gplugin'), readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin')))
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-notify-v0.1.0', root]).status, 0)
+  const released = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  assert.equal(released.plugins[1].download_url, 'https://github.com/jesongit/gamer-plugins/releases/download/gamer-notify-v0.1.0/gamer-notify-0.1.0.gplugin')
+  assert.ok(readFileSync(resolve(root, 'sha256sums.txt'), 'utf8').includes(`${yaml.sha256}  gamer-notify-0.1.0.gplugin`))
+})

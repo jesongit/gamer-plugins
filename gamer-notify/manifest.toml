@@ -1,0 +1,28 @@
+manifest_version = 2
+id = "gamer-notify"
+version = "0.1.0"
+name = "通知助手"
+description = "全局通知通道、任务结果通知与自动化通知"
+permissions = ["ui.host", "notify.send"]
+
+[host_api]
+ui = "^1.1"
+runtime = "^1.0"
+
+[targets.android]
+packages = ["*"]
+
+[execution]
+kind = "builtin"
+builtin_id = "gamer-notify"
+host_version = ">=0.2.7"
+
+[[ui.contributions]]
+panel_id = "notify"
+title = "通知助手"
+order = 55
+location = "console.right"
+runtime = "core"
+entry = "ui/plugin.js"
+requires_device = false
+component = "NotifyWorkspace"

@@ -435,6 +435,30 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 permissions: &[],
             },
         ];
+        functions.push(NativeFunction {
+            name: "notify",
+            display_name: "发送通知",
+            description: "提交通知后继续运行；通知插件不可用时跳过并返回原因",
+            params: vec![
+                p("content", ParamType::String, true, None, "通知正文"),
+                p(
+                    "title",
+                    ParamType::String,
+                    false,
+                    Some(json!("")),
+                    "通知标题",
+                ),
+                p(
+                    "channel",
+                    ParamType::String,
+                    false,
+                    Some(json!("")),
+                    "全局通道 ID；留空使用默认通道",
+                ),
+            ],
+            returns: "object",
+            permissions: &[],
+        });
         for func in &mut functions {
             func.params.push(p(
                 "name",
@@ -469,6 +493,7 @@ pub fn native_schema_json(func: &NativeFunction) -> Value {
         "name": func.name,
         "description": func.description,
         "source": "plugin",
+        "optional_extension": if func.name == "notify" { Some("gamer-notify") } else { None },
         "params": func.params.iter().map(|param| {
             let mut schema = json!({
             "name": param.name,

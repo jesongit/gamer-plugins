@@ -157,6 +157,7 @@ impl crate::core::events::EventSink for TracedSink {
 }
 
 struct YamlHostState {
+    notification: Option<super::notification::Sender>,
     current_trace: Option<serde_json::Value>,
     settings: super::settings::Settings,
     host: HostApi,
@@ -173,6 +174,7 @@ impl YamlHostState {
         sink: Option<Arc<dyn crate::core::events::EventSink>>,
     ) -> Self {
         Self {
+            notification: None,
             current_trace: None,
             host,
             cancelled,
@@ -264,6 +266,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                 }) as Arc<dyn crate::core::events::EventSink>
             });
             let settings = self.settings.clone();
+            let notification = self.notification.clone();
             let result = block_on_yaml(async move {
                 let context =
                     context.ok_or_else(|| anyhow::anyhow!("capability.invoke 需要 AppContext"))?;
@@ -291,6 +294,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     &name,
                     &serde_json::to_string(&args)?,
                     settings,
+                    notification,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&value)?)
@@ -397,6 +401,7 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
             request.context,
             request.sink.clone(),
         );
+        state.notification = request.notification;
         state.settings = request
             .program
             .get("_native_settings")

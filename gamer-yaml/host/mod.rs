@@ -25,6 +25,7 @@
 pub(crate) mod actions;
 pub(crate) mod error;
 pub(crate) mod native_funcs;
+pub(crate) mod notification;
 mod reference_types;
 pub(crate) mod resources;
 pub(crate) mod run_target;
@@ -101,7 +102,7 @@ pub(crate) fn yaml_runtime() -> std::sync::Arc<dyn yaml_extension::YamlWasmRunti
 /// `program` = [`syntax::build_program`] 产出的 wire JSON（含冻结函数表与
 /// 绑定参数）；`sink` = 运行可视化事件汇（`None` = 静默）。
 pub(crate) async fn run_yaml_program(
-    service: &crate::extensions::ExtensionService,
+    service: &std::sync::Arc<crate::extensions::ExtensionService>,
     program: serde_json::Value,
     context: crate::core::AppContext,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -109,6 +110,13 @@ pub(crate) async fn run_yaml_program(
 ) -> Result<serde_json::Value, crate::extensions::ExtensionError> {
     use crate::extensions::ExtensionId;
     let id = ExtensionId::parse(YAML_EXTENSION_ID).expect("built-in YAML extension id is valid");
+    let notification = service.plugin_call_context(&id).await.ok().map(|caller| {
+        notification::sender(
+            std::sync::Arc::downgrade(service),
+            caller,
+            program["trace"]["run_id"].as_str().map(str::to_string),
+        )
+    });
     service
         .with_guest_for_run(&id, move |wasm, host| async move {
             yaml_runtime()
@@ -119,6 +127,7 @@ pub(crate) async fn run_yaml_program(
                     context,
                     stop,
                     sink,
+                    notification,
                 })
                 .await
                 .map(|result| result.value)

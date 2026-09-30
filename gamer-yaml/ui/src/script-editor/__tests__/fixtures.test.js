@@ -48,7 +48,7 @@ describe('V1 fixtures roundtrip', () => {
     const fns = model.run.filter((s) => s.kind === 'call').map((s) => s.fn)
     for (const fn of [
       'launch', 'stop_app', 'tap', 'swipe', 'key', 'input_text', 'sleep', 'log',
-      'find', 'wait_find', 'tap_template', 'wait_disappear', 'eq',
+      'find', 'wait_find', 'tap_template', 'wait_disappear', 'eq', 'notify',
     ]) {
       expect(fns).toContain(fn)
     }
