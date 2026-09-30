@@ -15,7 +15,7 @@ packages = ["*"]
 [execution]
 kind = "builtin"
 builtin_id = "gamer-notify"
-host_version = ">=0.2.5"
+host_version = ">=0.2.6"
 
 [[ui.contributions]]
 panel_id = "notify"
