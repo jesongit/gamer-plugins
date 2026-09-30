@@ -34,7 +34,7 @@ impl Settings {
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("通知通道配置损坏"))
     }
 
-    pub fn write(&mut self, path: &PathBuf) -> Result<()> {
+    pub fn write(&mut self, path: &std::path::Path) -> Result<()> {
         self.version = Some(uuid::Uuid::new_v4().to_string());
         let parent = path.parent().context("通知配置路径无效")?;
         std::fs::create_dir_all(parent)?;
