@@ -245,11 +245,11 @@ impl NativeYamlHost {
         context: AppContext,
         stop: Arc<AtomicBool>,
         sink: Option<Arc<dyn EventSink>>,
-        name: &str,
-        args_json: &str,
+        function: (&str, &str),
         settings: super::settings::Settings,
         notification: Option<super::notification::Sender>,
     ) -> Result<Value> {
+        let (name, args_json) = function;
         let args: Value = serde_json::from_str(args_json)
             .map_err(|error| anyhow!("函数 {name} 参数不是合法 JSON: {error}"))?;
         let mut host = Self::new(host, context, stop, sink).await?;
