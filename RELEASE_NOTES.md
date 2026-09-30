@@ -2,8 +2,8 @@
 
 - gamer-notify 0.1.0：全局企微连通道、任务结果通知、手动测试与发送记录；密钥保存在宿主本地，不随配置包分发。
 - gamer-yaml 0.1.2：新增 `notify` 函数，可选依赖通知助手；插件缺失或停用时跳过通知，后续步骤继续，通知步骤仍可添加、编辑和保存。
-- gamer-keymap 保持 0.1.4。
-- gamer-video 保持 0.1.2。
+- gamer-keymap 保持 0.1.3。
+- gamer-video 保持 0.1.1。
 - gamer-live 保持 0.2.5。
 - gamer-package-publisher 保持 0.1.0，验证内容一致后复用已发布字节。
 

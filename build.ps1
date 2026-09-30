@@ -23,6 +23,10 @@ if (-not $ManifestsRoot) { $ManifestsRoot = $RepoRoot }
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'dist\plugins' }
 if (-not $RegistryFile) { $RegistryFile = Join-Path $RepoRoot 'dist\registry.json' }
 if (-not $TargetRoot) { $TargetRoot = Join-Path $RepoRoot '.build' }
+# Compare published files in the same absolute namespace as Get-ChildItem.FullName.
+# Relative output paths otherwise classify freshly copied archives as stale.
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$RegistryFile = [IO.Path]::GetFullPath($RegistryFile)
 # cargo --target-dir 指向 <TargetRoot> 时，packer 产物直接落在 <TargetRoot>\release\
 $PackerExe = Join-Path $TargetRoot 'release\gamer-plugin-packer.exe'
 
@@ -211,6 +215,8 @@ function New-RegistryEntry {
     foreach ($prop in $package.Meta.host_api.PSObject.Properties) { $hostApi[$prop.Name] = $prop.Value }
     $contributions = @($package.Meta.ui.contributions)
     $publisher = if ($package.Meta.publisher) { $package.Meta.publisher } else { $Publisher }
+    $execution = [ordered]@{ kind = $package.Kind }
+    if ($package.Meta.execution.host_version) { $execution.host_version = $package.Meta.execution.host_version }
     [ordered]@{
         id = $package.Id
         version = $package.Version
@@ -223,7 +229,7 @@ function New-RegistryEntry {
         permissions = @($package.Meta.permissions)
         host_api = $hostApi
         ui = [ordered]@{ contributions = $contributions }
-        execution = [ordered]@{ kind = $package.Kind }
+        execution = $execution
     }
 }
 
