@@ -165,7 +165,7 @@ pub(crate) fn validate_function_library_file(
         } else {
             file.content.as_deref().unwrap_or("")
         };
-        let calls = if is_function_library_path(&file.path) {
+        if is_function_library_path(&file.path) {
             match syntax::parse_function_library(source) {
                 Ok(defs) => {
                     if file.path != path {
@@ -178,9 +178,15 @@ pub(crate) fn validate_function_library_file(
                             }
                         }
                     }
-                    defs.iter()
-                        .flat_map(|(_, def)| def.called_functions())
-                        .collect::<std::collections::BTreeSet<_>>()
+                    for (name, def) in &defs {
+                        collect_removed_call_locations(
+                            &def.run,
+                            &removed,
+                            &file.path,
+                            &format!("函数“{name}”"),
+                            &mut referenced,
+                        );
+                    }
                 }
                 Err(_) if !removed.is_empty() => {
                     return Err(failure(
@@ -192,7 +198,22 @@ pub(crate) fn validate_function_library_file(
             }
         } else {
             match syntax::parse_script(source) {
-                Ok(script) => script.called_functions(),
+                Ok(script) => {
+                    let name = script
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            file.path.strip_prefix("automations/").unwrap_or(&file.path)
+                        });
+                    collect_removed_call_locations(
+                        &script.run,
+                        &removed,
+                        &file.path,
+                        &format!("自动化“{name}”"),
+                        &mut referenced,
+                    );
+                }
                 Err(_) if !removed.is_empty() => {
                     return Err(failure(
                         "yaml.functions.references_unknown",
@@ -201,9 +222,6 @@ pub(crate) fn validate_function_library_file(
                 }
                 Err(_) => continue,
             }
-        };
-        for name in calls.intersection(&removed) {
-            referenced.push(format!("{name} ← {}", file.path));
         }
     }
     if !referenced.is_empty() {
@@ -216,6 +234,75 @@ pub(crate) fn validate_function_library_file(
         ));
     }
     Ok(())
+}
+
+/// 保留调用者和每一处调用位置；步骤按编辑器中的一基序号显示。
+fn collect_removed_call_locations(
+    steps: &[syntax::SurfaceStep],
+    removed: &std::collections::BTreeSet<String>,
+    file: &str,
+    parent: &str,
+    out: &mut Vec<String>,
+) {
+    use syntax::SurfaceStep;
+    for (index, step) in steps.iter().enumerate() {
+        let location = format!("{parent} → 第 {} 步", index + 1);
+        match step {
+            SurfaceStep::Call { name, .. } if removed.contains(name) => {
+                out.push(format!("“{name}” ← {location}（{file}）"));
+            }
+            SurfaceStep::If {
+                then_steps,
+                else_steps,
+                ..
+            } => {
+                collect_removed_call_locations(
+                    then_steps,
+                    removed,
+                    file,
+                    &format!("{location} → 条件成立"),
+                    out,
+                );
+                collect_removed_call_locations(
+                    else_steps,
+                    removed,
+                    file,
+                    &format!("{location} → 否则"),
+                    out,
+                );
+            }
+            SurfaceStep::Repeat { body, .. } => {
+                collect_removed_call_locations(
+                    body,
+                    removed,
+                    file,
+                    &format!("{location} → 循环体"),
+                    out,
+                );
+            }
+            SurfaceStep::MatchTemplates {
+                cases, else_steps, ..
+            } => {
+                for (case_index, case) in cases.iter().enumerate() {
+                    collect_removed_call_locations(
+                        &case.body,
+                        removed,
+                        file,
+                        &format!("{location} → 模板分支 {}", case_index + 1),
+                        out,
+                    );
+                }
+                collect_removed_call_locations(
+                    else_steps,
+                    removed,
+                    file,
+                    &format!("{location} → 未匹配"),
+                    out,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// gamer-yaml 插件资源的统一内容钩子：按路径前缀分发到 V1 校验器。

@@ -217,6 +217,11 @@ export const KEY_ENUM: readonly string[] = [
   'ESC', 'ESCAPE', 'ENTER', 'RETURN', 'SPACE', 'TAB', 'BACKSPACE', 'DEL',
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift', 'Control', 'Alt', 'Meta',
   'UP', 'DOWN', 'LEFT', 'RIGHT', 'CTRL', 'DELETE', 'END', 'PAGEUP', 'PAGEDOWN', 'INSERT',
+  ...Array.from({ length: 26 }, (_, i) => `Key${String.fromCharCode(65 + i)}`),
+  ...Array.from({ length: 10 }, (_, i) => `Digit${i}`),
+  ...Array.from({ length: 12 }, (_, i) => `F${i + 1}`),
+  'ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight',
+  'NumpadEnter', 'Semicolon', 'Equal', 'Comma', 'Minus', 'Period', 'Slash', 'Backquote', 'BracketLeft', 'BracketRight', 'Backslash', 'Quote',
 ]
 
 /** 是否为服务端可解析的按键：命名枚举（大小写不敏感）或纯数字 keycode。 */

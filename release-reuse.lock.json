@@ -6,6 +6,13 @@
       "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-package-publisher-v0.1.0/gamer-package-publisher-0.1.0.gplugin",
       "size": 5120,
       "sha256": "de16d36c1b99c1253992b6d4412b70ce19a9f9dec0d878dc75020c850eb613a9"
+    },
+    {
+      "id": "gamer-live",
+      "version": "0.2.5",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-live-v0.2.5/gamer-live-0.2.5.gplugin",
+      "size": 22325,
+      "sha256": "ea9f03d91026b2152c9d096e0baae63dac7c5db5ce96136481a48e43febbcf6f"
     }
   ]
 }

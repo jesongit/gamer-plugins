@@ -49,7 +49,7 @@ export function eventText(e) {
   if (e.ev === 'vision') return `${e.template} ${e.found ? '命中' : '未命中'}`
   return `${e.name || e.ev} ${JSON.stringify(e.data || {})}`
 }
-export const detailText = name => ({ click_delay: '点击延迟', arguments: '调用参数', effective_args: '实际参数（含默认值）', result: '返回值', branch: '分支选择', iteration: '循环进度', tap: '点击坐标', swipe: '滑动坐标' }[name] || name)
+export const detailText = name => ({ click_delay: '点击延迟', key_delay: '按键延迟', arguments: '调用参数', effective_args: '实际参数（含默认值）', result: '返回值', branch: '分支选择', iteration: '循环进度', tap: '点击坐标', swipe: '滑动坐标' }[name] || name)
 export const timeText = time => new Date(time).toLocaleTimeString('zh-CN', { hour12: false })
 
 // The execution tree is data only: render siblings in one list, never nested cards.

@@ -423,7 +423,7 @@ impl NativeYamlHost {
 
     /// All automation clicks pass here once; manual input keeps its existing behavior.
     async fn click_point(&self, point: TouchPoint) -> Result<()> {
-        self.click_delay("before", self.settings.before_click_ms)
+        self.input_delay("click_delay", "before", self.settings.before_click_ms)
             .await?;
         let stamp = self.frame_stamp.read().unwrap().clone();
         self.registry
@@ -437,17 +437,17 @@ impl NativeYamlHost {
             y: point.y(),
         })
         .await;
-        self.click_delay("after", self.settings.after_click_ms)
+        self.input_delay("click_delay", "after", self.settings.after_click_ms)
             .await
     }
 
-    async fn click_delay(&self, phase: &str, duration_ms: u64) -> Result<()> {
+    async fn input_delay(&self, event: &str, phase: &str, duration_ms: u64) -> Result<()> {
         if self.runtime.cancelled() {
             bail!("CANCELLED: 运行已取消");
         }
         if duration_ms > 0 {
             self.emit_event(RuntimeEventKind::Detail {
-                name: "click_delay".into(),
+                name: event.into(),
                 data: json!({"phase":phase,"duration_ms":duration_ms}),
             })
             .await;
@@ -510,12 +510,16 @@ impl NativeYamlHost {
             value if value == "press" => KeyAction::Press,
             other => bail!("未知 key action: {other}"),
         };
+        self.input_delay("key_delay", "before", self.settings.before_click_ms)
+            .await?;
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
             .key_named(&self.device, &key, action)
             .await
             .map_err(anyhow::Error::new)?;
+        self.input_delay("key_delay", "after", self.settings.after_click_ms)
+            .await?;
         Ok(Value::Null)
     }
 
@@ -1964,7 +1968,7 @@ log = "^1.0"
     impl RuntimeService for ClickClock {
         async fn sleep(&self, duration: Duration) -> crate::capabilities::CapabilityResult<()> {
             self.sleeps.lock().unwrap().push((
-                self.trace.taps.lock().unwrap().len(),
+                self.trace.taps.lock().unwrap().len() + self.trace.keys.lock().unwrap().len(),
                 duration.as_millis() as u64,
             ));
             if self.cancel_on_sleep {
@@ -1979,8 +1983,16 @@ log = "^1.0"
     }
 
     #[tokio::test]
-    async fn click_delays_wrap_every_automation_click_exactly_once() {
-        for name in ["tap", "wait_find", "tap_template", "obstacle"] {
+    async fn input_delays_wrap_every_automation_click_and_key_exactly_once() {
+        for name in [
+            "tap",
+            "wait_find",
+            "tap_template",
+            "obstacle",
+            "press",
+            "down",
+            "up",
+        ] {
             let trace = Arc::new(Trace::default());
             let stub = VisionStub::new(FrameSize::new(1000, 1000));
             stub.push_outcome(stub_outcome());
@@ -1989,7 +2001,7 @@ log = "^1.0"
                 trace.clone(),
                 &stub,
                 LogTrace::new(),
-                &["input.tap", "vision.match", "resource.read"],
+                &["input.tap", "input.key", "vision.match", "resource.read"],
             );
             let mut native = NativeYamlHost::new(
                 host,
@@ -2009,6 +2021,7 @@ log = "^1.0"
             });
             native.runtime = clock.clone();
             let (function, args) = match name {
+                "press" | "down" | "up" => ("key", json!({"key":"HOME","action":name})),
                 "tap" => (name, json!([0.5, 0.5])),
                 "obstacle" => (
                     "wait_find",
@@ -2017,7 +2030,21 @@ log = "^1.0"
                 _ => (name, json!({"template":"home","timeout":"0ms"})),
             };
             native.call_function(function, args).await.unwrap();
-            assert_eq!(trace.taps.lock().unwrap().len(), 1, "{name}");
+            if function == "key" {
+                let keys = trace.keys.lock().unwrap();
+                assert_eq!(keys.len(), 1, "{name}");
+                assert_eq!(
+                    keys[0].action(),
+                    match name {
+                        "down" => KeyAction::Down,
+                        "up" => KeyAction::Up,
+                        _ => KeyAction::Press,
+                    }
+                );
+                assert!(trace.taps.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(trace.taps.lock().unwrap().len(), 1, "{name}");
+            }
             let sleeps = clock.sleeps.lock().unwrap();
             assert_eq!(
                 sleeps
@@ -2040,7 +2067,14 @@ log = "^1.0"
             let delays: Vec<_> = events
                 .of("detail")
                 .into_iter()
-                .filter(|e| e["name"] == "click_delay")
+                .filter(|e| {
+                    e["name"]
+                        == if function == "key" {
+                            "key_delay"
+                        } else {
+                            "click_delay"
+                        }
+                })
                 .collect();
             assert_eq!(delays.len(), 2);
             assert_eq!(
@@ -2055,38 +2089,59 @@ log = "^1.0"
     }
 
     #[tokio::test]
-    async fn click_delays_can_be_disabled_and_cancel_before_or_after_tap() {
-        for (before, after, cancel, expected_taps) in
-            [(0, 0, false, 1), (300, 300, true, 0), (0, 300, true, 1)]
-        {
-            let trace = Arc::new(Trace::default());
-            let stub = VisionStub::new(FrameSize::new(1000, 1000));
-            let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["input.tap"]);
-            let mut native =
-                NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
-                    .await
-                    .unwrap();
-            native.settings.before_click_ms = before;
-            native.settings.after_click_ms = after;
-            let clock = Arc::new(ClickClock {
-                trace: trace.clone(),
-                sleeps: Mutex::new(vec![]),
-                stop: AtomicBool::new(false),
-                cancel_on_sleep: cancel,
-            });
-            native.runtime = clock.clone();
-            assert_eq!(
-                native
-                    .call_function("tap", json!([0.5, 0.5]))
-                    .await
-                    .is_err(),
-                cancel
-            );
-            assert_eq!(trace.taps.lock().unwrap().len(), expected_taps);
-            assert_eq!(
-                clock.sleeps.lock().unwrap().len(),
-                if cancel { 1 } else { 0 }
-            );
+    async fn input_delays_can_be_disabled_and_cancel_before_or_after_input() {
+        for function in ["tap", "key"] {
+            for (before, after, cancel, expected_taps) in
+                [(0, 0, false, 1), (300, 300, true, 0), (0, 300, true, 1)]
+            {
+                let trace = Arc::new(Trace::default());
+                let stub = VisionStub::new(FrameSize::new(1000, 1000));
+                let host = vision_host(
+                    trace.clone(),
+                    &stub,
+                    LogTrace::new(),
+                    &["input.tap", "input.key"],
+                );
+                let mut native = NativeYamlHost::new(
+                    host,
+                    test_context(),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                )
+                .await
+                .unwrap();
+                native.settings.before_click_ms = before;
+                native.settings.after_click_ms = after;
+                let clock = Arc::new(ClickClock {
+                    trace: trace.clone(),
+                    sleeps: Mutex::new(vec![]),
+                    stop: AtomicBool::new(false),
+                    cancel_on_sleep: cancel,
+                });
+                native.runtime = clock.clone();
+                assert_eq!(
+                    native
+                        .call_function(
+                            function,
+                            if function == "key" {
+                                json!("HOME")
+                            } else {
+                                json!([0.5, 0.5])
+                            }
+                        )
+                        .await
+                        .is_err(),
+                    cancel
+                );
+                assert_eq!(
+                    trace.taps.lock().unwrap().len() + trace.keys.lock().unwrap().len(),
+                    expected_taps
+                );
+                assert_eq!(
+                    clock.sleeps.lock().unwrap().len(),
+                    if cancel { 1 } else { 0 }
+                );
+            }
         }
     }
 

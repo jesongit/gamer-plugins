@@ -63,6 +63,8 @@ export function useConsoleTemplates({
   // 二次裁切（右侧面板）
   const crop = reactive({ active: false, imgW: 0, imgH: 0, baseW: 0, baseH: 0, originX: 0, originY: 0, rect: { x: 0, y: 0, w: 0, h: 0 }, preview: '', name: '', zoom: 1, preserveColor: false, conflict: null, sourceLabel: '', error: '' })
   const cropCanvas = ref(null)
+  crop.replacement = null
+  let cropRequest = 0
   const cropSec = ref(null)
   // 二次裁切底图：框选时冻结的初始画面，拖动时只动遮罩框
   let cropBaseCanvas = null
@@ -193,13 +195,15 @@ export function useConsoleTemplates({
     crop.baseW = Math.round(rect.w)
     crop.baseH = Math.round(rect.h)
     crop.zoom = 1
-    crop.preserveColor = false
+    crop.preserveColor = !!crop.replacement?.preserveColor
     cropBaseCanvas = document.createElement('canvas')
     cropBaseCanvas.width = crop.baseW
     cropBaseCanvas.height = crop.baseH
     cropBaseCanvas.getContext('2d').drawImage(source, crop.originX, crop.originY, crop.baseW, crop.baseH, 0, 0, crop.baseW, crop.baseH)
     crop.rect = { x: 0, y: 0, w: crop.baseW, h: crop.baseH }
-    crop.name = defaultTplName(rect)
+    crop.name = crop.replacement
+      ? defaultTemplateName(rect, imgW, imgH, crop.replacement.shortName.replace(/\.(png|jpe?g)$/i, ''))
+      : defaultTplName(rect)
     crop.active = true
     nextTick(() => {
       renderCropFrame()
@@ -213,13 +217,16 @@ export function useConsoleTemplates({
    *  确定帧 PNG（stage.captureFrame）。异步取帧后校验 generation，来源已切换的
    *  过期结果不应用（不得偷偷画到新画面上）。 */
   async function openCrop(rect) {
+    const request = ++cropRequest
+    const requestedPackage = packageId.value
     confirmDelTpl.value = null
     crop.conflict = null
     crop.sourceLabel = ''
     const genBefore = stage?.generation()
     let frame
     try { frame = await frames.captureFrame() }
-    catch (e) { return toast('无法截取画面：' + e.message, 'error') }
+    catch (e) { if (request === cropRequest) toast('无法截取画面：' + e.message, 'error'); return }
+    if (request !== cropRequest || requestedPackage !== packageId.value) return
     if (!frame) return toast('无法获取画面帧，请稍后重试', 'error')
     if (stage && (stage.generation() !== genBefore || frame.generation !== genBefore)) {
       return toast('画面来源已切换，请重新框选', 'warn')
@@ -229,6 +236,8 @@ export function useConsoleTemplates({
 
   function cancelCrop() {
     if (saving.value) return
+    cropRequest++
+    crop.replacement = null
     crop.error = ''
     crop.active = false
     crop.conflict = null
@@ -240,6 +249,8 @@ export function useConsoleTemplates({
   }
 
   function repick() {
+    if (saving.value) return
+    cropRequest++
     crop.active = false
     crop.conflict = null
     cropBaseCanvas = null
@@ -510,11 +521,19 @@ export function useConsoleTemplates({
   }
   // Package 在页面挂载后异步恢复，初始为空时不能把一次空请求当作已加载。
   watch(packageId, () => { void refreshTemplatesData() }, { immediate: true })
+  watch(packageId, () => {
+    if (!saving.value) {
+      picking.value = false
+      selecting.value = false
+      cancelCrop()
+    }
+  }, { flush: 'sync' })
 
   async function finishCropSave(rep, shortName, toast) {
     const refreshed = await refreshTemplatesData()
     crop.conflict = null
     crop.active = false
+    crop.replacement = null
     cropBaseCanvas = null
     hideLoupe()
     toast(`模板 ${rep?.name || shortName} 已保存${tplSizeHint(rep)}${refreshed ? '' : '（模板列表刷新失败）'}`, refreshed ? 'success' : 'warn')
@@ -646,6 +665,9 @@ export function useConsoleTemplates({
   function hideLoupe() { loupeRequest++; loupe.show = false }
 
   function togglePick() {
+    if (saving.value) return
+    cropRequest++
+    crop.replacement = null
     confirmDelTpl.value = null
     // 框选随舞台来源工作：实时需已连接；视频来源需画面就绪（离线可框选）
     if (stage) {
@@ -694,6 +716,7 @@ export function useConsoleTemplates({
 
   /** UI Bridge 的通用区域选择：只把设备像素矩形返回给调用方，不暴露视频 DOM。 */
   function selectRegionForBridge() {
+    crop.replacement = null
     if (!connected.value) {
       toast('请先连接设备', 'error')
       return Promise.resolve(null)
@@ -808,6 +831,7 @@ export function useConsoleTemplates({
     /** 框选生成新模板：不切页签（裁切弹窗挂面板层级，任何页签下可见），用户走既有
      *  二次裁切→保存流程；保存成功后以模板短名 resolve，CellEditor 自动回填该字段 */
     captureTemplate: () => {
+      crop.replacement = null
       if (!connected.value) {
         toast('请先连接设备', 'error')
         return Promise.resolve(null)
@@ -984,31 +1008,22 @@ export function useConsoleTemplates({
     toast([parts.join('，') || '没有可导入的文件', ...failed.slice(0, 3)].join('；'), failed.length ? 'error' : level)
   }
 
-  /** 替换已有模板图片：名称/分区来自当前模板，图片替换使用独立当前端点。 */
-  async function replaceTemplateImage(t, file) {
-    const toast = beginReport()
-    if (!t || !file) return
-    const pkg = t.pkg || packageId.value
-    try {
-      const b64 = await fileToBase64(file)
-      const expectedVersion = await resolveTemplateVersion(t.name, pkg, t.version)
-      await putTemplateBytes(t.name, b64, pkg, expectedVersion)
-      if (packageId.value === pkg) await refreshTemplatesData()
-      toast(`模板 ${t.name} 图片已替换`, 'success')
-    } catch (err) {
-      toast('替换失败：' + err.message, 'error')
+  /** 从当前画面重选模板，保留短名，区域由新框选生成。 */
+  function replaceTemplate(t) {
+    if (saving.value || !t || (t.pkg && t.pkg !== packageId.value)) return
+    if (!stageReady.value) return toast('请先连接设备或加载视频画面', 'warn')
+    cancelCrop()
+    cancelCellPick()
+    if (bridgeRegionResolve) { bridgeRegionResolve(null); bridgeRegionResolve = null }
+    confirmDelTpl.value = null
+    crop.replacement = {
+      shortName: tplShortName(t.name),
+      preserveColor: /#1\.(png|jpe?g)$/i.test(t.name),
     }
+    selecting.value = false
+    picking.value = true
+    toast(`重新框选模板 ${crop.replacement.shortName} 的区域`, 'info')
   }
-
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const fr = new FileReader()
-      fr.onload = () => resolve(fr.result.split(',')[1])
-      fr.onerror = reject
-      fr.readAsDataURL(file)
-    })
-  }
-
   /** 去掉模板名尾部的颜色标记；#1 不是搜索区域的一部分。 */
   function stripTplColorMarker(name) {
     return String(name || '').replace(/#1(\.(png|jpe?g))$/i, '$1')
@@ -1190,7 +1205,7 @@ export function useConsoleTemplates({
     tplThumbUrl, onTplNameClick, setRenameInputEl, renameVal, confirmRename, cancelRename, startRename,
     onTplDeleteClick, onTplMatchClick, onTplUpload, tplShortName, tplRegionBadge, cropSize, cropZoomPct,
     cropMouseDown, cropMouseMove, cropMouseUp, cropMouseLeave, cropWheel, saveTemplate, overwriteTemplate, backToCrop, cancelCrop,
-    repick, saving, viewTpl, closeTplView, replaceTemplateImage,
+    repick, saving, viewTpl, closeTplView, replaceTemplate,
   }
 
   return {
@@ -1207,7 +1222,7 @@ export function useConsoleTemplates({
     cropMouseDown, cropMouseMove, cropMouseUp, cropMouseLeave, cropWheel,
     saveTemplate, overwriteTemplate, backToCrop, cancelCrop, repick,
     onTplRowClick, onTplThumbClick, onTplNameClick, confirmRename, cancelRename, startRename,
-    onTplDeleteClick, onTplMatchClick, onTplUpload, replaceTemplateImage,
+    onTplDeleteClick, onTplMatchClick, onTplUpload, replaceTemplate,
     tplShortName, tplRegionBadge, tplThumbUrl, testMatch,
     // bridge/单元格取值工具
     selectRegionForBridge, beginCellPick, cancelCellPick, finishCellPick,

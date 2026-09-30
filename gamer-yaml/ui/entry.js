@@ -1,4 +1,5 @@
 import ScriptRunner from './src/components/console/ScriptRunner.vue'
+import AutomationWorkbench from './src/components/console/AutomationWorkbench.vue'
 import TemplateCapture from './src/components/console/TemplateCapture.vue'
 export { ScriptRunner, TemplateCapture }
 export { useConsoleScriptRunner } from './src/components/console/useConsoleScriptRunner.js'
@@ -9,7 +10,5 @@ export { default as TemplateCropModal } from './src/components/console/TemplateC
 export { default as RunParamsModal } from './src/components/RunParamsModal.vue'
 export const sdkVersion = 1
 export const panels = {
-  'console.scripts': { component: ScriptRunner, panelClass: 'script-tab', aliases: ['script'], getProps: context => ({ context: context.scriptRunner?.scripts }) },
-  'console.functions': { component: ScriptRunner, panelClass: 'script-tab', getProps: context => ({ context: context.scriptRunner?.functions }) },
-  'console.templates': { component: TemplateCapture, panelClass: 'tpl-tab', getProps: context => ({ context: context.templateCapture }) },
+  'console.scripts': { component: AutomationWorkbench, panelClass: 'script-tab', aliases: ['script'], getProps: context => ({ context: { ...context.scriptRunner, templates: context.templateCapture } }) },
 }
