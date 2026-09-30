@@ -96,6 +96,21 @@ pub fn result_hook(extensions: Weak<ExtensionService>, db: Db) -> TaskResultHook
     })
 }
 
+/// The sender is selected for this specific terminal outcome, never by the presence of any task policy.
+pub(crate) fn owns_result(task: &Task, state: &str) -> bool {
+    owns_policy(task.extensions.get(ID), state)
+}
+fn owns_policy(policy: Option<&Value>, state: &str) -> bool {
+    policy
+        .and_then(|v| serde_json::from_value::<Policy>(v.clone()).ok())
+        .is_some_and(|p| {
+            p.enabled
+                && p.results
+                    .get(state)
+                    .is_some_and(|r| r.enabled && !r.channels.is_empty() && r.channels.len() <= 100)
+        })
+}
+
 fn messages(
     task: &Task,
     result: &TaskResult,
@@ -175,6 +190,19 @@ fn render(template: &str, values: &BTreeMap<&str, String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sender_ownership_is_per_actual_terminal_rule_and_requires_channels() {
+        let mut policy = BTreeMap::new();
+        policy.insert(ID.to_string(),json!({"enabled":true,"results":{"success":{"enabled":true,"channels":["wechat"]},"failed":{"enabled":false,"channels":["wechat"]},"cancelled":{"enabled":true,"channels":[]}}}));
+        assert!(owns_policy(policy.get(ID), "success"));
+        assert!(!owns_policy(policy.get(ID), "failed"));
+        assert!(!owns_policy(policy.get(ID), "cancelled"));
+        policy.insert(
+            ID.to_string(),
+            json!({"enabled":false,"results":{"success":{"enabled":true,"channels":["wechat"]}}}),
+        );
+        assert!(!owns_policy(policy.get(ID), "success"));
+    }
     #[test]
     fn template_values_are_literal_and_unknown_names_are_rejected() {
         let vars = BTreeMap::from([("task.name", "{{error}}".into()), ("error", "秘密".into())]);

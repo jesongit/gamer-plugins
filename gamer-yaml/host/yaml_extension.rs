@@ -118,6 +118,7 @@ impl YamlWasmRuntime for NoYamlWasmRuntime {
 /// 权限：每个函数声明所需权限，派发前逐项 `HostApi::authorize`——函数调用
 /// 不能绕过插件权限（计划 Phase 3.2）。
 pub(crate) struct NativeYamlHost {
+    side_effect: Option<crate::core::side_effect::Scope>,
     notification: Option<super::notification::Sender>,
     settings: super::settings::Settings,
     host: HostApi,
@@ -247,20 +248,27 @@ impl NativeYamlHost {
         sink: Option<Arc<dyn EventSink>>,
         name: &str,
         args_json: &str,
-        settings: super::settings::Settings,
-        notification: Option<super::notification::Sender>,
+        options: (
+            super::settings::Settings,
+            Option<super::notification::Sender>,
+        ),
     ) -> Result<Value> {
         let args: Value = serde_json::from_str(args_json)
             .map_err(|error| anyhow!("函数 {name} 参数不是合法 JSON: {error}"))?;
         let mut host = Self::new(host, context, stop, sink).await?;
-        host.settings = settings;
-        host.notification = notification;
+        host.settings = options.0;
+        host.notification = options.1;
         // 录制输入来源标注：guest 实例线程内执行点（task-local 不跨线程），
         // 在此线程内把 YAML runner 注入的输入标为 "runner"。
-        crate::capabilities::adapters::with_caller_input_source("runner", async {
+        let input = host.side_effect.as_ref().map(|s| s.input.clone());
+        let invoke = crate::capabilities::adapters::with_caller_input_source("runner", async {
             host.call_function(name, args).await
-        })
-        .await
+        });
+        if let Some(input) = input {
+            crate::core::input_ownership::scope(input, invoke).await
+        } else {
+            invoke.await
+        }
     }
 
     pub(crate) async fn new(
@@ -280,6 +288,7 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Self {
+            side_effect: crate::core::side_effect::lookup(&stop),
             notification: None,
             settings: super::settings::Settings::default(),
             host,
@@ -327,7 +336,7 @@ impl NativeYamlHost {
             data: json!({"function":name,"args":bound.values}),
         })
         .await;
-        match name {
+        let result = match name {
             "notify" => self.notify(&bound).await,
             "tap" => self.tap(&bound).await,
             "swipe" => self.swipe(&bound).await,
@@ -349,7 +358,11 @@ impl NativeYamlHost {
             "lt" => self.compare(&bound, CompareOp::Lt),
             "le" => self.compare(&bound, CompareOp::Le),
             other => bail!("函数 {other} 未实现"),
+        };
+        if let Some(scope) = &self.side_effect {
+            scope.policy.after(&self.context, result.is_ok()).await?;
         }
+        result
     }
 
     /// Schema 绑定：未知参数 / 缺必填 / 类型不符均结构化报错。
@@ -410,6 +423,19 @@ impl NativeYamlHost {
 
     // -- handlers ----------------------------------------------------------
 
+    async fn before_effect(&self, operation: Value) -> Result<()> {
+        if self.runtime.cancelled() {
+            bail!("CANCELLED: 运行已取消");
+        }
+        if let Some(scope) = &self.side_effect {
+            scope.policy.before(&self.context, operation).await?;
+        }
+        if self.runtime.cancelled() {
+            bail!("CANCELLED: 门禁后运行已取消");
+        }
+        Ok(())
+    }
+
     async fn tap(&self, args: &BoundArgs) -> Result<Value> {
         self.refresh_input_screen().await?;
         let point = self.touch_point(args.point("position")?)?;
@@ -426,6 +452,8 @@ impl NativeYamlHost {
         self.click_delay("before", self.settings.before_click_ms)
             .await?;
         let stamp = self.frame_stamp.read().unwrap().clone();
+        self.before_effect(json!({"kind":"tap","x":point.x(),"y":point.y()}))
+            .await?;
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
@@ -481,6 +509,7 @@ impl NativeYamlHost {
             bail!("滑动起止点来自不同画面")
         }
         let current_stamp = self.frame_stamp.read().unwrap().clone();
+        self.before_effect(json!({"kind":"swipe","from":[from.x(),from.y()],"to":[to.x(),to.y()],"duration_ms":duration})).await?;
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
@@ -503,6 +532,8 @@ impl NativeYamlHost {
 
     async fn key(&self, args: &BoundArgs) -> Result<Value> {
         let key = args.string("key")?;
+        self.before_effect(json!({"kind":"key","key":key,"args":args.values}))
+            .await?;
 
         let action = match args.opt_string("action")?.unwrap_or_else(|| "press".into()) {
             value if value == "down" => KeyAction::Down,
@@ -521,6 +552,8 @@ impl NativeYamlHost {
 
     async fn input_text(&self, args: &BoundArgs) -> Result<Value> {
         let text = args.string("text")?;
+        self.before_effect(json!({"kind":"text","text":text}))
+            .await?;
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
@@ -532,6 +565,8 @@ impl NativeYamlHost {
 
     async fn launch(&self, args: &BoundArgs) -> Result<Value> {
         let package = self.package(args)?;
+        self.before_effect(json!({"kind":"launch","package":package}))
+            .await?;
         self.registry
             .device()
             .ok_or_else(|| anyhow!("device capability 未注册"))?
@@ -543,6 +578,8 @@ impl NativeYamlHost {
 
     async fn stop_app(&self, args: &BoundArgs) -> Result<Value> {
         let package = self.package(args)?;
+        self.before_effect(json!({"kind":"stop_app","package":package}))
+            .await?;
         self.registry
             .device()
             .ok_or_else(|| anyhow!("device capability 未注册"))?
@@ -2091,6 +2128,62 @@ log = "^1.0"
     }
 
     #[tokio::test]
+    async fn scoped_single_tap_checks_host_policy_before_side_effect() {
+        struct Gate {
+            deny: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl crate::core::side_effect::Policy for Gate {
+            async fn before(
+                &self,
+                _: &AppContext,
+                operation: serde_json::Value,
+            ) -> anyhow::Result<()> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(operation["kind"], "tap");
+                anyhow::ensure!(!self.deny, "needs_authorization");
+                Ok(())
+            }
+        }
+        for deny in [true, false] {
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["input.tap"]);
+            let stop = Arc::new(AtomicBool::new(false));
+            let context = test_context();
+            let owner =
+                crate::core::input_ownership::acquire(context.device_id.as_str(), stop.clone())
+                    .unwrap();
+            let policy = Arc::new(Gate {
+                deny,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let _registration = crate::core::side_effect::register(
+                stop.clone(),
+                crate::core::side_effect::Scope {
+                    policy: policy.clone(),
+                    input: owner.0.clone(),
+                },
+            );
+            let mut native = NativeYamlHost::new(host, context, stop, None)
+                .await
+                .unwrap();
+            native.settings.before_click_ms = 0;
+            native.settings.after_click_ms = 0;
+            assert_eq!(
+                native
+                    .call_function("tap", json!([0.5, 0.5]))
+                    .await
+                    .is_err(),
+                deny
+            );
+            assert_eq!(policy.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(trace.taps.lock().unwrap().len(), if deny { 0 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
     async fn matching_without_click_never_uses_click_delays() {
         let trace = Arc::new(Trace::default());
         let stub = VisionStub::new(FrameSize::new(1000, 1000));
@@ -2450,6 +2543,68 @@ runtime = "^1.0"
             1,
             "点击不应额外截图"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_preserves_scoped_single_tap_policy_across_host_threads() {
+        struct Gate {
+            deny: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl crate::core::side_effect::Policy for Gate {
+            async fn before(&self, context: &AppContext, operation: Value) -> Result<()> {
+                // The guest host callback must restore its host-issued input permit.
+                let _input = crate::core::input_ownership::admit(context.device_id.as_str())?;
+                assert_eq!(operation["kind"], "tap");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::ensure!(!self.deny, "needs_authorization");
+                Ok(())
+            }
+        }
+        let runtime = LazyYamlWasmtimeRuntime::new();
+        for deny in [true, false] {
+            let trace = Arc::new(tests::Trace::default());
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut program = wire("run:\n  - tap: [0.5, 0.5]\n");
+            program["_native_settings"] =
+                json!({"default_timeout_secs":10,"before_click_ms":0,"after_click_ms":0});
+            let mut request = run_request(
+                program,
+                host_with_permissions(trace.clone(), &["device.read", "input.tap"]),
+                stop.clone(),
+                None,
+            );
+            request.context.device_id =
+                crate::core::DeviceId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+            let owner = crate::core::input_ownership::acquire(
+                request.context.device_id.as_str(),
+                stop.clone(),
+            )
+            .unwrap();
+            let gate = Arc::new(Gate {
+                deny,
+                calls: Default::default(),
+            });
+            let _registration = crate::core::side_effect::register(
+                stop,
+                crate::core::side_effect::Scope {
+                    policy: gate.clone(),
+                    input: owner.0.clone(),
+                },
+            );
+            let result = runtime.run(request).await;
+            if deny {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("needs_authorization"));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(trace.taps.lock().unwrap().len(), usize::from(!deny));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

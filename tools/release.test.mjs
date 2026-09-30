@@ -63,3 +63,15 @@ test('notify release accepts the complete catalog and emits immutable notificati
   assert.equal(released.plugins[1].download_url, 'https://github.com/jesongit/gamer-plugins/releases/download/gamer-notify-v0.1.0/gamer-notify-0.1.0.gplugin')
   assert.ok(readFileSync(resolve(root, 'sha256sums.txt'), 'utf8').includes(`${yaml.sha256}  gamer-notify-0.1.0.gplugin`))
 })
+test('AI release emits an immutable builtin URL without changing old plugin versions', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  const baseline = registry.plugins[0]
+  registry.plugins.push({ ...baseline, id: 'gamer-ai', version: '0.1.0' })
+  writeFileSync(resolve(root, 'plugins/gamer-ai-0.1.0.gplugin'), readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin')))
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-ai-v0.1.0', root]).status, 0)
+  const released = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  assert.equal(released.plugins[0].version, '1.2.3')
+  assert.equal(released.plugins[1].download_url, 'https://github.com/jesongit/gamer-plugins/releases/download/gamer-ai-v0.1.0/gamer-ai-0.1.0.gplugin')
+})
