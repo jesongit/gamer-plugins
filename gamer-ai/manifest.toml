@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-ai"
-version = "0.1.0"
+version = "0.1.1"
 name = "AI 游戏助手"
 description = "根据自然语言目标、画面与攻略执行，支持预算、授权和人工接管"
 permissions = ["ui.host", "device.read", "device.app", "input.tap", "input.swipe", "input.key", "input.text", "resource.read", "runtime.sleep", "log.write", "ai.infer", "ai.search", "notify.send"]
