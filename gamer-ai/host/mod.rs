@@ -34,12 +34,14 @@ pub const ID: &str = "gamer-ai";
 pub const ACTIONS: &[&str] = &[
     "settings.read",
     "settings.save",
+    "settings.discover",
     "settings.test",
     "plans.read",
     "plans.save",
     "plans.delete",
     "sessions.read",
     "sessions.events",
+    "sessions.message",
     "sessions.evidence",
     "sessions.resume",
     "sessions.budget",
@@ -68,7 +70,7 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         return None;
     }
     Some(match action {
-        "settings.test" => &[Permission::AiInfer],
+        "settings.test" | "settings.discover" => &[Permission::AiInfer],
         "input.takeover" | "sessions.cancel" => &[Permission::DeviceRead],
         _ => &[Permission::ResourceRead],
     })
@@ -102,8 +104,108 @@ pub struct AiService {
     extensions: std::sync::RwLock<Weak<ExtensionService>>,
     prepared: Arc<Mutex<HashMap<String, Prepared>>>,
     pub external: Arc<Mutex<HashMap<String, mcp::External>>>,
+    wake_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl AiService {
+    fn stop_question_worker(&self) {
+        if let Some(task) = self.wake_task.lock().take() {
+            task.abort();
+        }
+    }
+    fn start_question_worker(self: &Arc<Self>) {
+        self.stop_question_worker();
+        let weak = Arc::downgrade(self);
+        *self.wake_task.lock() = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.wake_expired_questions().await {
+                    tracing::warn!(%error, "AI question timeout worker");
+                }
+            }
+        }));
+    }
+    async fn wake_expired_questions(&self) -> Result<()> {
+        self.live().await?;
+        for id in self
+            .runtime
+            .repository
+            .expire_questions(self.runtime.clock.now().timestamp())?
+        {
+            let s = self.runtime.repository.data.lock().sessions[&id].clone();
+            if s.state != "partial" {
+                continue;
+            }
+            // A timer must never turn an MCP credential into administrator authority.
+            let owner = {
+                let data = self.runtime.repository.data.lock();
+                data.mcp_sessions
+                    .get(&id)
+                    .map(|key| data.credentials.get(key).cloned())
+            };
+            let result = if let Some(owner) = owner {
+                match owner {
+                    Some(credential) if !credential.revoked && credential.expires_at > self.runtime.clock.now().timestamp() && credential.tools.iter().any(|t| t == "gamer.goal.submit") =>
+                        mcp::call(self, &credential, &json!({"name":"gamer.goal.submit","arguments":{"goal":s.goal,"resume_session_id":id}})).await,
+                    _ => Err(anyhow::anyhow!("MCP 凭据已失效或只允许外部会话，需原客户端在其权限内继续")),
+                }
+            } else {
+                self.dispatch(
+                    "sessions.resume",
+                    json!({"session_id":id,"device_id":s.device}),
+                )
+                .await
+            };
+            if let Err(error) = result {
+                self.runtime.repository.event(&id, s.runs.last().map(String::as_str).unwrap_or(""), self.runtime.clock.now().timestamp_millis(),
+                    "tool_error", json!({"error":format!("超时后的自动恢复未启动：{error}；进度已保存，可手动继续")}))?;
+                self.notify_messages(
+                    &id,
+                    s.runs.last().map(String::as_str).unwrap_or(""),
+                    &self.settings(),
+                    vec![(
+                        "auto_resume_problem".into(),
+                        "AI 自动继续需要处理".into(),
+                        format!("{}\n{error}\n进度已保存，请在对话中继续", s.goal),
+                    )],
+                )
+                .await?;
+            }
+        }
+        let boundaries = self
+            .runtime
+            .repository
+            .data
+            .lock()
+            .sessions
+            .values()
+            .filter(|s| {
+                s.state == "partial"
+                    && s.events.last().is_some_and(|e| e.kind == "trial_boundary")
+                    && !s.notified.contains_key("trial_boundary")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for s in boundaries {
+            self.notify_messages(
+                &s.id,
+                s.runs.last().map(String::as_str).unwrap_or(""),
+                &self.settings(),
+                vec![(
+                    "trial_boundary".into(),
+                    "AI 已达到试错边界".into(),
+                    format!(
+                        "{}\n已保存进度：{}\n自动继续次数或动作已达到上限，请补充步骤或人工处理",
+                        s.goal, s.progress
+                    ),
+                )],
+            )
+            .await?;
+        }
+        Ok(())
+    }
     pub fn new(
         data: &std::path::Path,
         packages: Arc<crate::resources::PackageStore>,
@@ -131,6 +233,7 @@ impl AiService {
             extensions: std::sync::RwLock::new(Weak::new()),
             prepared: Arc::new(Mutex::new(HashMap::new())),
             external: Arc::new(Mutex::new(HashMap::new())),
+            wake_task: Mutex::new(None),
         })
     }
     pub fn attach(&self, extensions: &Arc<ExtensionService>) {
@@ -238,6 +341,12 @@ impl AiService {
             .clone();
         profile.validate()?;
         ensure!(
+            profile.protocol == "ollama"
+                || profile.has_prices()
+                || settings.budget.request_micros > 0,
+            "未配置价格时，API 每次请求费用预留必须大于零"
+        );
+        ensure!(
             profile.vision == "available" || external.is_some(),
             "请先测试多模态模型连接"
         );
@@ -254,7 +363,8 @@ impl AiService {
                 "MCP logical session belongs to another credential"
             );
         }
-        // Reuse a pending logical session only when its confirmed cycle and full scope match.
+        // Waiting for identity or authorization must not create a fresh budget on
+        // each timer tick. Only reuse the same device, entrypoint and frozen scope.
         if task_id.is_some() && goal.resume_session_id.is_none() {
             let data = self.runtime.repository.data.lock();
             goal.resume_session_id = data
@@ -264,6 +374,8 @@ impl AiService {
                 .find(|s| {
                     s.goal == goal.goal
                         && !data.mcp_sessions.contains_key(&s.id)
+                        && s.device == request.app.device_id.as_str()
+                        && s.entrypoint == request.entrypoint
                         && request
                             .app
                             .android_package
@@ -272,8 +384,6 @@ impl AiService {
                         && Some(s.package.as_str())
                             == request.app.content_package.as_ref().map(|p| p.as_str())
                         && s.state == "waiting_user"
-                        && s.cycle.is_some()
-                        && s.account.is_some()
                         && s.plan_version == plan_version
                         && s.profile_version == profile.version()
                         && s.expires_at > self.runtime.clock.now().timestamp()
@@ -382,10 +492,6 @@ impl AiService {
         } else {
             "success"
         };
-        let extensions = self.extensions()?;
-        let caller = extensions
-            .plugin_call_context(&ExtensionId::parse(ID)?)
-            .await?;
         let terminal_owned = if let Some(task) = task {
             let t = self.db.get_timer_task_async(task).await?;
             t.is_some_and(|t| crate::extensions::notify::task::owns_result(&t, state))
@@ -437,6 +543,42 @@ impl AiService {
                 ),
             ));
         }
+        let questions = s
+            .questions
+            .iter()
+            .filter(|q| q.pending())
+            .collect::<Vec<_>>();
+        if !questions.is_empty() {
+            notifications.push((
+                format!(
+                    "question:{}",
+                    store::hash(&serde_json::to_vec(
+                        &questions
+                            .iter()
+                            .map(|q| (&q.question, &q.options))
+                            .collect::<Vec<_>>()
+                    )?)
+                ),
+                "AI 需要你的选择".into(),
+                format!(
+                    "{}\n已完成：{}\n{}",
+                    s.goal,
+                    s.progress,
+                    questions
+                        .iter()
+                        .map(|q| format!("{}（问题 {}）", q.question, q.id))
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ),
+            ));
+        }
+        if error.is_some_and(|e| e.contains("trial_boundary")) {
+            notifications.push((
+                "trial_boundary".into(),
+                "AI 已达到试错边界".into(),
+                format!("{}\n进度：{}\n{}", s.goal, s.progress, error.unwrap()),
+            ));
+        }
         if error.is_some_and(|e| e.contains("budget_")) {
             notifications.push((
                 "budget_limit".into(),
@@ -447,7 +589,9 @@ impl AiService {
         if e.settings.notify_results
             && !terminal_owned
             && pending.is_empty()
+            && questions.is_empty()
             && !error.is_some_and(|e| e.contains("budget_"))
+            && !error.is_some_and(|e| e.contains("trial_boundary"))
         {
             notifications.push((
                 format!("terminal:{}:{state}", e.context.run_id),
@@ -460,9 +604,31 @@ impl AiService {
                 ),
             ));
         }
+        self.notify_messages(
+            &e.session,
+            e.context.run_id.as_str(),
+            &e.settings,
+            notifications,
+        )
+        .await
+    }
+    async fn notify_messages(
+        &self,
+        session: &str,
+        run: &str,
+        settings: &Settings,
+        notifications: Vec<(String, String, String)>,
+    ) -> Result<()> {
+        if notifications.is_empty() {
+            return Ok(());
+        }
+        let extensions = self.extensions()?;
+        let caller = extensions
+            .plugin_call_context(&ExtensionId::parse(ID)?)
+            .await?;
         for (key, title, content) in notifications {
-            let send = e.runtime.repository.transaction(|data| {
-                let s = data.sessions.get_mut(&e.session).unwrap();
+            let send = self.runtime.repository.transaction(|data| {
+                let s = data.sessions.get_mut(session).context("会话不存在")?;
                 if s.notified.contains_key(&key) {
                     return Ok(false);
                 }
@@ -473,22 +639,28 @@ impl AiService {
             if !send {
                 continue;
             }
-            let result=extensions.call_extension_from_plugin(&caller,&ExtensionId::parse(crate::extensions::notify::ID)?,crate::extensions::notify::SEND,json!({"channel":e.settings.notification_channel,"title":title,"content":content.chars().take(500).collect::<String>(),"source":"ai","source_id":e.session})).await;
+            let result=extensions.call_extension_from_plugin(&caller,&ExtensionId::parse(crate::extensions::notify::ID)?,crate::extensions::notify::SEND,json!({"channel":settings.notification_channel,"title":title,"content":content.chars().take(500).collect::<String>(),"source":"ai","source_id":session})).await;
             let value = match result {
                 Ok(value) => value,
                 Err(_) => {
                     json!({"status":"unavailable","message":"通知插件未安装、未启用或未配置；待办仍保留"})
                 }
             };
-            e.runtime.repository.transaction(|data| {
+            self.runtime.repository.transaction(|data| {
                 data.sessions
-                    .get_mut(&e.session)
+                    .get_mut(session)
                     .unwrap()
                     .notified
                     .insert(key.clone(), value.clone());
                 Ok(())
             })?;
-            e.event("notification", json!({"key":key,"result":value}))?;
+            self.runtime.repository.event(
+                session,
+                run,
+                self.runtime.clock.now().timestamp_millis(),
+                "notification",
+                json!({"key":key,"result":value}),
+            )?;
         }
         Ok(())
     }
@@ -496,6 +668,37 @@ impl AiService {
         let repo = &self.runtime.repository;
         match action {
             "settings.read" => Ok(self.settings().public()),
+            "settings.discover" => {
+                let endpoint = text(&values, "endpoint")?;
+                let protocol = values["protocol"].as_str().unwrap_or("auto");
+                let (normalized, kind) = provider::connection(endpoint, protocol)?;
+                let settings = self.settings();
+                let key = values["key"]
+                    .as_str()
+                    .filter(|key| !key.is_empty())
+                    .or_else(|| {
+                        settings
+                            .profiles
+                            .iter()
+                            .find(|p| {
+                                Some(p.id.as_str()) == values["profile_id"].as_str()
+                                    && p.endpoint == normalized
+                                    && p.protocol == kind
+                            })
+                            .map(|p| p.key.as_str())
+                    })
+                    .unwrap_or("");
+                let stop = Arc::new(AtomicBool::new(false));
+                let extensions = self.extensions()?;
+                let _lease = extensions
+                    .long_call(&ExtensionId::parse(ID)?, stop.clone())
+                    .await?;
+                let http = provider::HttpProvider::new()?;
+                tokio::select! {
+                    result = http.discover(&normalized, key, &kind) => result,
+                    _ = async { while !stop.load(Ordering::Acquire) { tokio::time::sleep(std::time::Duration::from_millis(20)).await; } } => Err(anyhow::anyhow!("CANCELLED: 模型列表读取已取消")),
+                }
+            }
             "settings.save" => {
                 let mut saved = self.settings.lock();
                 ensure!(
@@ -504,11 +707,19 @@ impl AiService {
                 );
                 let mut next: Settings = serde_json::from_value(values["settings"].clone())?;
                 next.budget.validate()?;
+                ensure!(
+                    (5..=3600).contains(&next.question_timeout_secs),
+                    "提问等待时间须在 5 至 3600 秒之间"
+                );
                 let mut seen = std::collections::HashSet::new();
                 for p in &mut next.profiles {
                     ensure!(seen.insert(p.id.clone()), "模型 ID 重复");
+                    p.endpoint = provider::connection(&p.endpoint, &p.protocol)?.0;
                     if let Some(old) = saved.profiles.iter().find(|o| o.id == p.id) {
-                        if p.key.is_empty() {
+                        if p.key.is_empty()
+                            && p.endpoint == old.endpoint
+                            && p.protocol == old.protocol
+                        {
                             p.key = old.key.clone();
                         }
                         p.vision = if p.endpoint == old.endpoint
@@ -576,7 +787,7 @@ impl AiService {
                     Ok(v)
                 } else {
                     Ok(
-                        json!({"sessions":data.sessions.values().rev().take(100).map(|s|json!({"id":s.id,"goal":s.goal,"state":s.state,"app":s.app,"package":s.package,"runs":s.runs,"progress":s.progress,"rounds":s.rounds,"account":s.account,"cycle":s.cycle})).collect::<Vec<_>>()}),
+                        json!({"sessions":data.sessions.values().rev().take(100).map(|s|json!({"id":s.id,"goal":s.goal,"state":s.state,"app":s.app,"package":s.package,"runs":s.runs,"progress":s.progress,"rounds":s.rounds,"account":s.account,"account_reference_only":s.account_reference_only,"cycle":s.cycle})).collect::<Vec<_>>()}),
                     )
                 }
             }
@@ -588,7 +799,36 @@ impl AiService {
                     .context("会话不存在")?;
                 let cursor = values["after"].as_u64().unwrap_or(0);
                 Ok(
-                    json!({"events":s.events.iter().filter(|e|e.seq>cursor).take(100).collect::<Vec<_>>(),"state":s.state}),
+                    json!({"events":s.events.iter().filter(|e|e.seq>cursor).take(100).collect::<Vec<_>>(),"state":s.state,"questions":s.questions}),
+                )
+            }
+            "sessions.message" => {
+                let message = text(&values, "message")?.to_owned();
+                let session = text(&values, "session_id")?;
+                let question = values["question_id"].as_str();
+                let at = self.runtime.clock.now().timestamp_millis();
+                repo.transaction(|data| {
+                    let s = data.sessions.get_mut(session).context("会话不存在")?;
+                    ensure!(s.state != "completed" && s.expires_at > at / 1000, "会话已完成或过期，请新建对话");
+                    ensure!(s.events.len() < 10_000 && s.events.iter().filter(|e| e.kind == "user_message").count() < 100,
+                        "对话消息达到保留上限");
+                    if let Some(id) = question {
+                        ensure!(s.state != "running", "AI 正在收尾，请稍后回答");
+                        let q = s.questions.iter_mut().find(|q| q.id == id).context("问题不属于此会话")?;
+                        ensure!(q.answer.is_none(), "问题已回答，不能覆盖");
+                        q.answer = Some(message.clone());
+                    } else {
+                        ensure!(!s.questions.iter().any(store::Question::pending), "请回答当前待选问题");
+                    }
+                    s.conversation_revision = s.conversation_revision.saturating_add(1);
+                    s.trial_mode = false; s.execution_plan = Value::Null;
+                    s.events.push(store::Event { seq: s.events.last().map_or(1, |e| e.seq + 1),
+                        run_id: s.runs.last().cloned().unwrap_or_default(), at, kind: "user_message".into(),
+                        data: json!({"message":message,"question_id":question,"authorization_changed":false}) });
+                    Ok(())
+                })?;
+                Ok(
+                    json!({"accepted":true,"authorization_changed":false,"instruction":"下一轮按新画面处理；已经接受的操作不会被聊天撤回，立即停止请使用取消或接管"}),
                 )
             }
             "sessions.evidence" => {
@@ -619,6 +859,12 @@ impl AiService {
                     .context("会话不存在")?;
                 for run in &s.runs {
                     self.runs.cancel(run);
+                }
+                if s.state != "running" {
+                    repo.transaction(|data| {
+                        data.sessions.get_mut(&s.id).unwrap().state = "cancelled".into();
+                        Ok(())
+                    })?;
                 }
                 Ok(json!({"accepted":true}))
             }
@@ -692,13 +938,30 @@ impl AiService {
                         .context("会话不存在")?;
                     ensure!(s.state != "running", "请先停止后确认账号或周期");
                     let account = text(&values, "account")?.to_string();
-                    let cycle = text(&values, "cycle")?.to_string();
-                    ensure!(
-                        s.account.as_ref().is_none_or(|a| a == &account),
-                        "账号变化不能继承原会话额度，需创建新目标"
-                    );
+                    let cycle = values["cycle"]
+                        .as_str()
+                        .filter(|c| !c.trim().is_empty())
+                        .map(str::to_owned);
+                    if s.account.as_ref().is_some_and(|a| a != &account) {
+                        ensure!(
+                            s.account_reference_only
+                                && !data.spends.iter().any(|p| p.session == s.id)
+                                && !data
+                                    .rules
+                                    .values()
+                                    .any(|r| r.session.as_deref() == Some(s.id.as_str())),
+                            "账号变化不能继承原会话额度，需创建新目标"
+                        );
+                        s.execution_plan = Value::Null;
+                        s.progress = Value::Null;
+                        s.cycle = None;
+                        s.conversation_revision = s.conversation_revision.saturating_add(1);
+                    }
                     s.account = Some(account);
-                    s.cycle = Some(cycle);
+                    s.account_reference_only = false;
+                    if let Some(cycle) = cycle {
+                        s.cycle = Some(cycle);
+                    }
                     Ok(())
                 })?;
                 Ok(json!({"confirmed":true}))
@@ -717,6 +980,10 @@ impl AiService {
                         .cloned()
                         .context("待办不存在")?;
                     ensure!(approval.status == "pending", "待办已处理");
+                    ensure!(
+                        matches!(values["decision"].as_str(), Some("approve" | "deny")),
+                        "请选择批准或拒绝"
+                    );
                     let s = data.sessions.get(&approval.session).context("会话不存在")?;
                     if values["decision"] == "deny" {
                         data.approvals.get_mut(&approval.id).unwrap().status = "denied".into();
@@ -742,7 +1009,12 @@ impl AiService {
                         .as_u64()
                         .filter(|v| *v > 0)
                         .context("授权额度必填")?;
-                    let expires = values["expires_at"].as_i64().context("授权有效期必填")?;
+                    let expires = if values["no_expiry"] == true {
+                        ensure!(scope == "persistent", "只有永久授权可以不设到期时间");
+                        i64::MAX
+                    } else {
+                        values["expires_at"].as_i64().context("授权有效期必填")?
+                    };
                     ensure!(expires > self.runtime.clock.now().timestamp(), "授权已过期");
                     let key = store::id();
                     data.rules.insert(
@@ -971,6 +1243,13 @@ impl AiService {
             .find(|p| Some(p.id.as_str()) == values["profile_id"].as_str())
             .context("模型不存在")?
             .clone();
+        profile.validate()?;
+        ensure!(
+            profile.protocol == "ollama"
+                || profile.has_prices()
+                || settings.budget.request_micros > 0,
+            "未配置价格时，API 每次请求费用预留必须大于零"
+        );
         profile.native_search_enabled = false;
         if values["native_search"] == true {
             ensure!(
@@ -991,6 +1270,7 @@ impl AiService {
             d.sessions.insert(
                 key.clone(),
                 store::Session {
+                    device: String::new(),
                     entrypoint: String::new(),
                     id: key.clone(),
                     package: String::new(),
@@ -1000,6 +1280,7 @@ impl AiService {
                     plan_version: String::new(),
                     profile_version: profile.version(),
                     account: None,
+                    account_reference_only: false,
                     cycle: None,
                     runs: vec![key.clone()],
                     state: "running".into(),
@@ -1012,6 +1293,12 @@ impl AiService {
                     tokens: 0,
                     expires_at: now.timestamp() + 600,
                     events: vec![],
+                    questions: vec![],
+                    conversation_revision: 0,
+                    execution_plan: Value::Null,
+                    trial_mode: false,
+                    trial_operations: 0,
+                    auto_resumes: 0,
                     operations: Default::default(),
                     notified: Default::default(),
                 },
@@ -1119,12 +1406,23 @@ impl BuiltinService for AiService {
             .map_err(|e| ExtensionError::CallRejected(e.to_string()))
     }
     async fn stop(&self) {
+        self.stop_question_worker();
         self.runs.cancel_runner(ID);
         for external in self.external.lock().values() {
             self.runs.cancel(&external.run_id);
         }
         self.external.lock().clear();
         self.prepared.lock().clear();
+        let _ = self.runtime.repository.transaction(|data| {
+            for s in data
+                .sessions
+                .values_mut()
+                .filter(|s| s.state == "waiting_user")
+            {
+                s.state = "cancelled".into();
+            }
+            Ok(())
+        });
     }
 }
 impl RunExecutor for AiService {
@@ -1272,11 +1570,13 @@ pub struct Registrar {
 impl crate::extensions::TimerRunnerRegistrar for Registrar {
     fn cancel_owned(&self, id: &str) {
         if id == ID {
+            self.service.stop_question_worker();
             self.service.runs.cancel_runner(ID);
         }
     }
     async fn extension_started(&self, id: &str) -> Result<()> {
         if id == ID {
+            self.service.start_question_worker();
             self.scheduler
                 .register_extension_runner(ID, ID, Arc::new(AiRunner(self.service.clone())))
                 .await?;

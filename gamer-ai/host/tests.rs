@@ -90,6 +90,14 @@ impl Provider for MockProvider {
                 }
             }
         }
+        if decision.arguments["validated_guides"] == "CURRENT_GUIDES" {
+            decision.arguments["validated_guides"] = json!(prompt["guide_candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g["path"].clone())
+                .collect::<Vec<_>>());
+        }
         Ok(Reply {
             decision,
             usage: json!({"total_tokens":100}),
@@ -174,6 +182,16 @@ fn fixture(replies: Vec<Decision>, delay: bool) -> Fixture {
     };
     let session = runtime
         .begin(&context, "完成日常", "plan-1", &settings, &p, None)
+        .unwrap();
+    // Ordinary tool fixtures model a session whose research/plan is already complete.
+    // Planning tests explicitly clear this field to exercise the admission gate.
+    runtime
+        .repository
+        .transaction(|data| {
+            data.sessions.get_mut(&session).unwrap().execution_plan =
+                json!({"steps":[{"description":"mock 计划","expected":"新画面"}]});
+            Ok(())
+        })
         .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let lease =
@@ -962,6 +980,7 @@ fn mock_service(f: &Fixture) -> AiService {
         extensions: std::sync::RwLock::new(Weak::new()),
         prepared: Arc::new(Mutex::new(HashMap::new())),
         external: Arc::new(Mutex::new(HashMap::new())),
+        wake_task: Mutex::new(None),
     }
 }
 
@@ -1010,7 +1029,26 @@ async fn builtin_lifecycle_runs_the_real_ai_executor_and_preserves_timer_complet
     };
     let f = fixture(
         vec![
+            decision("set_plan", plan_args("CURRENT")),
             decision("act", act("op-1", "CURRENT", "regenerative_resource")),
+            decision(
+                "finish",
+                json!({"subgoals":[{"name":"日常","state":"completed","evidence":"CURRENT","result":"可见完成"}],"summary":"完成"}),
+            ),
+            decision(
+                "finish",
+                json!({"verified":true,"observation_id":"CURRENT","account_consistent":true,"result":"可见全部完成"}),
+            ),
+            decision(
+                "ask_user",
+                json!({"question":"攻略缺少入口，如何进入？","options":[],"reason":"当前入口未知","kind":"knowledge","observation_id":"CURRENT"}),
+            ),
+            decision("set_plan", plan_args("CURRENT")),
+            decision("act", act("bounded-navigation", "CURRENT", "navigation")),
+            decision(
+                "act",
+                json!({"reversible":true,"consumption":consumption("navigation")}),
+            ),
             decision(
                 "finish",
                 json!({"subgoals":[{"name":"日常","state":"completed","evidence":"CURRENT","result":"可见完成"}],"summary":"完成"}),
@@ -1092,7 +1130,80 @@ async fn builtin_lifecycle_runs_the_real_ai_executor_and_preserves_timer_complet
         .any(|s| s.runs.contains(&submitted.run_id) && s.state == "completed"));
     assert_eq!(f.backend.inputs.lock().len(), 1);
     assert!(crate::core::input_ownership::admit(app.device_id.as_str()).is_ok());
+    // The real timeout worker resumes through the same runner and device slot.
+    service
+        .db
+        .upsert_device(&crate::store::Device {
+            id: app.device_id.to_string(),
+            name: "mock".into(),
+            addr: "MOCK-NOT-ADB".into(),
+            screen_mode: crate::store::ScreenMode::Virtual,
+            vd_res: None,
+            vd_dpi: None,
+            pkg: Some("com.sample.game".into()),
+            fps: None,
+            created_at: String::new(),
+        })
+        .unwrap();
+    let next = service
+        .submit(
+            RunRequest::for_app(
+                app.clone(),
+                ID,
+                "default#goal",
+                RunPayload::new(json!({"goal":"完成日常","model_profile_id":"mock"})),
+            )
+            .unwrap(),
+            "",
+            None,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+    let logical = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(s) = service
+                .runtime
+                .repository
+                .data
+                .lock()
+                .sessions
+                .values()
+                .find(|s| {
+                    s.runs.contains(&next.run_id)
+                        && s.state == "waiting_user"
+                        && service
+                            .runs
+                            .active_for_device(app.device_id.as_str())
+                            .is_none()
+                })
+                .map(|s| s.id.clone())
+            {
+                break s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.clock.0.fetch_add(121_000, Ordering::SeqCst);
+    service.wake_expired_questions().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while service.runtime.repository.data.lock().sessions[&logical].state != "completed" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let saved = service.runtime.repository.data.lock().sessions[&logical].clone();
+    assert_eq!(saved.runs.len(), 2);
+    assert_eq!(saved.auto_resumes, 1);
+    assert_eq!(saved.trial_operations, 1);
+    assert_eq!(saved.rounds, 6);
+    assert!(service.runtime.repository.data.lock().rules.is_empty());
+    assert_eq!(f.backend.inputs.lock().len(), 2);
     extensions.disable(&id).await.unwrap();
+    assert!(service.wake_task.lock().is_none());
     assert!(!scheduler.runners().iter().any(|r| r.runner_id == ID));
     assert!(service.live().await.is_err());
 }
@@ -1341,4 +1452,873 @@ fn concurrent_devices_cannot_both_reserve_the_same_global_balance() {
         1
     );
     assert_eq!(repo.data.lock().requests.len(), 1);
+}
+
+#[test]
+fn simple_model_connection_normalizes_addresses_without_embedded_secrets() {
+    for (input, expected, kind) in [
+        (
+            "https://proxy.example/v1",
+            "https://proxy.example/v1",
+            "chat",
+        ),
+        (
+            "https://proxy.example/v1/responses",
+            "https://proxy.example/v1",
+            "responses",
+        ),
+        (
+            "https://proxy.example/v1/chat/completions/",
+            "https://proxy.example/v1",
+            "chat",
+        ),
+        (
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
+            "claude",
+        ),
+        (
+            "https://generativelanguage.googleapis.com",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini",
+        ),
+        ("http://localhost:11434", "http://localhost:11434", "ollama"),
+        (
+            "http://localhost:11434/api/chat",
+            "http://localhost:11434",
+            "ollama",
+        ),
+    ] {
+        assert_eq!(
+            provider::connection(input, "auto").unwrap(),
+            (expected.into(), kind.into())
+        );
+    }
+    for input in [
+        "file:///models",
+        "https://user:secret@host/v1",
+        "https://host/v1?key=secret",
+        "https://host/v1#secret",
+    ] {
+        assert!(provider::connection(input, "auto").is_err());
+    }
+}
+
+#[test]
+fn optional_prices_never_make_unknown_api_costs_zero() {
+    let mut p = profile();
+    p.price_version.clear();
+    p.input_micros_per_million = 0;
+    p.output_micros_per_million = 0;
+    p.validate().unwrap();
+    let mut response = json!({"output":[{"type":"function_call","name":"gamer_tool","arguments":serde_json::to_string(&decision("observe",json!({}))).unwrap()}],"usage":{"input_tokens":100,"output_tokens":10}});
+    let reply = provider::normalize(&p, response.clone()).unwrap();
+    assert_eq!(reply.cost, None);
+    assert_eq!(reply.source, "unknown");
+    response["usage"]["cost"] = json!(0.025);
+    assert_eq!(
+        provider::normalize(&p, response).unwrap().cost,
+        Some(25_000)
+    );
+    p.input_micros_per_million = 1;
+    assert!(p.validate().is_err());
+}
+
+#[tokio::test]
+async fn unpriced_api_requires_a_positive_reserve_before_request() {
+    let mut f = fixture(vec![decision("observe", json!({}))], false);
+    f.e.profile.price_version.clear();
+    f.e.profile.input_micros_per_million = 0;
+    f.e.profile.output_micros_per_million = 0;
+    f.e.settings.budget.request_micros = 0;
+    let o = f.e.observe().await.unwrap();
+    assert!(f
+        .e
+        .infer("test".into(), &o, "decision")
+        .await
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("预留必须大于零"));
+    assert!(f.e.runtime.repository.data.lock().requests.is_empty());
+}
+
+#[tokio::test]
+async fn model_discovery_is_bounded_get_and_never_infers_or_verifies_vision() {
+    use axum::{http::HeaderMap, routing::get, Json, Router};
+    let received = Arc::new(Mutex::new(vec![]));
+    let captured = received.clone();
+    let app = Router::new().route("/*path", get(move |axum::extract::Path(path):axum::extract::Path<String>, headers:HeaderMap| {
+        let captured = captured.clone(); async move {
+            captured.lock().push((path.clone(), headers));
+            Json(if path == "api/tags" { json!({"models":[{"model":"local-vision"}]}) }
+            else if path == "v1beta/models" { json!({"models":[{"name":"models/embedding","supportedGenerationMethods":["embedContent"]},{"name":"models/vision","supportedGenerationMethods":["generateContent"]}]}) }
+            else { json!({"data":[{"id":"unknown-candidate"},{"id":"text-only","input_modalities":["text"]},{"id":"advertised-vision","capabilities":{"image_input":{"supported":true}}},{"id":"advertised-vision"},{"id":"unsafe?name"}]}) })
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = provider::HttpProvider::new().unwrap();
+    for protocol in ["chat", "responses", "claude", "gemini", "ollama"] {
+        let result = http
+            .discover(&format!("http://{address}"), "catalog-test-key", protocol)
+            .await
+            .unwrap();
+        assert_eq!(result["vision"], "untested");
+        let expected = if protocol == "gemini" {
+            "vision"
+        } else if protocol == "ollama" {
+            "local-vision"
+        } else {
+            "advertised-vision"
+        };
+        assert_eq!(result["models"][0]["id"], expected);
+        let items = result["models"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            if protocol == "gemini" || protocol == "ollama" {
+                1
+            } else {
+                2
+            }
+        );
+        assert!(!result.to_string().contains("catalog-test-key"));
+    }
+    let calls = received.lock();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(calls[0].0, "v1/models");
+    assert_eq!(calls[0].1["authorization"], "Bearer catalog-test-key");
+    assert_eq!(calls[2].1["x-api-key"], "catalog-test-key");
+    assert_eq!(calls[3].1["x-goog-api-key"], "catalog-test-key");
+    assert_eq!(calls[4].0, "api/tags");
+    server.abort();
+}
+
+#[tokio::test]
+async fn changing_model_endpoint_does_not_reuse_secret_or_trust() {
+    let f = fixture(vec![], false);
+    let service = mock_service(&f);
+    service.settings.lock().profiles[0].key = "stored-private-key".into();
+    let mut settings = service.settings();
+    let version = settings.version.clone();
+    settings.profiles[0].key.clear();
+    settings.profiles[0].endpoint = "https://other.example/v1".into();
+    let result = service
+        .dispatch(
+            "settings.save",
+            json!({"expected_version":version,"settings":settings}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["profiles"][0]["has_key"], false);
+    assert_eq!(result["profiles"][0]["vision"], "untested");
+    assert!(!result.to_string().contains("stored-private-key"));
+}
+
+#[tokio::test]
+async fn manual_profile_accepts_full_method_url_without_network_or_reverification() {
+    let f = fixture(vec![], false);
+    let service = mock_service(&f);
+    let mut next = service.settings();
+    let version = next.version.clone();
+    next.profiles[0].endpoint = "https://mock.invalid/v1/responses".into();
+    let result = service
+        .dispatch(
+            "settings.save",
+            json!({"expected_version":version,"settings":next}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["profiles"][0]["endpoint"], "https://mock.invalid/v1");
+    assert_eq!(result["profiles"][0]["vision"], "available");
+    assert!(f.e.runtime.repository.data.lock().requests.is_empty());
+}
+
+fn plan_args(observation: &str) -> Value {
+    json!({"observation_id":observation,"research_summary":"攻略未覆盖新活动入口，用户说明已补充；先验证入口，再核对完成状态","steps":[{"description":"按说明进入活动","expected":"活动页面可见"}],"guide_paths":[],"source_urls":[]})
+}
+fn waiting(f: &Fixture) {
+    f.e.runtime
+        .repository
+        .checkpoint(&f.e.session, f.clock.now().timestamp_millis(), true)
+        .unwrap();
+    f.e.runtime
+        .repository
+        .transaction(|d| {
+            d.sessions.get_mut(&f.e.session).unwrap().state = "waiting_user".into();
+            Ok(())
+        })
+        .unwrap();
+}
+async fn ask(f: &Fixture, kind: &str) -> String {
+    let o = f.e.observe().await.unwrap();
+    let v = tools::execute(&f.e, "ask_user", json!({"question":"新的活动入口如何进入？","options":["进入侧边活动页","先完成前置"],"reason":"当前攻略和画面不足以确定路径","kind":kind,"observation_id":o.id})).await.unwrap();
+    waiting(f);
+    v["question_id"].as_str().unwrap().into()
+}
+#[tokio::test]
+async fn user_answer_resumes_same_budget_and_becomes_verified_long_term_guide() {
+    let f = fixture(
+        vec![
+            decision(
+                "ask_user",
+                json!({"question":"入口在哪里？","options":["侧边活动"],"reason":"攻略仍缺入口","kind":"knowledge","observation_id":"CURRENT"}),
+            ),
+            decision("set_plan", plan_args("CURRENT")),
+            decision("act", act("learned-step", "CURRENT", "navigation")),
+            decision(
+                "finish",
+                json!({"subgoals":[{"name":"活动","state":"completed","evidence":"CURRENT","result":"完成标记可见"}],"summary":"活动完成"}),
+            ),
+            decision(
+                "finish",
+                json!({"verified":true,"observation_id":"CURRENT","account_consistent":true,"validated_guides":"CURRENT_GUIDES","result":"全部目标完成且指南入口验证有效"}),
+            ),
+        ],
+        false,
+    );
+    assert!(f
+        .e
+        .run()
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("waiting_user"));
+    let q = f.e.runtime.repository.data.lock().sessions[&f.e.session].questions[0]
+        .id
+        .clone();
+    let service = mock_service(&f);
+    service.dispatch("sessions.message", json!({"session_id":f.e.session,"question_id":q,"message":"从侧边活动页进入，完成后检查活动面板"})).await.unwrap();
+    let seq = f.e.runtime.repository.data.lock().sessions[&f.e.session]
+        .events
+        .iter()
+        .find(|e| e.kind == "user_message")
+        .unwrap()
+        .seq;
+    let o = f.e.observe().await.unwrap();
+    let candidate = tools::execute(&f.e,"memory.propose",json!({"observation_id":o.id,"title":"活动入口经验","content":"从侧边活动页进入，完成后检查活动面板","conditions":"当前游戏版本、入口可见","sources":[],"user_message_refs":[seq]})).await.unwrap();
+    let path = candidate["path"].as_str().unwrap();
+    assert_eq!(
+        tools::read_local_memory(&f.e.runtime, "default", path).unwrap()["effective_status"],
+        "candidate"
+    );
+    let mut resumed = f.e.clone();
+    resumed.context.run_id = RunId::generate();
+    let same = resumed
+        .runtime
+        .begin(
+            &resumed.context,
+            "完成日常",
+            "plan-1",
+            &resumed.settings,
+            &resumed.profile,
+            Some(&resumed.session),
+        )
+        .unwrap();
+    assert_eq!(same, f.e.session);
+    resumed.run().await.unwrap();
+    assert_eq!(f.backend.inputs.lock().len(), 1);
+    let data = f.e.runtime.repository.data.lock();
+    assert_eq!(data.sessions[&same].rounds, 5);
+    assert_eq!(data.sessions[&same].runs.len(), 2);
+    assert!(data.rules.is_empty());
+    drop(data);
+    let reopened = store::Repository::open(&f.e.runtime.repository.root).unwrap();
+    assert_eq!(
+        reopened.data.lock().sessions[&same].questions[0]
+            .answer
+            .as_deref(),
+        Some("从侧边活动页进入，完成后检查活动面板")
+    );
+    assert_eq!(
+        tools::read_local_memory(&f.e.runtime, "default", path).unwrap()["effective_status"],
+        "verified"
+    );
+}
+#[tokio::test]
+async fn knowledge_timeout_is_persisted_and_bounds_actions_and_repeated_wakeups() {
+    let f = fixture(vec![], false);
+    for round in 0..3 {
+        ask(&f, "knowledge").await;
+        f.clock.0.fetch_add(121_000, Ordering::SeqCst);
+        assert_eq!(
+            f.e.runtime
+                .repository
+                .expire_questions(f.clock.now().timestamp())
+                .unwrap(),
+            vec![f.e.session.clone()]
+        );
+        let reopened = store::Repository::open(&f.e.runtime.repository.root).unwrap();
+        let data = reopened.data.lock();
+        let s = &data.sessions[&f.e.session];
+        assert!(s.trial_mode);
+        assert_eq!(s.auto_resumes, round + 1);
+        assert!(data.rules.is_empty());
+        assert!(!s.questions.iter().any(store::Question::pending));
+    }
+    ask(&f, "knowledge").await;
+    f.clock.0.fetch_add(121_000, Ordering::SeqCst);
+    assert!(f
+        .e
+        .runtime
+        .repository
+        .expire_questions(f.clock.now().timestamp())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.e.runtime.repository.data.lock().sessions[&f.e.session].auto_resumes,
+        3
+    );
+    let d = f.e.runtime.repository.data.lock();
+    assert_eq!(d.sessions[&f.e.session].state, "partial");
+    assert_eq!(
+        d.sessions[&f.e.session].events.last().unwrap().kind,
+        "trial_boundary"
+    );
+    drop(d);
+    assert!(f.backend.inputs.lock().is_empty());
+}
+#[tokio::test]
+async fn identity_preferences_secrets_and_authorization_timeout_never_choose_or_approve() {
+    for kind in ["identity", "preference", "secret", "authorization"] {
+        let f = fixture(vec![], false);
+        ask(&f, kind).await;
+        f.clock.0.fetch_add(121_000, Ordering::SeqCst);
+        assert!(f
+            .e
+            .runtime
+            .repository
+            .expire_questions(f.clock.now().timestamp())
+            .unwrap()
+            .is_empty());
+        let d = f.e.runtime.repository.data.lock();
+        let s = &d.sessions[&f.e.session];
+        assert!(s.questions[0].timed_out && s.questions[0].pending());
+        assert_eq!(s.questions[0].answer, None);
+        assert!(!s.trial_mode);
+        assert!(d.rules.is_empty());
+    }
+}
+#[tokio::test]
+async fn planning_gate_requires_research_and_rejects_invented_sources() {
+    let mut f = fixture(vec![], false);
+    f.e.runtime
+        .repository
+        .transaction(|d| {
+            d.sessions.get_mut(&f.e.session).unwrap().execution_plan = Value::Null;
+            Ok(())
+        })
+        .unwrap();
+    let o = f.e.observe().await.unwrap();
+    assert!(
+        tools::execute(&f.e, "act", act("too-early", &o.id, "navigation"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .starts_with("plan_required")
+    );
+    assert!(tools::execute(
+        &f.e,
+        "call_automation",
+        json!({"entrypoint":"default/test.yaml","args":{}})
+    )
+    .await
+    .is_err());
+    f.e.settings.search = Some(runtime::SearchSettings {
+        endpoint: "https://search.example".into(),
+        key: String::new(),
+        request_micros: 1,
+    });
+    assert!(tools::execute(&f.e, "set_plan", plan_args(&o.id))
+        .await
+        .unwrap_err()
+        .to_string()
+        .starts_with("research_required"));
+    tools::execute(&f.e, "search_guides", json!({"query":"活动入口"}))
+        .await
+        .unwrap();
+    let mut args = plan_args(&o.id);
+    args["source_urls"] = json!(["https://invented.invalid"]);
+    assert!(tools::execute(&f.e, "set_plan", args).await.is_err());
+    tools::execute(&f.e, "set_plan", plan_args(&o.id))
+        .await
+        .unwrap();
+    tools::execute(&f.e, "act", act("researched", &o.id, "navigation"))
+        .await
+        .unwrap();
+    assert_eq!(f.backend.inputs.lock().len(), 1);
+}
+#[tokio::test]
+async fn timeout_trial_exhaustion_does_not_bill_or_create_unknown_operation() {
+    let f = fixture(vec![], false);
+    f.e.runtime
+        .repository
+        .transaction(|d| {
+            let s = d.sessions.get_mut(&f.e.session).unwrap();
+            s.trial_mode = true;
+            s.trial_operations = 3;
+            Ok(())
+        })
+        .unwrap();
+    let o = f.e.observe().await.unwrap();
+    assert!(
+        tools::execute(&f.e, "act", act("beyond-limit", &o.id, "navigation"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .starts_with("trial_boundary")
+    );
+    let d = f.e.runtime.repository.data.lock();
+    assert!(d.requests.is_empty());
+    assert!(d.sessions[&f.e.session].operations.is_empty());
+    assert!(f.backend.inputs.lock().is_empty());
+}
+#[tokio::test]
+async fn trial_step_requires_multimodal_reversibility_and_never_spends_extra() {
+    for (reversible, category, allowed) in [
+        (true, "navigation", true),
+        (false, "navigation", false),
+        (true, "item", false),
+    ] {
+        let f = fixture(
+            vec![decision(
+                "act",
+                json!({"reversible":reversible,"consumption":consumption(category)}),
+            )],
+            false,
+        );
+        f.e.runtime
+            .repository
+            .transaction(|d| {
+                d.sessions.get_mut(&f.e.session).unwrap().trial_mode = true;
+                Ok(())
+            })
+            .unwrap();
+        let o = f.e.observe().await.unwrap();
+        assert_eq!(
+            tools::execute(&f.e, "act", act("trial", &o.id, category))
+                .await
+                .is_ok(),
+            allowed
+        );
+        assert_eq!(f.backend.inputs.lock().len(), usize::from(allowed));
+        assert_eq!(
+            f.e.runtime.repository.data.lock().sessions[&f.e.session].trial_operations,
+            u32::from(allowed)
+        );
+    }
+}
+#[tokio::test]
+async fn old_decision_after_user_steering_is_charged_but_cannot_execute() {
+    let f = fixture(
+        vec![decision("act", act("stale", "CURRENT", "navigation"))],
+        false,
+    );
+    let o = f.e.observe().await.unwrap();
+    mock_service(&f)
+        .dispatch(
+            "sessions.message",
+            json!({"session_id":f.e.session,"message":"先看帮助页面，不进入活动"}),
+        )
+        .await
+        .unwrap();
+    let error =
+        f.e.infer(
+            json!({"conversation_revision":0,"observation_id":o.id}).to_string(),
+            &o,
+            "decision",
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().starts_with("conversation_changed"));
+    let d = f.e.runtime.repository.data.lock();
+    assert_eq!(d.requests.len(), 1);
+    assert_eq!(d.requests.values().next().unwrap().actual, Some(10));
+    assert!(d.rules.is_empty());
+    assert!(f.backend.inputs.lock().is_empty());
+}
+#[tokio::test]
+async fn permanent_permission_is_explicit_scoped_cumulative_and_revocable() {
+    let f = fixture(vec![], false);
+    let repo = &f.e.runtime.repository;
+    let o = f.e.observe().await.unwrap();
+    let c: store::Consumption = serde_json::from_value(consumption("item")).unwrap();
+    assert!(!repo
+        .gate(
+            &f.e.session,
+            "pending-permanent",
+            &o.id,
+            c.clone(),
+            f.clock.now().timestamp()
+        )
+        .unwrap());
+    waiting(&f);
+    let service = mock_service(&f);
+    service
+        .dispatch(
+            "identity.confirm",
+            json!({"session_id":f.e.session,"account":"verified-account"}),
+        )
+        .await
+        .unwrap();
+    let approval = repo
+        .data
+        .lock()
+        .approvals
+        .values()
+        .next()
+        .unwrap()
+        .id
+        .clone();
+    assert!(service
+        .dispatch(
+            "approvals.resolve",
+            json!({"approval_id":approval,"scope":"persistent","limit":2,"no_expiry":true})
+        )
+        .await
+        .is_err());
+    service
+        .dispatch(
+            "sessions.message",
+            json!({"session_id":f.e.session,"message":"同意永久使用门票"}),
+        )
+        .await
+        .unwrap();
+    assert!(repo.data.lock().rules.is_empty());
+    service.dispatch("approvals.resolve",json!({"approval_id":approval,"decision":"approve","scope":"persistent","limit":2,"no_expiry":true})).await.unwrap();
+    let rule = repo.data.lock().rules.values().next().unwrap().clone();
+    assert_eq!(rule.expires_at, i64::MAX);
+    assert_eq!(rule.account.as_deref(), Some("verified-account"));
+    assert!(repo
+        .gate(
+            &f.e.session,
+            "first-permanent",
+            &o.id,
+            c.clone(),
+            f.clock.now().timestamp()
+        )
+        .unwrap());
+    let mut second = repo.data.lock().sessions[&f.e.session].clone();
+    second.id = store::id();
+    second.runs.clear();
+    repo.transaction(|d| {
+        d.sessions.insert(second.id.clone(), second.clone());
+        Ok(())
+    })
+    .unwrap();
+    let reopened = store::Repository::open(&repo.root).unwrap();
+    assert!(reopened
+        .gate(
+            &second.id,
+            "second-permanent",
+            &o.id,
+            c.clone(),
+            f.clock.now().timestamp()
+        )
+        .unwrap());
+    assert!(!reopened
+        .gate(
+            &second.id,
+            "third-permanent",
+            &o.id,
+            c.clone(),
+            f.clock.now().timestamp()
+        )
+        .unwrap());
+    let mut other = second.clone();
+    other.id = store::id();
+    other.account = Some("another-account".into());
+    repo.transaction(|d| {
+        d.sessions.insert(other.id.clone(), other.clone());
+        Ok(())
+    })
+    .unwrap();
+    assert!(!repo
+        .gate(
+            &other.id,
+            "wrong-account",
+            &o.id,
+            c.clone(),
+            f.clock.now().timestamp()
+        )
+        .unwrap());
+    service
+        .dispatch("approvals.revoke", json!({"rule_id":rule.id}))
+        .await
+        .unwrap();
+    assert!(!repo
+        .gate(&f.e.session, "revoked", &o.id, c, f.clock.now().timestamp())
+        .unwrap());
+}
+
+#[tokio::test]
+async fn question_timer_never_promotes_external_or_revoked_mcp_credentials() {
+    for (allowed, revoked) in [("gamer.session.open", false), ("gamer.goal.submit", true)] {
+        let f = fixture(vec![], false);
+        ask(&f, "knowledge").await;
+        let service = Arc::new(mock_service(&f));
+        let issued=mcp::manage(&service,"credentials.issue",&json!({"package_id":"default","android_package":"com.sample.game","device_id":f.e.context.device_id(),"tools":[allowed,"observe"],"expires_at":f.clock.now().timestamp()+1000})).unwrap();
+        let credential = issued["credential_id"].as_str().unwrap();
+        service
+            .runtime
+            .repository
+            .transaction(|d| {
+                d.credentials.get_mut(credential).unwrap().revoked = revoked;
+                d.mcp_sessions
+                    .insert(f.e.session.clone(), credential.into());
+                Ok(())
+            })
+            .unwrap();
+        let extensions = Arc::new(
+            crate::extensions::ExtensionService::for_data_root(
+                f._dir.path(),
+                crate::capabilities::CapabilityRegistry::default(),
+            )
+            .with_builtin_service(service.clone()),
+        );
+        service.attach(&extensions);
+        extensions.install(&ai_archive()).await.unwrap();
+        let id = ExtensionId::parse(ID).unwrap();
+        extensions.enable(&id).await.unwrap();
+        extensions.start(&id).await.unwrap();
+        f.clock.0.fetch_add(121_000, Ordering::SeqCst);
+        service.wake_expired_questions().await.unwrap();
+        {
+            let data = service.runtime.repository.data.lock();
+            let s = &data.sessions[&f.e.session];
+            assert_eq!(s.runs.len(), 1);
+            assert_eq!(data.mcp_sessions[&f.e.session], credential);
+            assert!(data.requests.is_empty());
+            assert!(data.rules.is_empty());
+            assert!(s.events.iter().any(
+                |e| e.kind == "tool_error" && e.data["error"].as_str().unwrap().contains("MCP")
+            ));
+            assert!(s.notified.contains_key("auto_resume_problem"));
+        }
+        extensions.disable(&id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn new_goal_reuses_permanent_rule_only_after_current_screen_identity_verification() {
+    for consistent in [false, true] {
+        let f = fixture(
+            vec![decision(
+                "act",
+                json!({"account_consistent":consistent,"cycle_consistent":true,"consumption":consumption("item")}),
+            )],
+            false,
+        );
+        let o = f.e.observe().await.unwrap();
+        let c: store::Consumption = serde_json::from_value(consumption("item")).unwrap();
+        assert!(!f
+            .e
+            .runtime
+            .repository
+            .gate(
+                &f.e.session,
+                "authorize-once",
+                &o.id,
+                c,
+                f.clock.now().timestamp()
+            )
+            .unwrap());
+        waiting(&f);
+        let service = mock_service(&f);
+        service
+            .dispatch(
+                "identity.confirm",
+                json!({"session_id":f.e.session,"account":"account-approved-once"}),
+            )
+            .await
+            .unwrap();
+        let approval =
+            f.e.runtime
+                .repository
+                .data
+                .lock()
+                .approvals
+                .values()
+                .next()
+                .unwrap()
+                .id
+                .clone();
+        service.dispatch("approvals.resolve",json!({"approval_id":approval,"decision":"approve","scope":"persistent","limit":2,"no_expiry":true})).await.unwrap();
+        let mut next = f.e.clone();
+        next.context.run_id = RunId::generate();
+        next.session = next
+            .runtime
+            .begin(
+                &next.context,
+                "再次完成活动",
+                "next-plan",
+                &next.settings,
+                &next.profile,
+                None,
+            )
+            .unwrap();
+        assert_ne!(next.session, f.e.session);
+        assert_eq!(
+            next.runtime.repository.data.lock().sessions[&next.session]
+                .account
+                .as_deref(),
+            Some("account-approved-once")
+        );
+        assert_eq!(
+            next.runtime.repository.data.lock().sessions[&next.session].cycle,
+            None
+        );
+        let listed = service.dispatch("sessions.read", json!({})).await.unwrap();
+        let reference = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == next.session)
+            .unwrap();
+        assert_eq!(reference["account_reference_only"], true);
+        let fresh = next.observe().await.unwrap();
+        tools::execute(&next, "set_plan", plan_args(&fresh.id))
+            .await
+            .unwrap();
+        let outcome =
+            tools::execute(&next, "act", act("permanent-next-goal", &fresh.id, "item")).await;
+        if consistent {
+            assert_eq!(outcome.unwrap()["status"], "injected");
+        } else {
+            assert!(outcome
+                .unwrap_err()
+                .to_string()
+                .starts_with("account_unverified"));
+        }
+        {
+            let data = next.runtime.repository.data.lock();
+            assert_eq!(data.rules.len(), 1);
+            assert_eq!(data.spends.len(), usize::from(consistent));
+            assert_eq!(f.backend.inputs.lock().len(), usize::from(consistent));
+        }
+        next.runtime
+            .repository
+            .transaction(|d| {
+                d.sessions.get_mut(&next.session).unwrap().state = "partial".into();
+                Ok(())
+            })
+            .unwrap();
+        let changed = service
+            .dispatch(
+                "identity.confirm",
+                json!({"session_id":next.session,"account":"different-current-account"}),
+            )
+            .await;
+        if consistent {
+            assert!(changed.is_err());
+        } else {
+            changed.unwrap();
+            assert_eq!(
+                next.runtime.repository.data.lock().sessions[&next.session].rounds,
+                1
+            );
+            let c: store::Consumption = serde_json::from_value(consumption("item")).unwrap();
+            assert!(!next
+                .runtime
+                .repository
+                .gate(
+                    &next.session,
+                    "different-account-spend",
+                    &fresh.id,
+                    c,
+                    f.clock.now().timestamp()
+                )
+                .unwrap());
+        }
+        let mut other = next.context.clone();
+        other.run_id = RunId::generate();
+        other.app.device_id = DeviceId::new(store::id()).unwrap();
+        let unconfirmed = next
+            .runtime
+            .begin(
+                &other,
+                "另一设备",
+                "next-plan",
+                &next.settings,
+                &next.profile,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            next.runtime.repository.data.lock().sessions[&unconfirmed].account,
+            None
+        );
+    }
+}
+
+#[test]
+fn timer_reuses_pending_session_before_identity_without_crossing_device_scope() {
+    let f = fixture(vec![], false);
+    let service = mock_service(&f);
+    let request = RunRequest::for_app(
+        f.e.context.app.clone(),
+        ID,
+        "default#goal",
+        RunPayload::new(json!({"goal":"等待活动说明","model_profile_id":"mock"})),
+    )
+    .unwrap();
+    let first = service
+        .prepare_request(request.clone(), Some("timer-ai".into()), None, None)
+        .unwrap();
+    let prepared = service
+        .prepared
+        .lock()
+        .remove(first.payload.as_value()["prepared_id"].as_str().unwrap())
+        .unwrap();
+    let sid =
+        f.e.runtime
+            .begin(
+                &f.e.context,
+                &prepared.goal.goal,
+                &prepared.plan_version,
+                &prepared.settings,
+                &prepared.profile,
+                None,
+            )
+            .unwrap();
+    f.e.runtime
+        .repository
+        .transaction(|data| {
+            let s = data.sessions.get_mut(&sid).unwrap();
+            s.state = "waiting_user".into();
+            s.entrypoint = request.entrypoint.clone();
+            s.rounds = 7;
+            s.trial_operations = 2;
+            Ok(())
+        })
+        .unwrap();
+    let repeated = service
+        .prepare_request(request.clone(), Some("timer-ai".into()), None, None)
+        .unwrap();
+    let reused = service
+        .prepared
+        .lock()
+        .remove(repeated.payload.as_value()["prepared_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(reused.goal.resume_session_id.as_deref(), Some(sid.as_str()));
+    {
+        let data = f.e.runtime.repository.data.lock();
+        let s = &data.sessions[&sid];
+        assert!(s.account.is_none() && s.cycle.is_none());
+        assert_eq!((s.rounds, s.trial_operations), (7, 2));
+        assert_eq!(data.sessions.len(), 2);
+    }
+    let mut other = request;
+    other.app.device_id = DeviceId::new(store::id()).unwrap();
+    let prepared = service
+        .prepare_request(other, Some("timer-other".into()), None, None)
+        .unwrap();
+    assert!(
+        service.prepared.lock()[prepared.payload.as_value()["prepared_id"].as_str().unwrap()]
+            .goal
+            .resume_session_id
+            .is_none()
+    );
 }

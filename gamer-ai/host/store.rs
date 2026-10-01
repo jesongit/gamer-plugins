@@ -27,6 +27,11 @@ pub struct Budget {
     pub max_active_secs: u64,
     pub max_tokens: u64,
     pub concurrency: usize,
+    #[serde(default = "default_trials")]
+    pub max_trials: u32,
+}
+fn default_trials() -> u32 {
+    3
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -40,11 +45,16 @@ impl Default for Budget {
             max_active_secs: 600,
             max_tokens: 100_000,
             concurrency: 2,
+            max_trials: default_trials(),
         }
     }
 }
 impl Budget {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_trials <= 10,
+            "自动试错次数上限最多 10 次，0 表示禁止试错"
+        );
         ensure!(
             self.max_rounds > 0
                 && self.max_rounds <= 1000
@@ -71,7 +81,26 @@ pub struct Event {
     pub data: Value,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Question {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub reason: String,
+    pub observation: String,
+    pub answer: Option<String>,
+    pub kind: String,
+    pub deadline: i64,
+    pub timed_out: bool,
+}
+impl Question {
+    pub fn pending(&self) -> bool {
+        self.answer.is_none() && (!self.timed_out || self.kind != "knowledge")
+    }
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Session {
+    #[serde(default)]
+    pub device: String,
     pub id: String,
     #[serde(default)]
     pub entrypoint: String,
@@ -82,6 +111,8 @@ pub struct Session {
     pub plan_version: String,
     pub profile_version: String,
     pub account: Option<String>,
+    #[serde(default)]
+    pub account_reference_only: bool,
     pub cycle: Option<String>,
     pub runs: Vec<String>,
     pub state: String,
@@ -95,6 +126,18 @@ pub struct Session {
     pub tokens: u64,
     pub expires_at: i64,
     pub events: Vec<Event>,
+    #[serde(default)]
+    pub questions: Vec<Question>,
+    #[serde(default)]
+    pub conversation_revision: u64,
+    #[serde(default)]
+    pub execution_plan: Value,
+    #[serde(default)]
+    pub trial_mode: bool,
+    #[serde(default)]
+    pub trial_operations: u32,
+    #[serde(default)]
+    pub auto_resumes: u32,
     pub operations: BTreeMap<String, Value>,
     pub notified: BTreeMap<String, Value>,
 }
@@ -221,6 +264,45 @@ pub struct Repository {
     pub data: Mutex<Data>,
 }
 impl Repository {
+    /// Expiration changes context, never grants permission or invents an answer.
+    pub fn expire_questions(&self, now: i64) -> Result<Vec<String>> {
+        let due = self.data.lock().sessions.values().any(|s| {
+            s.state == "waiting_user"
+                && s.questions
+                    .iter()
+                    .any(|q| q.answer.is_none() && !q.timed_out && q.deadline <= now)
+        });
+        if !due {
+            return Ok(vec![]);
+        }
+        self.transaction(|data| {
+            let mut resume = vec![];
+            for s in data.sessions.values_mut().filter(|s| s.state == "waiting_user") {
+                let mut expired = false;
+                for q in &mut s.questions {
+                    if q.answer.is_none() && !q.timed_out && q.deadline <= now {
+                        q.timed_out = true; expired = true;
+                    }
+                }
+                if !expired { continue; }
+                ensure!(s.events.len() + 2 <= 10_000, "会话事件达到容量上限");
+                let retry = !s.questions.iter().any(Question::pending) && s.trial_operations < s.budget.max_trials && s.auto_resumes < s.budget.max_trials && !s.device.is_empty();
+                s.events.push(Event { seq:s.events.last().map_or(1, |e| e.seq + 1), run_id:s.runs.last().cloned().unwrap_or_default(), at:now * 1000,
+                    kind:"question_timeout".into(), data:json!({"summary":if retry { "求助等待已超时，将重新观察、制定有限探索计划；未获得任何消耗授权" } else { "求助等待已超时，仍需要人工回答或已达到试错边界；未获得授权" },"auto_retry":retry,"authorization_changed":false}) });
+                if retry {
+                    s.auto_resumes += 1;
+                    s.trial_mode = true; s.execution_plan = Value::Null;
+                    s.conversation_revision = s.conversation_revision.saturating_add(1);
+                    s.state = "partial".into(); resume.push(s.id.clone());
+                } else if !s.questions.iter().any(Question::pending) {
+                    s.state = "partial".into();
+                    s.events.push(Event { seq:s.events.last().map_or(1, |e| e.seq + 1), run_id:s.runs.last().cloned().unwrap_or_default(), at:now * 1000,
+                        kind:"trial_boundary".into(), data:json!({"summary":"自动继续达到边界，进度已保存；请补充步骤或人工处理","authorization_changed":false}) });
+                }
+            }
+            Ok(resume)
+        })
+    }
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)?;
         let path = root.join("state.json");
@@ -243,7 +325,12 @@ impl Repository {
         }
         for s in data.sessions.values_mut() {
             if s.state == "running" {
-                s.state = "partial".into();
+                s.state = if s.questions.iter().any(Question::pending) {
+                    "waiting_user"
+                } else {
+                    "partial"
+                }
+                .into();
                 if let Some(at) = s.active_checkpoint.take() {
                     let elapsed = chrono::Utc::now()
                         .timestamp_millis()

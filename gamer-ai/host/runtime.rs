@@ -46,6 +46,11 @@ pub struct Settings {
     pub notification_channel: Option<String>,
     #[serde(default)]
     pub notify_results: bool,
+    #[serde(default = "default_question_timeout")]
+    pub question_timeout_secs: u64,
+}
+fn default_question_timeout() -> u64 {
+    120
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -57,6 +62,7 @@ impl Default for Settings {
             search: None,
             notification_channel: None,
             notify_results: true,
+            question_timeout_secs: default_question_timeout(),
         }
     }
 }
@@ -76,7 +82,7 @@ impl Settings {
         )
     }
     pub fn public(&self) -> Value {
-        json!({"version":self.version,"billing":self.billing.as_ref().map(super::billing::Billing::public),"profiles":self.profiles.iter().map(Profile::public).collect::<Vec<_>>(),"budget":self.budget,"search":self.search.as_ref().map(|s|json!({"endpoint":s.endpoint,"request_micros":s.request_micros,"has_key":!s.key.is_empty()})),"notification_channel":self.notification_channel,"notify_results":self.notify_results})
+        json!({"version":self.version,"billing":self.billing.as_ref().map(super::billing::Billing::public),"profiles":self.profiles.iter().map(Profile::public).collect::<Vec<_>>(),"budget":self.budget,"search":self.search.as_ref().map(|s|json!({"endpoint":s.endpoint,"request_micros":s.request_micros,"has_key":!s.key.is_empty()})),"notification_channel":self.notification_channel,"notify_results":self.notify_results,"question_timeout_secs":self.question_timeout_secs})
     }
 }
 pub struct Capture {
@@ -340,11 +346,17 @@ impl Runtime {
                 );
                 ensure!(s.expires_at > now, "会话已过期");
                 ensure!(
+                    !s.questions.iter().any(store::Question::pending),
+                    "waiting_user: 请先回答对话中的问题"
+                );
+                ensure!(
                     s.state != "running" && s.state != "completed",
                     "会话正在运行或已经完成"
                 );
                 s.runs.push(context.run_id.to_string());
                 s.state = "running".into();
+                s.device = context.device_id().as_str().into();
+                s.execution_plan = Value::Null;
                 s.active_checkpoint = Some(self.clock.now().timestamp_millis());
                 return Ok(resume.into());
             }
@@ -353,9 +365,27 @@ impl Runtime {
                 "AI 会话达到保留上限，请归档历史"
             );
             let key = store::id();
+            // Private user-confirmed identity is a reference, not proof of the
+            // current screen. Every extra consumption still passes identity_gate.
+            // Android app/device scope is independent of the Package namespace.
+            let account = data
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.device == context.device_id().as_str()
+                        && context
+                            .app
+                            .android_package
+                            .as_ref()
+                            .is_some_and(|app| app.as_str() == s.app)
+                        && s.account.is_some()
+                })
+                .max_by_key(|s| s.events.last().map_or(0, |e| e.at))
+                .and_then(|s| s.account.clone());
             data.sessions.insert(
                 key.clone(),
                 Session {
+                    device: context.device_id().as_str().into(),
                     entrypoint: String::new(),
                     id: key.clone(),
                     package: package.into(),
@@ -369,7 +399,8 @@ impl Runtime {
                     goal: goal.into(),
                     plan_version: plan_version.into(),
                     profile_version: profile.version(),
-                    account: None,
+                    account_reference_only: account.is_some(),
+                    account,
                     cycle: None,
                     runs: vec![context.run_id.to_string()],
                     state: "running".into(),
@@ -382,6 +413,12 @@ impl Runtime {
                     tokens: 0,
                     expires_at: now + 7 * 86400,
                     events: vec![],
+                    questions: vec![],
+                    conversation_revision: 0,
+                    execution_plan: Value::Null,
+                    trial_mode: false,
+                    trial_operations: 0,
+                    auto_resumes: 0,
                     operations: Default::default(),
                     notified: Default::default(),
                 },
@@ -557,6 +594,12 @@ impl Execution {
     ) -> Result<Reply> {
         self.check()?;
         ensure!(
+            self.profile.protocol == "ollama"
+                || self.profile.has_prices()
+                || self.settings.budget.request_micros > 0,
+            "未配置价格时，API 每次请求费用预留必须大于零"
+        );
+        ensure!(
             self.profile.vision == "available",
             "multimodal_unverified: 请先完成图片连接测试"
         );
@@ -589,6 +632,20 @@ impl Execution {
             },
             reserve,
         )?;
+        let conversation_revision = serde_json::from_str::<Value>(&prompt)
+            .ok()
+            .and_then(|v| v["conversation_revision"].as_u64())
+            .unwrap_or_else(|| {
+                self.runtime.repository.data.lock().sessions[&self.session].conversation_revision
+            });
+        self.event(
+            "thinking",
+            json!({"kind":kind,"summary":match kind {
+                "verification" => "正在用新画面核对目标是否完成",
+                "mcp_gate" | "yaml_gate" | "identity_gate" => "正在核对操作、账号与消耗",
+                _ => "正在结合当前画面、你的要求与已有经验判断下一步",
+            }}),
+        )?;
         let started = std::time::Instant::now();
         let request = self.runtime.provider.infer(
             &effective,
@@ -611,6 +668,12 @@ impl Execution {
                 ensure!(
                     reply.cost.is_some_and(|cost| cost <= reserve),
                     "budget_cost_unknown: 费用未知或超过请求预留，保存进度后对账"
+                );
+                ensure!(
+                    self.runtime.repository.data.lock().sessions[&self.session]
+                        .conversation_revision
+                        == conversation_revision,
+                    "conversation_changed: 已收到用户补充，旧决策丢弃并重新观察"
                 );
                 self.event("decision",json!({"request_id":id,"tool":reply.decision.tool,"summary":reply.decision.summary,"sources":reply.sources}))?;
                 Ok(reply)
@@ -670,14 +733,16 @@ impl Execution {
         let result = self.run_loop().await;
         let error = result.as_ref().err().map(ToString::to_string);
         let cancelled = self.stop.load(Ordering::Acquire);
-        let waiting = self
-            .runtime
-            .repository
-            .data
-            .lock()
-            .approvals
-            .values()
-            .any(|a| a.session == self.session && a.status == "pending");
+        let waiting = {
+            let data = self.runtime.repository.data.lock();
+            data.approvals
+                .values()
+                .any(|a| a.session == self.session && a.status == "pending")
+                || data.sessions[&self.session]
+                    .questions
+                    .iter()
+                    .any(store::Question::pending)
+        };
         let state = if cancelled {
             "cancelled"
         } else if result.is_ok() {
@@ -697,10 +762,11 @@ impl Execution {
             s.state = state.into();
             Ok(())
         })?;
-        if error
-            .as_ref()
-            .is_some_and(|s| s.starts_with("no_progress") || s.starts_with("partial"))
-        {
+        if error.as_ref().is_some_and(|s| {
+            s.starts_with("no_progress")
+                || s.starts_with("partial")
+                || s.starts_with("trial_boundary")
+        }) {
             let s = self.runtime.repository.data.lock().sessions[&self.session].clone();
             self.runtime.repository.transaction(|d|{d.failures.push(json!({"app":s.app,"goal":s.goal,"reason":error,"conditions":"本次目标与画面；先重新观察，不能凭此判断延迟或攻略错误","observation_id":self.observation.lock().as_ref().map(|o|o.id.clone()),"at":self.runtime.clock.now()}));Ok(())})?;
         }
@@ -722,8 +788,18 @@ impl Execution {
             let s = self.runtime.repository.data.lock().sessions[&self.session].clone();
             let o = self.observe().await?;
             let memories = super::tools::memory_search(self, "", 5)?;
-            let prompt=json!({"goal":s.goal,"progress":s.progress,"account_confirmed":s.account,"cycle_confirmed":s.cycle,"observation_id":o.id,"original_size":o.size,"model_size":o.model_size,"coordinate_mapping":"normalized coordinates refer to the original frame","tools":super::tools::catalog(),"relevant_memory_untrusted":memories,"last_tool_result":last_result,"recent_host_events":s.events.iter().rev().take(8).collect::<Vec<_>>(),"pending_approvals":self.runtime.repository.data.lock().approvals.values().filter(|p|p.session==self.session).collect::<Vec<_>>()}).to_string();
-            let reply = self.infer(prompt, &o, "decision").await?;
+            ensure!(
+                !s.questions.iter().any(store::Question::pending),
+                "waiting_user: 等待用户回答，设备已释放"
+            );
+            let prompt=json!({"goal":s.goal,"progress":s.progress,"execution_plan":s.execution_plan,"conversation_revision":s.conversation_revision,"trial_policy":{"active":s.trial_mode,"operations_used":s.trial_operations,"auto_resumes_used":s.auto_resumes,"limit":s.budget.max_trials,"instruction":"超时只允许逐步可恢复导航或明确的常规行动资源；不执行整段自动化、不消耗额外资源、不代替账号或授权选择。到边界保存进度并 finish。"},"account_confirmed":s.account,"account_reference_only":s.account_reference_only,"cycle_confirmed":s.cycle,"observation_id":o.id,"original_size":o.size,"model_size":o.model_size,"coordinate_mapping":"normalized coordinates refer to the original frame","tools":super::tools::catalog(),"relevant_memory_untrusted":memories,"last_tool_result":last_result,"recent_host_events":s.events.iter().rev().take(8).collect::<Vec<_>>(),"user_messages":s.events.iter().filter(|e| e.kind == "user_message").rev().take(20).collect::<Vec<_>>(),"user_questions":s.questions,"pending_approvals":self.runtime.repository.data.lock().approvals.values().filter(|p|p.session==self.session).collect::<Vec<_>>()}).to_string();
+            let reply = match self.infer(prompt, &o, "decision").await {
+                Err(error) if error.to_string().starts_with("conversation_changed") => {
+                    last_result = json!({"instruction":"用户要求已更新，已丢弃旧决策"});
+                    continue;
+                }
+                result => result?,
+            };
             let mut semantic = reply.decision.arguments.clone();
             if let Some(a) = semantic.as_object_mut() {
                 a.remove("observation_id");
@@ -746,6 +822,9 @@ impl Execution {
             );
             match super::tools::execute(self, &reply.decision.tool, reply.decision.arguments).await
             {
+                Ok(value) if value["waiting_user"] == true => {
+                    anyhow::bail!("waiting_user: 已保存问题和进度，等待用户回答");
+                }
                 Ok(value) if value["completed"] == true => {
                     ensure!(
                         !self
@@ -765,10 +844,17 @@ impl Execution {
                         blocked += 1;
                     }
                     last_result = value;
+                    self.event(
+                        "tool_result",
+                        json!({"tool":reply.decision.tool,"result":last_result}),
+                    )?;
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if message.starts_with("CANCELLED") || message.contains("budget_") {
+                    if message.starts_with("CANCELLED")
+                        || message.contains("budget_")
+                        || message.contains("trial_boundary")
+                    {
                         return Err(error);
                     }
                     last_result = json!({"error":message});

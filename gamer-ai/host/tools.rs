@@ -19,6 +19,8 @@ pub const NAMES: &[&str] = &[
     "list_automations",
     "call_automation",
     "request_approval",
+    "ask_user",
+    "set_plan",
     "finish",
 ];
 pub fn input_schema(name: &str) -> Value {
@@ -97,10 +99,12 @@ pub fn catalog() -> Value {
         {"name":"read_guide","args":{"path":"guides/name.json"}},
         {"name":"memory.search","args":{"query":"keywords","limit":5}},
         {"name":"memory.read","args":{"path":"guides/name.json"}},
-        {"name":"memory.propose","args":{"title":"title","content":"semantic guide without personal identifiers","conditions":"app/version/conditions","sources":["https://source.example"],"observation_id":"current ID","supersedes":null},"description":"Candidate only; cannot grant permissions or declare local verification"},
+        {"name":"memory.propose","args":{"title":"title","content":"semantic guide without personal identifiers","conditions":"app/version/conditions","sources":["https://source.example"],"observation_id":"current ID","supersedes":null},"description":"Record corrected guides learned from real execution and user answers; optional user_message_refs are existing event sequence numbers. Candidate only; cannot grant permissions or declare local verification"},
         {"name":"list_automations","args":{},"description":"Discover current Package YAML; every side effect requires fresh multimodal policy approval"},
         {"name":"call_automation","args":{"entrypoint":"package/name.yaml or package#function","args":{}},"description":"Execute in this parent run without acquiring another device slot"},
         {"name":"request_approval","args":{"operation_id":"ID","observation_id":"current ID","consumption":{"category":"unknown","resource":"resource","quantity":1,"purpose":"purpose","evidence":"screen evidence"}}},
+        {"name":"ask_user","args":{"question":"需要用户决定的问题","options":["选项一","选项二"],"reason":"为何需要这个选择","kind":"knowledge|preference|identity|secret|authorization","observation_id":"current ID"},"description":"Checkpoint and release the device. Knowledge questions expire into bounded reversible exploration; preferences, identity, secrets and authorization still require the real user. Never ask for passwords or codes in chat."},
+        {"name":"set_plan","args":{"steps":[{"description":"执行步骤","expected":"可验证结果"}],"guide_paths":["guides/name.json"],"source_urls":["https://actual-source.example"],"research_summary":"依据、前置条件、消耗和仍不确定的部分","observation_id":"current ID"},"description":"Inspect local guides and available search before planning. Cite only existing guides or actual search results; without sources explicitly describe bounded screen exploration. A plan is required before input or YAML execution and does not authorize spending."},
         {"name":"finish","args":{"subgoals":[{"name":"subgoal","state":"completed|blocked","evidence":"current observation ID","result":"visible result"}],"summary":"completed work and blockers"},"description":"New screenshot and multimodal verification are required; partial results never become success"}
     ])
 }
@@ -266,10 +270,132 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
         "observe" => {
             let o = e.observe().await?;
             Ok(
-                json!({"observation_id":o.id,"size":o.size,"model_size":o.model_size,"at":o.at,"hash":o.hash}),
+                json!({"observation_id":o.id,"size":o.size,"model_size":o.model_size,"at":o.at,"hash":o.hash,"user_messages":e.runtime.repository.data.lock().sessions[&e.session].events.iter().filter(|e| e.kind == "user_message").rev().take(20).collect::<Vec<_>>()}),
             )
         }
+        "ask_user" => {
+            let question = required(&args, "question")?.to_owned();
+            let reason = required(&args, "reason")?.to_owned();
+            let options: Vec<String> = serde_json::from_value(args["options"].clone())?;
+            ensure!(
+                options.len() <= 6
+                    && options
+                        .iter()
+                        .all(|o| !o.trim().is_empty() && o.len() <= 300),
+                "问题选项最多六个，每项最多 300 字节"
+            );
+            let o = e
+                .valid_observation(required(&args, "observation_id")?)
+                .await?;
+            let kind = required(&args, "kind")?;
+            ensure!(
+                [
+                    "knowledge",
+                    "preference",
+                    "identity",
+                    "secret",
+                    "authorization"
+                ]
+                .contains(&kind),
+                "问题类别无效"
+            );
+            let id = store::id();
+            e.runtime.repository.transaction(|data| {
+                let s = data.sessions.get_mut(&e.session).context("会话不存在")?;
+                ensure!(
+                    s.questions.len() < 50 && !s.questions.iter().any(store::Question::pending),
+                    "当前已有未回答问题或已达到问题上限"
+                );
+                s.questions.push(store::Question {
+                    id: id.clone(),
+                    question: question.clone(),
+                    reason: reason.clone(),
+                    options: options.clone(),
+                    observation: o.id.clone(),
+                    answer: None,
+                    kind: kind.into(),
+                    deadline: e.runtime.clock.now().timestamp()
+                        + e.settings.question_timeout_secs as i64,
+                    timed_out: false,
+                });
+                Ok(())
+            })?;
+            e.event("question", json!({"question_id":id,"summary":question,"reason":reason,"options":options,"observation_id":o.id}))?;
+            Ok(json!({"waiting_user":true,"question_id":id}))
+        }
+        "set_plan" => {
+            let o = e
+                .valid_observation(required(&args, "observation_id")?)
+                .await?;
+            let summary = required(&args, "research_summary")?;
+            let steps = args["steps"].as_array().context("计划步骤必填")?;
+            ensure!(
+                !steps.is_empty()
+                    && steps.len() <= 20
+                    && steps
+                        .iter()
+                        .all(|s| required(s, "description").is_ok()
+                            && required(s, "expected").is_ok()),
+                "计划需要 1 至 20 个含目的与预期结果的步骤"
+            );
+            let paths: Vec<String> = serde_json::from_value(args["guide_paths"].clone())?;
+            let urls: Vec<String> = serde_json::from_value(args["source_urls"].clone())?;
+            ensure!(paths.len() <= 10 && urls.len() <= 10, "计划来源过多");
+            for path in &paths {
+                read_memory(e, path)?;
+            }
+            let session = e.runtime.repository.data.lock().sessions[&e.session].clone();
+            let mut sources = Vec::new();
+            fn collect(v: &Value, urls: &mut Vec<String>) {
+                match v {
+                    Value::Object(map) => {
+                        for (key, v) in map {
+                            if key == "url" || key == "uri" {
+                                if let Some(s) = v.as_str() {
+                                    urls.push(s.into());
+                                }
+                            } else {
+                                collect(v, urls);
+                            }
+                        }
+                    }
+                    Value::Array(values) => {
+                        for v in values {
+                            collect(v, urls);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for event in &session.events {
+                if event.kind == "search" {
+                    collect(&event.data["result"], &mut sources);
+                } else if event.kind == "decision" {
+                    collect(&event.data["sources"], &mut sources);
+                }
+            }
+            ensure!(
+                urls.iter().all(|url| sources.contains(url)),
+                "计划不能引用未经实际查询的网页"
+            );
+            let search_available = session.budget.max_searches > 0
+                && (e.settings.search.is_some() || e.profile.native_search_enabled);
+            ensure!(
+                !paths.is_empty() || !search_available || session.searches > 0,
+                "research_required: 尚无本地攻略依据，先尝试可用的攻略搜索"
+            );
+            let plan = json!({"steps":steps,"guide_paths":paths,"source_urls":urls,"research_summary":summary,"observation_id":o.id,"trial_mode":session.trial_mode});
+            e.runtime.repository.transaction(|data| { let s = data.sessions.get_mut(&e.session).unwrap(); s.execution_plan = plan.clone(); s.progress = json!(steps.iter().map(|step| json!({"name":step["description"],"state":"pending","expected":step["expected"]})).collect::<Vec<_>>()); Ok(()) })?;
+            e.event("plan", json!({"summary":summary,"plan":plan}))?;
+            Ok(json!({"planned":true,"authorization_changed":false}))
+        }
         "act" => {
+            ensure!(
+                e.runtime.repository.data.lock().sessions[&e.session]
+                    .execution_plan
+                    .is_object(),
+                "plan_required: 先查阅攻略并制定计划"
+            );
             let operation = required(&args, "operation_id")?;
             ensure!(
                 operation.len() <= 100 && !operation.chars().any(char::is_control),
@@ -295,6 +421,41 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
             required(&args, "expected")?;
             let consumption: Consumption = serde_json::from_value(args["consumption"].clone())?;
             let s = e.runtime.repository.data.lock().sessions[&e.session].clone();
+            if s.trial_mode {
+                ensure!(
+                    s.trial_operations < s.budget.max_trials,
+                    "trial_boundary: 自动试错次数已达到上限"
+                );
+                let reply = e.infer(json!({"mode":"check_trial_side_effect","action":args["action"],"observation_id":o.id,"account_confirmed":s.account,"instruction":"仅允许可恢复的导航或明确数量的常规体力动作；不允许替用户选择账号/区服、提交验证码、删除、购买、领取不明消费或承担无法判断的损失。返回 act arguments={reversible:boolean,consumption:{category,resource,quantity,purpose,evidence}}。不确定 reversible=false。"}).to_string(), &o, "trial_gate").await?;
+                let assessed: Consumption =
+                    serde_json::from_value(reply.decision.arguments["consumption"].clone())?;
+                ensure!(
+                    reply.decision.tool == "act"
+                        && reply.decision.arguments["reversible"] == true
+                        && matches!(
+                            assessed.category,
+                            store::Category::Navigation | store::Category::RegenerativeResource
+                        )
+                        && (assessed.category != store::Category::RegenerativeResource
+                            || assessed.quantity.is_some()),
+                    "trial_boundary: 该动作不适合自动试错，请用户处理"
+                );
+                ensure!(
+                    matches!(
+                        consumption.category,
+                        store::Category::Navigation | store::Category::RegenerativeResource
+                    ),
+                    "trial_boundary: 试错不使用额外资源，即使存在长期授权"
+                );
+                ensure!(
+                    assessed.category == consumption.category
+                        && assessed.resource == consumption.resource
+                        && assessed.quantity == consumption.quantity
+                        && assessed.purpose == consumption.purpose,
+                    "trial_boundary: 当前画面与动作声明不一致，先重新核实"
+                );
+                e.valid_observation(&o.id).await?;
+            }
             if s.account.is_some()
                 && !matches!(
                     consumption.category,
@@ -319,6 +480,13 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
                     "consumption_changed: 当前画面消耗已变化"
                 );
                 e.valid_observation(&o.id).await?;
+                e.runtime.repository.transaction(|data| {
+                    data.sessions
+                        .get_mut(&e.session)
+                        .unwrap()
+                        .account_reference_only = false;
+                    Ok(())
+                })?;
             }
             if !e.runtime.repository.gate(
                 &e.session,
@@ -335,7 +503,19 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
                     json!({"blocked":true,"reason":"approval_required","instruction":"完成其他允许部分后 finish 汇总"}),
                 );
             }
-            e.runtime.repository.transaction(|data|{data.sessions.get_mut(&e.session).unwrap().operations.insert(operation.into(),json!({"operation_id":operation,"descriptor":descriptor,"status":"outcome_unknown","observation_id":o.id}));Ok(())})?;
+            e.runtime.repository.transaction(|data| {
+                let s = data.sessions.get_mut(&e.session).unwrap();
+                ensure!(s.execution_plan.is_object(), "conversation_changed: 用户要求已更新，请重新制定计划");
+                if s.trial_mode {
+                    ensure!(
+                        s.trial_operations < s.budget.max_trials,
+                        "trial_boundary: 自动试错次数已达到上限"
+                    );
+                    s.trial_operations += 1;
+                }
+                s.operations.insert(operation.into(), json!({"operation_id":operation,"descriptor":descriptor,"status":"outcome_unknown","observation_id":o.id}));
+                Ok(())
+            })?;
             e.event("action",json!({"operation_id":operation,"action":args["action"],"observation_id":o.id,"expected":args["expected"]}))?;
             let result = crate::core::input_ownership::scope(
                 e.permit.clone(),
@@ -466,7 +646,18 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
                 );
             }
             let path = format!("guides/{}.json", store::id());
-            let value = json!({"schema":1,"app":session.app,"title":redact(required(&args,"title")?),"content":content,"conditions":redact(required(&args,"conditions")?),"sources":sources,"recorded_at":e.runtime.clock.now(),"supersedes":args["supersedes"],"author_status":"candidate"});
+            let user_message_refs: Vec<u64> = serde_json::from_value(
+                args.get("user_message_refs").cloned().unwrap_or(json!([])),
+            )?;
+            ensure!(
+                user_message_refs.len() <= 20
+                    && user_message_refs.iter().all(|seq| session
+                        .events
+                        .iter()
+                        .any(|event| event.seq == *seq && event.kind == "user_message")),
+                "用户经验引用必须来自当前会话的真实消息"
+            );
+            let value = json!({"schema":1,"app":session.app,"title":redact(required(&args,"title")?),"content":content,"conditions":redact(required(&args,"conditions")?),"sources":sources,"user_message_refs":user_message_refs,"recorded_at":e.runtime.clock.now(),"supersedes":args["supersedes"],"author_status":"candidate"});
             let entry = e.runtime.packages.write_text(
                 &package(e)?,
                 super::ID,
@@ -489,6 +680,15 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
             )
         }
         "call_automation" => {
+            let s = e.runtime.repository.data.lock().sessions[&e.session].clone();
+            ensure!(
+                s.execution_plan.is_object(),
+                "plan_required: 先查阅攻略并制定计划"
+            );
+            ensure!(
+                !s.trial_mode,
+                "trial_boundary: 自动试错只允许逐步可恢复动作，不执行整段自动化"
+            );
             let target = required(&args, "entrypoint")?;
             let payload = args["args"].as_object().cloned().unwrap_or_default();
             let policy = Arc::new(YamlPolicy {
@@ -521,6 +721,13 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
             Ok(json!({"allowed":allowed,"blocked":!allowed}))
         }
         "finish" => {
+            ensure!(
+                !e.runtime.repository.data.lock().sessions[&e.session]
+                    .questions
+                    .iter()
+                    .any(store::Question::pending),
+                "waiting_user: 尚有未回答问题"
+            );
             let goals = args["subgoals"]
                 .as_array()
                 .context("finish 必须列出全部子目标")?;
@@ -586,6 +793,13 @@ pub async fn execute(e: &Execution, name: &str, args: Value) -> Result<Value> {
                         .is_empty(),
                 "completion_unverified: 新画面未能验证目标完整完成"
             );
+            e.runtime.repository.transaction(|data| {
+                data.sessions
+                    .get_mut(&e.session)
+                    .unwrap()
+                    .account_reference_only = false;
+                Ok(())
+            })?;
             e.event("completion_verified",json!({"observation_id":fresh.id,"summary":summary,"subgoals":goals,"result":reply.decision.arguments["result"]}))?;
             e.runtime.repository.transaction(|data|{let s=data.sessions[&e.session].clone();for candidate in candidates.iter().filter(|candidate|reply.decision.arguments["validated_guides"].as_array().is_some_and(|paths|paths.contains(&candidate["path"]))){data.verifications.push(Verification{resource_instance:resource_instance(e,&s.package,candidate["path"].as_str().unwrap())?,package:s.package.clone(),generation:s.generation.clone(),path:candidate["path"].as_str().unwrap().into(),hash:candidate["hash"].as_str().unwrap().into(),session:e.session.clone(),observation:fresh.id.clone(),conditions:"当前目标、应用及本次画面验证".into()});}data.completions.push(json!({"session":s.id,"account":s.account,"cycle":s.cycle,"goal":s.goal,"generation":s.generation,"observation_id":fresh.id}));Ok(())})?;
             Ok(json!({"completed":true,"observation_id":fresh.id}))
@@ -601,6 +815,12 @@ struct YamlPolicy {
 impl crate::core::side_effect::Policy for YamlPolicy {
     async fn before(&self, context: &crate::core::AppContext, operation: Value) -> Result<()> {
         let e = &self.execution;
+        ensure!(
+            e.runtime.repository.data.lock().sessions[&e.session]
+                .execution_plan
+                .is_object(),
+            "conversation_changed: 用户要求已更新，请重新制定计划"
+        );
         ensure!(context == &e.context.app, "YAML parent context mismatch");
         let o = e.observe().await?;
         let identity = e.runtime.repository.data.lock().sessions[&e.session].clone();
@@ -611,6 +831,12 @@ impl crate::core::side_effect::Policy for YamlPolicy {
         );
         e.valid_observation(&o.id).await?;
         ensure!(
+            e.runtime.repository.data.lock().sessions[&e.session]
+                .execution_plan
+                .is_object(),
+            "conversation_changed: 用户要求已更新，请重新制定计划"
+        );
+        ensure!(
             identity.account.is_none() || reply.decision.arguments["account_consistent"] == true,
             "account_unverified: YAML 当前账号无法核实"
         );
@@ -618,6 +844,15 @@ impl crate::core::side_effect::Policy for YamlPolicy {
             identity.cycle.is_none() || reply.decision.arguments["cycle_consistent"] == true,
             "cycle_unverified: YAML 当前周期无法核实"
         );
+        if identity.account.is_some() {
+            e.runtime.repository.transaction(|data| {
+                data.sessions
+                    .get_mut(&e.session)
+                    .unwrap()
+                    .account_reference_only = false;
+                Ok(())
+            })?;
+        }
         let c: Consumption =
             serde_json::from_value(reply.decision.arguments["consumption"].clone())?;
         let semantic = store::hash(&serde_json::to_vec(
