@@ -809,11 +809,12 @@ mod keymap_wasmtime {
         screen: ScreenSize,
         event: InputEvent,
         trace: Option<KeymapTraceContext>,
+        control_identity: Option<crate::core::control::ControlIdentity>,
         reply: oneshot::Sender<ExtensionResult<InputResult>>,
     }
 
     enum Command {
-        Invoke(Invoke),
+        Invoke(Box<Invoke>),
         Stop(oneshot::Sender<()>),
     }
 
@@ -919,6 +920,7 @@ mod keymap_wasmtime {
 
                 let mut touches: HashMap<u64, (DeviceHandle, crate::capabilities::TouchHandle)> =
                     HashMap::new();
+                let mut last_control_identity: Option<crate::core::control::ControlIdentity> = None;
                 while let Some(command) = commands_rx.recv().await {
                     match command {
                         Command::Invoke(invoke) => {
@@ -930,6 +932,37 @@ mod keymap_wasmtime {
                                     continue;
                                 }
                             }
+                            let identity_changed =
+                                match (&last_control_identity, &invoke.control_identity) {
+                                    (Some(old), Some(current)) => !old.same_origin(current),
+                                    (None, None) => false,
+                                    _ => true,
+                                };
+                            if identity_changed {
+                                // A control barrier already released stale physical
+                                // contacts. Retire their exact handles and reset the
+                                // guest's held-key slots before accepting new input.
+                                for (_, (device, touch)) in touches.drain() {
+                                    let _ = executor
+                                        .execute(&device, &DeviceAction::TouchEnd { touch })
+                                        .await;
+                                }
+                                if let Err(error) = keymap
+                                    .call_start(&mut store, profile.as_deref())
+                                    .and_then(|result| result.map_err(wasmtime::Error::msg))
+                                {
+                                    let _ = invoke.reply.send(Err(ExtensionError::Runtime(
+                                        format!("keymap control reset failed: {error}"),
+                                    )));
+                                    continue;
+                                }
+                                // Keep only identity metadata, never a gate lease
+                                // between input messages (pause must still drain).
+                                last_control_identity = invoke
+                                    .control_identity
+                                    .as_ref()
+                                    .map(|identity| identity.detached());
+                            }
                             // Phase 6 E2E：wasm_begin 覆盖 guest 调用排队完成后的
                             // 实际执行起点（service 查找与命令队列排队计入
                             // Server Receive → WASM Begin 阶段）
@@ -937,7 +970,7 @@ mod keymap_wasmtime {
                             let guest_event = guest_event(&invoke.event);
                             let guest_result = keymap.call_handle(&mut store, &guest_event);
                             let wasm_end = Instant::now();
-                            let result = invoke_guest_result(
+                            let operation = invoke_guest_result(
                                 &host,
                                 &executor,
                                 &mut touches,
@@ -945,8 +978,12 @@ mod keymap_wasmtime {
                                 guest_result,
                                 wasm_begin,
                                 wasm_end,
-                            )
-                            .await;
+                            );
+                            let result = if let Some(identity) = &invoke.control_identity {
+                                identity.scope(operation).await
+                            } else {
+                                operation.await
+                            };
                             let _ = invoke.reply.send(result);
                         }
                         Command::Stop(reply) => {
@@ -1028,13 +1065,14 @@ mod keymap_wasmtime {
                 .ok_or(ExtensionError::RuntimeUnavailable("keymap WASM 实例不存在"))?;
             let (reply, wait) = oneshot::channel();
             commands
-                .send(Command::Invoke(Invoke {
+                .send(Command::Invoke(Box::new(Invoke {
+                    control_identity: crate::core::control::ControlIdentity::current(),
                     device,
                     screen,
                     event,
                     trace,
                     reply,
-                }))
+                })))
                 .await
                 .map_err(|_| ExtensionError::RuntimeUnavailable("keymap WASM 实例已退出"))?;
             wait.await
