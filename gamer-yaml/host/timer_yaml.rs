@@ -534,11 +534,6 @@ impl YamlTimerRunnerRegistrar {
 
 #[async_trait]
 impl crate::extensions::TimerRunnerRegistrar for YamlTimerRunnerRegistrar {
-    fn cancel_owned(&self, extension_id: &str) {
-        if extension_id == YAML_EXTENSION_ID {
-            self.runs.cancel_runner(YAML_EXTENSION_ID);
-        }
-    }
     async fn extension_started(&self, extension_id: &str) -> anyhow::Result<()> {
         if extension_id != YAML_EXTENSION_ID {
             return Ok(());

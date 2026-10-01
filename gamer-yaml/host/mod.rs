@@ -118,7 +118,7 @@ pub(crate) async fn run_yaml_program(
         )
     });
     service
-        .with_guest_for_run_cancel(&id, stop.clone(), move |wasm, host| async move {
+        .with_guest_for_run(&id, move |wasm, host| async move {
             yaml_runtime()
                 .run(yaml_extension::YamlWasmRunRequest {
                     wasm,

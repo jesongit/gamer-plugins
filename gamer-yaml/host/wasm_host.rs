@@ -293,7 +293,8 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     sink,
                     &name,
                     &serde_json::to_string(&args)?,
-                    (settings, notification),
+                    settings,
+                    notification,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&value)?)

@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +22,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &PathBuf) -> Result<Self> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -34,7 +34,7 @@ impl Settings {
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("通知通道配置损坏"))
     }
 
-    pub fn write(&mut self, path: &Path) -> Result<()> {
+    pub fn write(&mut self, path: &PathBuf) -> Result<()> {
         self.version = Some(uuid::Uuid::new_v4().to_string());
         let parent = path.parent().context("通知配置路径无效")?;
         std::fs::create_dir_all(parent)?;

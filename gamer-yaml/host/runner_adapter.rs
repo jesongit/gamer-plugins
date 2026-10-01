@@ -140,62 +140,6 @@ impl EngineExecutor {
             strict_args,
         })
     }
-
-    /// Same parent run, frozen YAML resources, and host-issued per-effect policy.
-    pub(crate) async fn execute_scoped(
-        &self,
-        context: &RunContext,
-        entrypoint: &str,
-        args: JsonMap<String, Value>,
-        stop: Arc<AtomicBool>,
-        scope: crate::core::side_effect::Scope,
-    ) -> anyhow::Result<()> {
-        let package = context
-            .app
-            .content_package
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Package Context 缺失"))?
-            .as_str();
-        let target = if let Some((pkg, function)) = entrypoint.split_once('#') {
-            anyhow::ensure!(
-                pkg == package && !function.is_empty(),
-                "automation scope mismatch"
-            );
-            RunTarget::Function {
-                pkg: pkg.into(),
-                function: function.into(),
-                start_index: 0,
-            }
-        } else {
-            anyhow::ensure!(
-                entrypoint.starts_with(&format!("{package}/")),
-                "automation scope mismatch"
-            );
-            RunTarget::Script {
-                script_id: entrypoint.into(),
-                start_index: 0,
-            }
-        };
-        let adapter = self
-            .yaml_vnext
-            .read()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("YAML runner unavailable"))?;
-        let _registration = crate::core::side_effect::register(stop.clone(), scope);
-        adapter
-            .execute(
-                &RunSpec {
-                    context: context.clone(),
-                    target,
-                    args,
-                    strict_args: true,
-                },
-                stop,
-            )
-            .await
-            .map(|_| ())
-    }
 }
 
 impl RunExecutor for EngineExecutor {
