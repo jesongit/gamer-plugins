@@ -1,5 +1,5 @@
 //! One tool dispatcher is shared by the local model and external MCP clients.
-use super::{mcp::ToolResult, required, Session, State};
+use super::{mcp::ToolResult, required, PauseReason, Session, State};
 use crate::{
     capabilities::{
         AppId, DeviceHandle, DeviceId, FrameStamp, KeyAction, SwipeGesture, TextInput, TouchPoint,
@@ -287,6 +287,9 @@ impl State {
             name.to_owned(),
             call_id.to_owned(),
         );
+        let diagnostic_name = name.clone();
+        let diagnostic_id = call_id.clone();
+        let diagnostic_args = public_arguments(&name, &args);
         let result = tokio::spawn(async move {
             state
                 .tool_inner(&owned_session, &name, args, &call_id, generation)
@@ -295,9 +298,29 @@ impl State {
         .await
         .context("工具任务异常结束")?;
         if let Err(error) = &result {
+            let already_recorded = session.record.lock().events.iter().any(|event| {
+                event.kind == "tool"
+                    && event.data["phase"] == "result"
+                    && event.data["call_id"] == diagnostic_id
+                    && event.data["generation"] == generation
+            });
+            if !already_recorded {
+                session.event("tool", format!("工具 {diagnostic_name} 未完成：{error}"), json!({"phase":"result","tool":diagnostic_name,"call_id":diagnostic_id,"generation":generation,"arguments":diagnostic_args,"ok":false,"result":{"error":error.to_string()}}));
+            }
             if error.to_string().contains("target_changed:") {
-                self.pause(session, format!("目标连接发生变化：{error}"))
-                    .await?;
+                self.pause_automatic(
+                    session,
+                    generation,
+                    PauseReason::new(
+                        "target_changed",
+                        "target",
+                        "目标连接发生变化",
+                        error.to_string(),
+                        "确认连接的目标后继续；浏览器绑定已更换时请开始新对话。",
+                        true,
+                    ),
+                )
+                .await?;
             }
         }
         result
@@ -348,12 +371,13 @@ impl State {
             "工具调用达到预算，请暂停处理"
         );
         ensure!(
-            record.usage.known_tokens < record.limits.max_tokens
-                && record.usage.active_seconds < record.limits.max_seconds as f64
-                && record
-                    .usage
-                    .total_tokens
-                    .is_none_or(|t| t < record.limits.max_tokens),
+            record.usage.active_seconds < record.limits.max_seconds as f64
+                && (record.limits.max_tokens == 0
+                    || (record.usage.known_tokens < record.limits.max_tokens
+                        && record
+                            .usage
+                            .total_tokens
+                            .is_none_or(|t| t < record.limits.max_tokens))),
             "活动时长或 token 使用达到预算，请暂停处理"
         );
         let lease = session
@@ -363,7 +387,16 @@ impl State {
             .as_ref()
             .context("控制会话未就绪")?
             .clone();
+        // Pause/resume may replace the lease while this request waits for it.
+        // Never let an old request borrow the resumed generation's authority.
+        ensure!(
+            lease.generation == generation
+                && lease.owner == record.session_id
+                && lease.target == record.device_id,
+            "stale_generation: 控制租约已换代，请使用当前会话代次"
+        );
         let handle = DeviceHandle::new(DeviceId::new(&record.device_id));
+        session.event("tool", format!("正在执行 {name}"), json!({"phase":"start","tool":name,"call_id":call_id,"generation":generation,"arguments":public_arguments(name,&args)}));
         let result=self.runtime.devices.controls.execute(&lease,async {
             if name=="screen_capture" {
                 let max_width=args.get("max_width").map_or(Ok(1280u32),|v|v.as_u64().and_then(|n|u32::try_from(n).ok()).context("max_width 必须为整数"))?;ensure!((320..=1920).contains(&max_width),"max_width 超出允许范围");
@@ -396,9 +429,10 @@ impl State {
                 "app_launch"|"app_stop"=> {let app=AppId::new(record.android_package.as_ref().context("当前设备没有配置应用")?);let device=self.runtime.capabilities.device().context("应用能力不可用")?;if name=="app_launch"{device.start_app(&handle,&app).await?;}else{device.stop_app(&handle,&app).await?;}},
                 _=>anyhow::bail!("未知操作"),
             }
-            session.frame.lock().take();session.event("tool",format!("已执行 {name}"),if name=="input_text"{json!({"tool":name,"text":"[已隐藏]"})}else{json!({"tool":name,"arguments":args})});Ok(ToolResult::json(json!({"ok":true,"observe_again":true})).value())
+            session.frame.lock().take();Ok(ToolResult::json(json!({"ok":true,"observe_again":true})).value())
         }).await;
         session.record.lock().usage.actions += 1;
+        session.event("tool", if result.is_ok() { format!("已执行 {name}") } else { format!("工具 {name} 执行失败") }, json!({"phase":"result","tool":name,"call_id":call_id,"generation":generation,"arguments":public_arguments(name,&args),"ok":result.is_ok(),"result":match &result {Ok(value)=>public_result(value),Err(error)=>json!({"error":error.to_string()})}}));
         // Cache failures too: retrying a timed-out call must never inject twice.
         let cached = match &result {
             Ok(value) => value.clone(),
@@ -420,6 +454,60 @@ impl State {
         }
         results.insert(key, json!({"fingerprint":fingerprint,"result":cached}));
         result
+    }
+}
+
+fn public_arguments(name: &str, args: &Value) -> Value {
+    let mut public = args.clone();
+    if name == "input_text" {
+        if let Some(object) = public.as_object_mut() {
+            object.insert("text".into(), json!("[已隐藏]"));
+        } else {
+            return json!({"invalid_args":true});
+        }
+    }
+    public
+}
+
+/// Timeline receipts carry metadata and errors, never raw image pixels.
+fn public_result(result: &Value) -> Value {
+    let content = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|block| {
+            if block["type"] == "image" {
+                json!({"type":"image","mimeType":block["mimeType"],"preview":"见画面观察记录"})
+            } else {
+                block.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({"content":content,"structuredContent":result["structuredContent"],"isError":result["isError"]})
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    #[test]
+    fn text_receipts_hide_typed_contents_and_image_receipts_only_retain_metadata() {
+        let args = public_arguments(
+            "input_text",
+            &json!({"frame_id":"f","text":"private typed content"}),
+        );
+        assert_eq!(args["frame_id"], "f");
+        assert_eq!(args["text"], "[已隐藏]");
+        assert!(!args.to_string().contains("private typed content"));
+        let invalid = public_arguments("input_text", &json!("private malformed content"));
+        assert_eq!(invalid["invalid_args"], true);
+        assert!(!invalid.to_string().contains("private malformed content"));
+        let result = public_result(
+            &ToolResult::image(&[1, 2, 3], "image/png", json!({"frame_id":"f"})).value(),
+        );
+        assert_eq!(result["structuredContent"]["frame_id"], "f");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert!(result["content"][1].get("data").is_none());
     }
 }
 

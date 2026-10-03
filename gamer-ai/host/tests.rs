@@ -89,10 +89,43 @@ fn record() -> SessionRecord {
         state: "running".into(),
         generation: 1,
         reason: None,
+        pause_reason: None,
+        messages: vec![UserMessage::new("goal")],
         limits: Limits::default(),
         usage: Usage::default(),
         events: vec![],
     }
+}
+fn session_record(record: SessionRecord, lease: Option<ControlLease>) -> Arc<Session> {
+    Arc::new(Session {
+        record: Mutex::new(record),
+        lease: AsyncMutex::new(lease),
+        transition: AsyncMutex::new(()),
+        operation: AsyncMutex::new(()),
+        cancelled: Mutex::new(Arc::new(AtomicBool::new(false))),
+        ending: AtomicBool::new(false),
+        wake: Notify::new(),
+        deadline: Mutex::new(Instant::now() + Duration::from_secs(120)),
+        active_since: Mutex::new(None),
+        frame: Mutex::new(None),
+        binding: Mutex::new(None),
+        results: Mutex::new(BTreeMap::new()),
+    })
+}
+async fn controlled_session(ai: &AiService) -> Arc<Session> {
+    let mut r = record();
+    let lease = ai
+        .state
+        .runtime
+        .devices
+        .controls
+        .claim(&r.device_id, &r.session_id)
+        .await
+        .unwrap();
+    r.generation = lease.generation;
+    let session = session_record(r, Some(lease));
+    ai.state.sessions.lock().insert("s".into(), session.clone());
+    session
 }
 #[test]
 fn budgets_are_bounded_and_tokens_unknown_are_not_zero() {
@@ -111,6 +144,358 @@ fn budgets_are_bounded_and_tokens_unknown_are_not_zero() {
     .is_err());
     assert!(constant_eq("abc", "abc"));
     assert!(!constant_eq("abc", "abd"));
+}
+
+#[test]
+fn unlimited_tokens_preserve_usage_and_other_hard_budgets() {
+    let mut r = record();
+    r.limits.max_tokens = 0;
+    r.limits.validate().unwrap();
+    r.usage.known_tokens = 900_000;
+    r.usage.has_unknown_tokens = true;
+    r.usage.total_tokens = None;
+    assert!(budget_reason(&r).is_none());
+    ensure_budget_available(&r).unwrap();
+    assert_eq!(r.usage.known_tokens, 900_000);
+    r.usage.actions = r.limits.max_actions;
+    assert_eq!(budget_reason(&r).unwrap().code, "budget_actions");
+    r.usage.actions = 0;
+    r.usage.active_seconds = r.limits.max_seconds as f64;
+    assert_eq!(budget_reason(&r).unwrap().code, "budget_seconds");
+}
+
+#[test]
+fn finite_token_budget_reports_the_known_lower_bound_when_total_is_unknown() {
+    let mut r = record();
+    r.usage.known_tokens = 105_396;
+    r.usage.has_unknown_tokens = true;
+    let reason = budget_reason(&r).unwrap();
+    assert_eq!(reason.code, "budget_tokens");
+    assert_eq!(reason.source, "budget");
+    assert!(reason.detail.contains("至少 105396"));
+    assert!(reason.detail.contains("100000"));
+    assert!(reason.detail.contains("总量未知"));
+    let error = ensure_budget_available(&r).unwrap_err().to_string();
+    assert!(error.contains("budget_tokens"));
+    assert!(error.contains("上限"));
+    assert!(error.contains("不会清零"));
+    assert!(optional_limits(&json!({"limits":{"max_tokens":0}})).is_err());
+    r.limits.max_tokens = 0;
+    assert_eq!(
+        optional_limits(&json!({"limits":r.limits}))
+            .unwrap()
+            .unwrap()
+            .max_tokens,
+        0
+    );
+}
+
+#[tokio::test]
+async fn exhausted_budget_resume_does_not_flash_running_or_change_generation() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_session(&ai).await;
+    {
+        let mut record = session.record.lock();
+        record.usage.known_tokens = record.limits.max_tokens;
+        record.usage.consecutive_failures = 3;
+    }
+    let reason = budget_reason(&session.record.lock()).unwrap();
+    let generation = session.record.lock().generation;
+    ai.state
+        .pause_automatic(&session, generation, reason)
+        .await
+        .unwrap();
+    let paused = session.record.lock().generation;
+    let error = ai.state.resume(&session, None).await.unwrap_err();
+    assert!(error.to_string().contains("budget_tokens"));
+    let mut insufficient = session.record.lock().limits.clone();
+    insufficient.max_tokens = 2048;
+    assert!(ai
+        .state
+        .resume(&session, Some(insufficient))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("budget_tokens"));
+    let record = session.record.lock();
+    assert_eq!(record.state, "paused");
+    assert_eq!(record.generation, paused);
+    assert_eq!(record.usage.consecutive_failures, 3);
+    assert_eq!(record.limits.max_tokens, 100_000);
+    assert_eq!(record.pause_reason.as_ref().unwrap().code, "budget_tokens");
+    assert_eq!(record.events.last().unwrap().data["state"], "paused");
+    assert!(ai.state.runtime.devices.controls.status("d").manual_allowed);
+}
+
+#[tokio::test]
+async fn new_message_waits_for_admitted_input_before_becoming_available_to_manual() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_session(&ai).await;
+    let lease = session.lease.lock().await.clone().unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let controls = ai.state.runtime.devices.controls.clone();
+    let operation = tokio::spawn(async move {
+        controls
+            .execute(&lease, async move {
+                entered_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    entered_rx.await.unwrap();
+    let sender = {
+        let ai = ai.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            ai.state
+                .message(&session, "先打开设置，再调整画质", false, None)
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.record.lock().state != "pausing" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!sender.is_finished());
+    assert_eq!(session.record.lock().messages.len(), 1);
+    assert!(!ai.state.runtime.devices.controls.status("d").manual_allowed);
+    release_tx.send(()).unwrap();
+    operation.await.unwrap();
+    let response = sender.await.unwrap();
+    assert_eq!(response["session"]["state"], "paused");
+    assert_eq!(response["resumed"], false);
+    assert_eq!(response["session"]["messages"].as_array().unwrap().len(), 2);
+    assert!(ai.state.runtime.devices.controls.status("d").manual_allowed);
+    let record = session.record.lock();
+    assert_eq!(record.events.last().unwrap().kind, "user");
+    assert_eq!(
+        record.events.last().unwrap().data["message_id"],
+        response["message"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn old_generation_automatic_pause_cannot_pause_a_resumed_owner() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_session(&ai).await;
+    let original = session.lease.lock().await.clone().unwrap();
+    let held = session.transition.lock().await;
+    let late = {
+        let ai = ai.clone();
+        let session = session.clone();
+        let generation = original.generation;
+        tokio::spawn(async move {
+            ai.state
+                .pause_automatic(
+                    &session,
+                    generation,
+                    PauseReason::new(
+                        "model_request_failed",
+                        "model",
+                        "旧请求失败",
+                        "旧代次错误",
+                        "检查连接",
+                        true,
+                    ),
+                )
+                .await
+                .unwrap()
+        })
+    };
+    let controls = &ai.state.runtime.devices.controls;
+    let paused = controls.pause(&original, async { Ok(()) }).await.unwrap();
+    let resumed = controls.resume(&paused, async { Ok(()) }).await.unwrap();
+    session.record.lock().generation = resumed.generation;
+    *session.lease.lock().await = Some(resumed.clone());
+    drop(held);
+    late.await.unwrap();
+    assert_eq!(session.record.lock().state, "running");
+    assert_eq!(session.record.lock().generation, resumed.generation);
+    assert!(session.record.lock().pause_reason.is_none());
+    assert!(!controls.status("d").manual_allowed);
+}
+
+#[tokio::test]
+async fn old_finish_waiting_for_lease_cannot_borrow_the_resumed_generation() {
+    let (_root, ai, _extensions) = fixture().await;
+    let target = crate::browser::BrowserTarget {
+        id: "browser-lease-race".into(),
+        name: "lease race".into(),
+        url: "http://localhost/".into(),
+        profile_id: "lease-race".into(),
+        width: 640,
+        height: 480,
+    };
+    ai.state
+        .runtime
+        .devices
+        .browsers
+        .db
+        .save_browser_target(target.clone())
+        .unwrap();
+    let controls = &ai.state.runtime.devices.controls;
+    let original = controls.claim(&target.id, "s").await.unwrap();
+    let mut record = record();
+    record.device_id = target.id.clone();
+    record.generation = original.generation;
+    let session = session_record(record, Some(original.clone()));
+    let mut held = session.lease.lock().await;
+    let late = {
+        let ai = ai.clone();
+        let session = session.clone();
+        let generation = original.generation;
+        tokio::spawn(async move {
+            ai.state
+                .tool(
+                    &session,
+                    "session_finish",
+                    json!({"message":"旧代次的结束指令"}),
+                    "old-finish",
+                    generation,
+                )
+                .await
+        })
+    };
+    // On the single-thread test runtime, the worker runs synchronously after
+    // operation admission until its next await: our deliberately held lease.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.operation.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!late.is_finished());
+    let paused = controls.pause(&original, async { Ok(()) }).await.unwrap();
+    let resumed = controls.resume(&paused, async { Ok(()) }).await.unwrap();
+    session.record.lock().generation = resumed.generation;
+    *held = Some(resumed.clone());
+    drop(held);
+    let error = late.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("stale_generation"));
+    assert!(
+        !session.ending.load(Ordering::Acquire),
+        "A stale session_finish must not end the resumed owner"
+    );
+    assert_eq!(session.record.lock().state, "running");
+    assert_eq!(session.record.lock().generation, resumed.generation);
+    assert_eq!(session.record.lock().usage.actions, 0);
+    assert_eq!(
+        controls.status(&target.id).phase,
+        crate::core::control::ControlPhase::Running
+    );
+    assert!(!controls.status(&target.id).manual_allowed);
+    // No browser process or device session was created for this race test.
+    assert!(ai
+        .state
+        .runtime
+        .devices
+        .browsers
+        .session(&target.id)
+        .is_err());
+}
+
+#[tokio::test]
+async fn accepted_message_has_a_receipt_even_when_resume_configuration_is_missing() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_session(&ai).await;
+    ai.state.pause(&session, "用户暂停".into()).await.unwrap();
+    let response = ai
+        .state
+        .message(&session, "改为点击左侧菜单", true, None)
+        .await
+        .unwrap();
+    assert_eq!(response["resumed"], false);
+    assert!(response["resume_error"].is_string());
+    assert_eq!(session.record.lock().state, "paused");
+    assert_eq!(session.record.lock().messages.len(), 2);
+    let history = generation_history(&session.record.lock());
+    assert!(history
+        .iter()
+        .any(|item| item["content"][0]["text"] == "改为点击左侧菜单"));
+    session.record.lock().mode = "mcp".into();
+    assert!(ai
+        .state
+        .message(&session, "不应写入", false, None)
+        .await
+        .is_err());
+    assert_eq!(session.record.lock().messages.len(), 2);
+    session.record.lock().mode = "api".into();
+    session.record.lock().messages = (0..64)
+        .map(|_| UserMessage::new("不可丢弃的指令"))
+        .collect();
+    assert!(ai
+        .state
+        .message(&session, "第65条", false, None)
+        .await
+        .is_err());
+    assert_eq!(session.record.lock().messages.len(), 64);
+    ai.state.stop(&session, "cancelled").await.unwrap();
+    assert_eq!(session.record.lock().state, "finished");
+    assert!(ai
+        .state
+        .message(&session, "已结束不能追加", false, None)
+        .await
+        .is_err());
+    assert_eq!(session.record.lock().messages.len(), 64);
+}
+
+#[test]
+fn new_generation_rebuild_keeps_every_instruction_and_only_public_receipts() {
+    let mut r = record();
+    r.messages.push(UserMessage::new("现在先打开设置"));
+    r.events.push(Event {
+        seq: 1,
+        at: "now".into(),
+        kind: "assistant".into(),
+        message: "已打开菜单".into(),
+        data: json!({}),
+    });
+    r.events.push(Event {
+        seq: 2,
+        at: "now".into(),
+        kind: "tool".into(),
+        message: "已执行 input_tap".into(),
+        data: json!({"phase":"result","ok":true,"result":{"ok":true}}),
+    });
+    let history = generation_history(&r);
+    let serialized = json!(history).to_string();
+    assert!(serialized.contains("已打开菜单"));
+    assert!(serialized.contains("已执行 input_tap"));
+    assert!(serialized.contains("现在先打开设置"));
+    assert!(serialized.contains("goal"));
+    assert!(
+        !serialized.contains("function_call"),
+        "Rebuilt summaries must not create unpaired tool calls"
+    );
+}
+
+#[test]
+fn stale_observation_and_results_cannot_borrow_new_generation_cancellation_or_failures() {
+    let session = session_record(record(), None);
+    let original = session.generation_cancel(1).unwrap();
+    session.cancel_generation();
+    session.record.lock().generation = 2;
+    *session.cancelled.lock() = Arc::new(AtomicBool::new(false));
+    assert!(original.load(Ordering::Acquire));
+    assert!(session.generation_cancel(1).is_none());
+    assert!(!session
+        .generation_cancel(2)
+        .unwrap()
+        .load(Ordering::Acquire));
+    session.record.lock().usage.consecutive_failures = 2;
+    assert!(session.update_failures(1, true).is_none());
+    assert!(session.update_failures(1, false).is_none());
+    assert_eq!(session.record.lock().usage.consecutive_failures, 2);
+    assert_eq!(session.update_failures(2, false), Some(3));
+    assert_eq!(session.update_failures(2, true), Some(0));
 }
 
 #[test]
@@ -433,7 +818,30 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
         .manual(&target.id, async { Ok(()) })
         .await
         .unwrap();
-    ai.state.resume(&session).await.unwrap();
+    // Token accounting remains cumulative. Explicitly changing the paused
+    // limit to zero permits continuation without erasing unknown usage.
+    {
+        let mut record = session.record.lock();
+        record.usage.known_tokens = record.limits.max_tokens + 100;
+        record.usage.has_unknown_tokens = true;
+        record.usage.total_tokens = None;
+        record.usage.consecutive_failures = 3;
+    }
+    assert!(ai
+        .state
+        .resume(&session, None)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("budget_tokens"));
+    assert_eq!(session.record.lock().state, "paused");
+    let mut unlimited = session.record.lock().limits.clone();
+    unlimited.max_tokens = 0;
+    ai.state.resume(&session, Some(unlimited)).await.unwrap();
+    assert_eq!(session.record.lock().usage.known_tokens, 100_100);
+    assert!(session.record.lock().usage.has_unknown_tokens);
+    assert_eq!(session.record.lock().usage.consecutive_failures, 0);
+    assert_eq!(session.record.lock().limits.max_tokens, 0);
     assert_ne!(session.record.lock().generation, generation);
     assert!(ai
         .state
@@ -578,7 +986,36 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
             .status(&target.id)
             .manual_allowed
     );
+    let paused_generation = stalled.record.lock().generation;
+    let queued = ai
+        .dispatch(
+            "session.message",
+            json!({"session_id":started["session_id"],"message":"先确认菜单位置，保持暂停"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["resumed"], false);
+    assert_eq!(stalled.record.lock().state, "paused");
+    assert_eq!(stalled.record.lock().generation, paused_generation);
+    let before = stalled.record.lock().usage.active_seconds;
+    let mut continued = stalled.record.lock().limits.clone();
+    continued.max_seconds = 600;
+    continued.max_tokens = 0;
+    stall.store(false, Ordering::Release);
+    let resumed = ai.dispatch("session.message", json!({"session_id":started["session_id"],"message":"确认后结束本次测试","resume":true,"limits":continued})).await.unwrap();
+    assert_eq!(resumed["resumed"], true);
+    assert_ne!(stalled.record.lock().generation, paused_generation);
+    assert!(stalled.record.lock().usage.active_seconds >= before);
+    assert_eq!(stalled.record.lock().messages.len(), 3);
+    wait_state(&stalled, "finished").await;
     ai.state.stop(&stalled, "cancelled").await.unwrap();
+    assert!(ai
+        .dispatch(
+            "session.message",
+            json!({"session_id":started["session_id"],"message":"结束后不能操作"})
+        )
+        .await
+        .is_err());
     ai.state
         .runtime
         .devices

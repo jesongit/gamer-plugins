@@ -51,6 +51,7 @@ pub const ACTIONS: &[&str] = &[
     "connection.probe",
     "session.start",
     "session.get",
+    "session.message",
     "session.pause",
     "session.resume",
     "session.stop",
@@ -128,7 +129,7 @@ impl Limits {
             (1..=500).contains(&self.max_turns)
                 && (1..=2000).contains(&self.max_actions)
                 && (10..=7200).contains(&self.max_seconds)
-                && (2048..=2_000_000).contains(&self.max_tokens)
+                && (self.max_tokens == 0 || (2048..=2_000_000).contains(&self.max_tokens))
                 && (1..=20).contains(&self.max_failures),
             "运行预算超出允许范围"
         );
@@ -154,6 +155,63 @@ pub struct Event {
     pub data: Value,
 }
 #[derive(Clone, Serialize)]
+pub struct UserMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub at: String,
+}
+impl UserMessage {
+    fn new(text: &str) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: "user".into(),
+            text: text.into(),
+            at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+#[derive(Clone, Serialize)]
+pub struct PauseReason {
+    pub code: String,
+    pub source: String,
+    pub title: String,
+    pub detail: String,
+    pub suggestion: String,
+    pub at: String,
+    pub retryable: bool,
+}
+impl PauseReason {
+    fn new(
+        code: &str,
+        source: &str,
+        title: &str,
+        detail: impl Into<String>,
+        suggestion: &str,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            source: source.into(),
+            title: title.into(),
+            detail: detail.into(),
+            suggestion: suggestion.into(),
+            at: Utc::now().to_rfc3339(),
+            retryable,
+        }
+    }
+    fn user(title: &str) -> Self {
+        Self::new(
+            "user_pause",
+            "user",
+            title,
+            "已排空 AI 操作并释放输入，可人工操作或发送后续指令。",
+            "确认后点击继续，AI 会重新观察画面。",
+            true,
+        )
+    }
+}
+#[derive(Clone, Serialize)]
 pub struct SessionRecord {
     pub session_id: String,
     pub run_id: String,
@@ -165,6 +223,8 @@ pub struct SessionRecord {
     pub state: String,
     pub generation: u64,
     pub reason: Option<String>,
+    pub pause_reason: Option<PauseReason>,
+    pub messages: Vec<UserMessage>,
     pub limits: Limits,
     pub usage: Usage,
     pub events: Vec<Event>,
@@ -233,6 +293,9 @@ impl Session {
         }
         r.state = state.into();
         r.reason = reason;
+        if matches!(state, "running" | "finished") {
+            r.pause_reason = None;
+        }
     }
     fn charge_time(&self) {
         let mut r = self.record.lock();
@@ -245,6 +308,28 @@ impl Session {
     fn cancel_generation(&self) {
         self.cancelled.lock().store(true, Ordering::Release);
         self.wake.notify_waiters();
+    }
+    fn generation_cancel(&self, generation: u64) -> Option<Arc<AtomicBool>> {
+        let record = self.record.lock();
+        (record.state == "running"
+            && record.generation == generation
+            && !self.ending.load(Ordering::Acquire))
+        .then(|| self.cancelled.lock().clone())
+    }
+    fn update_failures(&self, generation: u64, success: bool) -> Option<u32> {
+        let mut record = self.record.lock();
+        if record.state != "running"
+            || record.generation != generation
+            || self.ending.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        record.usage.consecutive_failures = if success {
+            0
+        } else {
+            record.usage.consecutive_failures.saturating_add(1)
+        };
+        Some(record.usage.consecutive_failures)
     }
 }
 
@@ -341,11 +426,29 @@ impl AiService {
                     json!({"run_id":record.run_id,"session_id":session.record.lock().session_id,"state":"starting"}),
                 )
             }
+            "session.message" => {
+                let session = self.state.session(required(&values, "session_id")?)?;
+                let resume = values.get("resume").map_or(Ok(false), |value| {
+                    value.as_bool().context("resume 必须为布尔值")
+                })?;
+                self.state
+                    .message(
+                        &session,
+                        required(&values, "message")?,
+                        resume,
+                        optional_limits(&values)?,
+                    )
+                    .await
+            }
             "session.pause" | "session.resume" | "session.stop" => {
                 let session = self.state.session(required(&values, "session_id")?)?;
                 match action {
                     "session.pause" => self.state.pause(&session, "用户暂停".into()).await?,
-                    "session.resume" => self.state.resume(&session).await?,
+                    "session.resume" => {
+                        self.state
+                            .resume(&session, optional_limits(&values)?)
+                            .await?
+                    }
                     _ => {
                         self.state.stop(&session, "cancelled").await?;
                     }
@@ -373,8 +476,20 @@ impl AiService {
                                 && r.content_package == token.content_package
                         };
                         if matched {
+                            let generation = session.record.lock().generation;
                             self.state
-                                .pause(&session, "MCP 连接令牌已撤销".into())
+                                .pause_automatic(
+                                    &session,
+                                    generation,
+                                    PauseReason::new(
+                                        "mcp_revoked",
+                                        "mcp",
+                                        "MCP 连接令牌已撤销",
+                                        "外部 AI 的控制令牌已被撤销，停止接受该连接的操作。",
+                                        "创建并连接新的控制令牌，再由用户恢复会话。",
+                                        true,
+                                    ),
+                                )
                                 .await?;
                         }
                     }
@@ -496,6 +611,12 @@ impl State {
                 state: "starting".into(),
                 generation: 0,
                 reason: None,
+                pause_reason: None,
+                messages: if goal.is_empty() {
+                    vec![]
+                } else {
+                    vec![UserMessage::new(goal)]
+                },
                 limits,
                 usage: Usage::default(),
                 events: vec![],
@@ -572,7 +693,16 @@ impl State {
         ) {
             Ok(record) => {
                 session.record.lock().run_id = record.run_id.clone();
-                session.event("state", "AI 会话已创建", json!({}));
+                let initial_message = session.record.lock().messages.first().cloned();
+                if let Some(message) = initial_message {
+                    session.event("user", message.text, json!({"message_id":message.id}));
+                }
+                let generation = session.record.lock().generation;
+                session.event(
+                    "state",
+                    "AI 会话已创建",
+                    json!({"state":"starting","code":"created","generation":generation}),
+                );
                 Ok((record, session))
             }
             Err(error) => {
@@ -586,6 +716,33 @@ impl State {
     }
     async fn pause(&self, session: &Arc<Session>, reason: String) -> Result<()> {
         let _transition = session.transition.lock().await;
+        self.pause_locked(session, PauseReason::user(&reason), None)
+            .await
+    }
+    async fn pause_automatic(
+        &self,
+        session: &Arc<Session>,
+        generation: u64,
+        reason: PauseReason,
+    ) -> Result<()> {
+        let _transition = session.transition.lock().await;
+        self.pause_locked(session, reason, Some(generation)).await
+    }
+    /// A stale model/tool result must never pause the generation the user just resumed.
+    async fn pause_locked(
+        &self,
+        session: &Arc<Session>,
+        reason: PauseReason,
+        generation: Option<u64>,
+    ) -> Result<()> {
+        if generation.is_some_and(|expected| {
+            let record = session.record.lock();
+            record.generation != expected
+                || record.state != "running"
+                || session.ending.load(Ordering::Acquire)
+        }) {
+            return Ok(());
+        }
         let state = session.record.lock().state.clone();
         if state == "paused" {
             return Ok(());
@@ -596,9 +753,12 @@ impl State {
         );
         let mut lease = session.lease.lock().await;
         let current = lease.as_ref().context("会话尚未就绪，请稍后暂停")?.clone();
-        session.set_state("pausing", Some(reason.clone()));
+        session.record.lock().pause_reason = Some(reason.clone());
+        session.set_state("pausing", Some(reason.title.clone()));
         session.cancel_generation();
-        let next = self
+        let generation = session.record.lock().generation;
+        session.event("state", "正在暂停 AI，等待已入场操作结束", json!({"state":"pausing","code":reason.code,"generation":generation,"pause_reason":reason,"manual_allowed":false}));
+        let next = match self
             .runtime
             .devices
             .controls
@@ -606,19 +766,57 @@ impl State {
                 &current,
                 self.runtime.devices.release_control_inputs(&current.target),
             )
-            .await?;
+            .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                let failed = PauseReason::new(
+                    "pause_cleanup_failed",
+                    "core",
+                    "暂停输入收尾失败",
+                    error.to_string(),
+                    "输入尚未释放，请停止会话并等待清理完成。",
+                    false,
+                );
+                session.record.lock().pause_reason = Some(failed.clone());
+                session.set_state("pausing", Some(failed.title.clone()));
+                session.event("state", failed.title.clone(), json!({"state":"pausing","code":failed.code,"generation":generation,"pause_reason":failed,"manual_allowed":false}));
+                return Err(error);
+            }
+        };
         session.record.lock().generation = next.generation;
         *lease = Some(next);
         session.frame.lock().take();
-        session.set_state("paused", Some(reason.clone()));
-        session.event("state", reason, json!({"manual_allowed":true}));
+        session.set_state("paused", Some(reason.title.clone()));
+        let record = session.record.lock().clone();
+        session.event(
+            "state",
+            format!("AI 已暂停：{}", reason.title),
+            json!({
+                "state":"paused", "code":reason.code, "generation":record.generation,
+                "pause_reason":reason, "usage":record.usage, "limits":record.limits,
+                "manual_allowed":true
+            }),
+        );
         Ok(())
     }
-    async fn resume(&self, session: &Arc<Session>) -> Result<()> {
+    async fn resume(&self, session: &Arc<Session>, limits: Option<Limits>) -> Result<()> {
         self.authorize(None)?;
         let _transition = session.transition.lock().await;
+        self.resume_locked(session, limits).await
+    }
+    async fn resume_locked(&self, session: &Arc<Session>, limits: Option<Limits>) -> Result<()> {
         ensure!(session.record.lock().state == "paused", "当前会话没有暂停");
-        let r = session.record.lock().clone();
+        ensure!(
+            !session.ending.load(Ordering::Acquire),
+            "会话正在结束，不能继续"
+        );
+        let mut r = session.record.lock().clone();
+        if let Some(limits) = &limits {
+            limits.validate()?;
+            r.limits = limits.clone();
+        }
+        ensure_budget_available(&r)?;
         if r.mode == "api" {
             self.settings.connection()?;
         }
@@ -647,7 +845,8 @@ impl State {
         let mut lease = session.lease.lock().await;
         let current = lease.as_ref().context("控制会话不存在")?.clone();
         session.set_state("resuming", None);
-        let next = self
+        session.event("state", "正在收回人工输入，准备恢复 AI", json!({"state":"resuming","code":"resume_requested","generation":r.generation,"manual_allowed":false}));
+        let next = match self
             .runtime
             .devices
             .controls
@@ -655,8 +854,34 @@ impl State {
                 &current,
                 self.runtime.devices.release_control_inputs(&r.device_id),
             )
-            .await?;
-        session.record.lock().generation = next.generation;
+            .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                // Core intentionally keeps its gate closed when input cleanup
+                // fails. It is not a completed pause and cannot admit manual.
+                let failed = PauseReason::new(
+                    "resume_cleanup_failed",
+                    "core",
+                    "恢复输入收尾失败",
+                    error.to_string(),
+                    "输入仲裁仍在恢复屏障中，请停止会话并等待清理完成。",
+                    false,
+                );
+                session.record.lock().pause_reason = Some(failed.clone());
+                session.set_state("resuming", Some(failed.title.clone()));
+                session.event("state", failed.title.clone(), json!({"code":failed.code,"state":"resuming","generation":r.generation,"pause_reason":failed,"manual_allowed":false}));
+                return Err(error);
+            }
+        };
+        {
+            let mut record = session.record.lock();
+            record.generation = next.generation;
+            record.usage.consecutive_failures = 0;
+            if let Some(limits) = limits {
+                record.limits = limits;
+            }
+        }
         *lease = Some(next);
         *session.cancelled.lock() = Arc::new(AtomicBool::new(false));
         session.frame.lock().take();
@@ -666,17 +891,115 @@ impl State {
         }
         *session.deadline.lock() = Instant::now() + Duration::from_secs(120);
         session.set_state("running", None);
-        session.event("state", "AI 已恢复，将重新观察画面", json!({}));
+        let generation = session.record.lock().generation;
+        session.event(
+            "state",
+            "AI 已恢复，将重新观察画面",
+            json!({"state":"running","code":"resumed","generation":generation}),
+        );
         session.wake.notify_waiters();
         Ok(())
     }
+    async fn message(
+        &self,
+        session: &Arc<Session>,
+        text: &str,
+        resume: bool,
+        limits: Option<Limits>,
+    ) -> Result<Value> {
+        self.authorize(None)?;
+        let text = text.trim();
+        ensure!(
+            !text.is_empty() && text.len() <= 8000,
+            "消息不能为空或超过 8000 字节"
+        );
+        if let Some(limits) = &limits {
+            limits.validate()?;
+        }
+        let _transition = session.transition.lock().await;
+        let record = session.record.lock().clone();
+        ensure!(
+            record.mode == "api",
+            "外部 MCP 会话由外部 AI 接收指令，请在外部客户端继续对话"
+        );
+        ensure!(
+            matches!(record.state.as_str(), "running" | "starting" | "paused")
+                && !session.ending.load(Ordering::Acquire),
+            "会话已结束或正在结束，请开始新对话"
+        );
+        ensure!(
+            record.messages.len() < 64,
+            "本次对话已达到 64 条用户消息上限，请开始新对话"
+        );
+        if record.state != "paused" {
+            self.pause_locked(
+                session,
+                PauseReason::new(
+                    "user_instruction",
+                    "user",
+                    "收到新的用户指令",
+                    "已暂停当前 AI 操作，等待纳入新的指令。",
+                    "发送并继续会重新观察画面；仅发送则保持暂停。",
+                    true,
+                ),
+                None,
+            )
+            .await?;
+        }
+        ensure!(
+            !session.ending.load(Ordering::Acquire),
+            "会话正在结束，消息未发送"
+        );
+        let mut candidate = session.record.lock().clone();
+        if let Some(limits) = &limits {
+            candidate.limits = limits.clone();
+        }
+        if resume {
+            ensure_budget_available(&candidate)?;
+        }
+        let message = UserMessage::new(text);
+        {
+            let mut record = session.record.lock();
+            record.messages.push(message.clone());
+            if let Some(limits) = &limits {
+                record.limits = limits.clone();
+            }
+        }
+        session.event(
+            "user",
+            text,
+            json!({"message_id":message.id,"delivery":"queued"}),
+        );
+        // The message is accepted once appended. A failed resume returns its
+        // error alongside that receipt, so the UI must not resend the message.
+        let resume_error = if resume {
+            self.resume_locked(session, None)
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
+        Ok(
+            json!({"message":message,"session":session.record.lock().clone(),"resumed":resume && resume_error.is_none(),"resume_error":resume_error}),
+        )
+    }
     async fn stop(&self, session: &Arc<Session>, reason: &str) -> Result<()> {
         let run_id = session.record.lock().run_id.clone();
-        if session.record.lock().state != "finished" {
-            session.set_state("stopping", Some(reason.into()));
-            session.ending.store(true, Ordering::Release);
-            session.cancel_generation();
-            self.runtime.runs.cancel(&run_id);
+        {
+            let _transition = session.transition.lock().await;
+            if session.record.lock().state != "finished" {
+                session.set_state("stopping", Some(reason.into()));
+                session.ending.store(true, Ordering::Release);
+                session.cancel_generation();
+                self.runtime.runs.cancel(&run_id);
+                let generation = session.record.lock().generation;
+                session.event(
+                    "state",
+                    "正在停止 AI 会话，等待输入收尾",
+                    json!({"state":"stopping","code":"stop_requested","generation":generation}),
+                );
+            }
         }
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -712,7 +1035,12 @@ impl State {
         }
         held.take();
         session.set_state("finished", Some(reason.into()));
-        session.event("state", format!("会话结束：{reason}"), json!({}));
+        let generation = session.record.lock().generation;
+        session.event(
+            "state",
+            format!("会话结束：{reason}"),
+            json!({"state":"finished","code":reason,"generation":generation}),
+        );
         session.wake.notify_waiters();
         Ok(())
     }
@@ -915,13 +1243,25 @@ impl State {
             session.charge_time();
             let budget = { budget_reason(&session.record.lock()) };
             if let Some(reason) = budget {
-                self.pause(session, reason).await?;
+                self.pause_automatic(session, record.generation, reason)
+                    .await?;
                 continue;
             }
             if mode == "mcp" {
                 if Instant::now() > *session.deadline.lock() {
-                    self.pause(session, "MCP 控制租约到期，请重新连接后由用户恢复".into())
-                        .await?;
+                    self.pause_automatic(
+                        session,
+                        record.generation,
+                        PauseReason::new(
+                            "mcp_expired",
+                            "mcp",
+                            "MCP 控制租约到期，请重新连接后由用户恢复",
+                            "外部 AI 在控制租约内没有续期，已停止接受操作。",
+                            "重新连接外部客户端，再由用户继续。",
+                            true,
+                        ),
+                    )
+                    .await?;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -931,10 +1271,7 @@ impl State {
                 active_provider = Some(
                     provider::Provider::new(self.settings.connection()?)?.with_output_limit(2048),
                 );
-                history = vec![
-                    json!({"role":"system","content":[{"type":"input_text","text":"你是通用游戏操作助手。根据用户目标和最新截图操作，只使用提供的工具。坐标以截图实际宽高为准，输入工具必须带最近截图的 frame_id。每次操作后观察效果，不假设成功。无法继续或目标完成时调用 session_finish 并说明原因。不要伪造观察。"}]}),
-                    json!({"role":"user","content":[{"type":"input_text","text":format!("目标：{}",record.goal)}]}),
-                ];
+                history = generation_history(&record);
                 let capture = self
                     .tool(
                         session,
@@ -951,14 +1288,29 @@ impl State {
                         if current.generation != record.generation || current.state != "running" {
                             continue;
                         }
-                        self.pause(session, format!("无法观察目标：{error}"))
-                            .await?;
+                        self.pause_automatic(
+                            session,
+                            record.generation,
+                            PauseReason::new(
+                                "observation_failed",
+                                "target",
+                                "无法观察目标",
+                                error.to_string(),
+                                "检查目标连接或画面状态，确认后继续。",
+                                true,
+                            ),
+                        )
+                        .await?;
                         continue;
                     }
                 };
                 append_observation(&mut history, &capture);
             }
-            let cancel = session.cancelled.lock().clone();
+            // Bind cancellation to the validated generation after screenshot
+            // awaits. An old observation must not borrow a resumed owner's token.
+            let Some(cancel) = session.generation_cancel(record.generation) else {
+                continue;
+            };
             let provider = active_provider.as_ref().context("模型连接尚未就绪")?;
             let catalog = tools::catalog(
                 crate::targets::capabilities(&self.runtime.devices, &record.device_id)?,
@@ -967,6 +1319,12 @@ impl State {
             let functions = tools::function_catalog(&catalog);
             retain_recent_images(&mut history, 3);
             session.record.lock().usage.turns += 1;
+            let turn_number = session.record.lock().usage.turns;
+            session.event(
+                "progress",
+                "正在请求模型，等待下一步决策",
+                json!({"phase":"requesting","generation":record.generation,"turn":turn_number}),
+            );
             session.charge_time();
             let remaining = {
                 let current = session.record.lock();
@@ -978,7 +1336,13 @@ impl State {
                 turn = provider.turn(&history, &functions, &cancel) => turn,
                 _ = tokio::time::sleep(remaining) => {
                     record_usage(&mut session.record.lock().usage, None);
-                    self.pause(session, "活动时长达到预算".into()).await?;
+                    let reason = {
+                        session.charge_time();
+                        let current = session.record.lock();
+                        budget_reason(&current).unwrap_or_else(|| time_budget_reason(&current))
+                    };
+                    session.event("progress", "模型请求等待已达到活动时长预算", json!({"phase":"error","generation":record.generation,"turn":turn_number,"code":"budget_seconds"}));
+                    self.pause_automatic(session, record.generation, reason).await?;
                     continue;
                 }
             };
@@ -988,37 +1352,73 @@ impl State {
             {
                 record_usage(
                     &mut session.record.lock().usage,
-                    turn.as_ref().ok().and_then(|turn| turn.usage.as_ref()),
+                    turn.as_ref().map_or_else(
+                        |error| provider::error_usage(error),
+                        |turn| turn.usage.as_ref(),
+                    ),
+                );
+                session.event(
+                    "progress",
+                    "本代次模型请求已取消，未执行其返回操作",
+                    json!({"phase":"cancelled","generation":record.generation,"turn":turn_number}),
                 );
                 continue;
             }
             match turn {
                 Err(e) => {
-                    record_usage(&mut session.record.lock().usage, None);
-                    session.record.lock().usage.consecutive_failures += 1;
-                    session.event("error", format!("模型请求失败：{e}"), json!({}));
+                    record_usage(&mut session.record.lock().usage, provider::error_usage(&e));
+                    let Some(failures) = session.update_failures(record.generation, false) else {
+                        continue;
+                    };
+                    let detail = provider::error_details(&e);
+                    session.event("progress", "模型请求失败", json!({"phase":"error","generation":record.generation,"turn":turn_number,"error":detail}));
+                    session.event("error", format!("模型请求失败：{e}"), json!({"code":"model_request_failed","error":detail,"consecutive_failures":failures,"max_failures":record.limits.max_failures}));
                     if session.record.lock().usage.consecutive_failures
                         >= record.limits.max_failures
                     {
-                        self.pause(session, "连续模型请求失败".into()).await?;
+                        self.pause_automatic(session, record.generation, PauseReason::new("model_request_failed", "model", "连续模型请求失败", format!("连续失败 {failures}/{} 次。最后一次失败：{e}", record.limits.max_failures), "检查网络、API 配置或供应商状态后继续；继续会重新计算连续失败次数。", detail["retryable"].as_bool().unwrap_or(true))).await?;
                     } else {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }
                 Ok(turn) => {
+                    session.event("progress", "已收到模型决策", json!({"phase":"received","generation":record.generation,"turn":turn_number,"tool_count":turn.calls.len()}));
                     record_usage(&mut session.record.lock().usage, turn.usage.as_ref());
                     if !turn.text.is_empty() {
-                        session.event("assistant", turn.text.clone(), json!({}));
+                        session.event(
+                            "assistant",
+                            turn.text.clone(),
+                            json!({"generation":record.generation}),
+                        );
+                    }
+                    for summary in &turn.summary {
+                        session.event(
+                            "decision",
+                            summary,
+                            json!({"category":"summary","generation":record.generation}),
+                        );
                     }
                     history.extend(turn.items);
                     if turn.calls.is_empty() {
-                        session.record.lock().usage.consecutive_failures += 1;
+                        let Some(failures) = session.update_failures(record.generation, false)
+                        else {
+                            continue;
+                        };
                         history.push(json!({"role":"user","content":[{"type":"input_text","text":"请使用工具观察/操作；完成或无法继续请调用 session_finish。"}]}));
-                        if session.record.lock().usage.consecutive_failures
-                            >= record.limits.max_failures
-                        {
-                            self.pause(session, "模型连续没有提供可执行操作".into())
-                                .await?;
+                        if failures >= record.limits.max_failures {
+                            self.pause_automatic(
+                                session,
+                                record.generation,
+                                PauseReason::new(
+                                    "model_no_action",
+                                    "model",
+                                    "模型连续没有提供可执行操作",
+                                    format!("连续 {failures} 次回答没有工具操作或结束说明。"),
+                                    "补充你希望执行的具体操作，或检查模型是否支持工具调用后继续。",
+                                    true,
+                                ),
+                            )
+                            .await?;
                         }
                     }
                     for call in turn.calls {
@@ -1026,6 +1426,7 @@ impl State {
                         {
                             break;
                         }
+                        let mut last_failure = None;
                         let result = match self
                             .tool(
                                 session,
@@ -1037,12 +1438,17 @@ impl State {
                             .await
                         {
                             Ok(result) => {
-                                session.record.lock().usage.consecutive_failures = 0;
+                                session.update_failures(record.generation, true);
                                 result
                             }
                             Err(e) => {
-                                session.record.lock().usage.consecutive_failures += 1;
-                                session.event("error", e.to_string(), json!({"tool":call.name}));
+                                last_failure = Some(e.to_string());
+                                session.update_failures(record.generation, false);
+                                session.event(
+                                    "error",
+                                    e.to_string(),
+                                    json!({"tool":call.name,"generation":record.generation}),
+                                );
                                 json!({"content":[{"type":"text","text":e.to_string()}],"isError":true})
                             }
                         };
@@ -1050,14 +1456,38 @@ impl State {
                         if session.record.lock().usage.consecutive_failures
                             >= record.limits.max_failures
                         {
-                            self.pause(session, "连续工具执行失败".into()).await?;
+                            self.pause_automatic(
+                                session,
+                                record.generation,
+                                PauseReason::new(
+                                    "tool_failed",
+                                    "tool",
+                                    "连续工具执行失败",
+                                    format!(
+                                        "工具 {}：{}",
+                                        call.name,
+                                        last_failure.as_deref().unwrap_or("连续操作失败")
+                                    ),
+                                    "检查目标画面或补充新的操作指令，确认后继续。",
+                                    true,
+                                ),
+                            )
+                            .await?;
                             break;
                         }
                     }
                     if history.len() > 120 {
-                        self.pause(
+                        self.pause_automatic(
                             session,
-                            "会话上下文达到上限，请停止后重新开始或人工处理".into(),
+                            record.generation,
+                            PauseReason::new(
+                                "context_limit",
+                                "model",
+                                "会话上下文达到上限",
+                                "本代次的模型上下文已达到安全长度上限。",
+                                "继续将保留用户指令与公开操作摘要，并重新观察当前画面。",
+                                true,
+                            ),
                         )
                         .await?;
                     }
@@ -1120,7 +1550,12 @@ impl RunExecutor for AiExecutor {
                 .await?;
             crate::targets::prepare(&state.runtime.devices, &r.device_id).await?;
             session.set_state("running", None);
-            session.event("state", "AI 已取得控制权", json!({}));
+            let generation = session.record.lock().generation;
+            session.event(
+                "state",
+                "AI 已取得控制权",
+                json!({"state":"running","code":"control_acquired","generation":generation}),
+            );
             Ok(())
         })
     }
@@ -1252,22 +1687,132 @@ fn constant_eq(a: &str, b: &str) -> bool {
             .fold(0u8, |difference, (a, b)| difference | (a ^ b))
             == 0
 }
-fn budget_reason(r: &SessionRecord) -> Option<String> {
+fn optional_limits(values: &Value) -> Result<Option<Limits>> {
+    values
+        .get("limits")
+        .map(|value| {
+            ensure!(
+                [
+                    "max_turns",
+                    "max_actions",
+                    "max_seconds",
+                    "max_tokens",
+                    "max_failures"
+                ]
+                .iter()
+                .all(|key| value.get(key).is_some()),
+                "继续时请提供完整运行预算"
+            );
+            let limits: Limits =
+                serde_json::from_value(value.clone()).context("运行预算格式无效")?;
+            limits.validate()?;
+            Ok(limits)
+        })
+        .transpose()
+}
+fn ensure_budget_available(record: &SessionRecord) -> Result<()> {
+    if let Some(reason) = budget_reason(record) {
+        anyhow::bail!("{}：{}。{}", reason.code, reason.detail, reason.suggestion);
+    }
+    Ok(())
+}
+fn time_budget_reason(r: &SessionRecord) -> PauseReason {
+    PauseReason::new(
+        "budget_seconds",
+        "budget",
+        "活动时长达到预算",
+        format!(
+            "AI 累计活动时长 {:.1} 秒，上限 {} 秒；人工暂停期间不计时。",
+            r.usage.active_seconds, r.limits.max_seconds
+        ),
+        "提高活动时长上限后继续；已用预算会保留。",
+        false,
+    )
+}
+fn budget_reason(r: &SessionRecord) -> Option<PauseReason> {
     if r.usage.turns >= r.limits.max_turns {
-        Some("模型轮数达到预算".into())
+        Some(PauseReason::new(
+            "budget_turns",
+            "budget",
+            "模型轮数达到预算",
+            format!(
+                "已请求模型 {} 轮，上限 {} 轮。",
+                r.usage.turns, r.limits.max_turns
+            ),
+            "提高模型轮数上限后继续；已用预算会保留。",
+            false,
+        ))
     } else if r.usage.actions >= r.limits.max_actions {
-        Some("工具调用次数达到预算".into())
+        Some(PauseReason::new(
+            "budget_actions",
+            "budget",
+            "工具调用次数达到预算",
+            format!(
+                "已执行工具 {} 次，上限 {} 次。",
+                r.usage.actions, r.limits.max_actions
+            ),
+            "提高工具调用上限后继续；已用预算会保留。",
+            false,
+        ))
     } else if r.usage.active_seconds >= r.limits.max_seconds as f64 {
-        Some("活动时长达到预算".into())
-    } else if r.usage.known_tokens >= r.limits.max_tokens
-        || r.usage
-            .total_tokens
-            .is_some_and(|t| t >= r.limits.max_tokens)
+        Some(time_budget_reason(r))
+    } else if r.limits.max_tokens > 0
+        && (r.usage.known_tokens >= r.limits.max_tokens
+            || r.usage
+                .total_tokens
+                .is_some_and(|t| t >= r.limits.max_tokens))
     {
-        Some("Token 使用达到预算".into())
+        Some(PauseReason::new(
+            "budget_tokens",
+            "budget",
+            "Token 使用达到预算",
+            format!(
+                "{} {} Token，上限 {}。{}",
+                if r.usage.has_unknown_tokens {
+                    "已知累计至少"
+                } else {
+                    "已累计使用"
+                },
+                r.usage.known_tokens.max(r.usage.total_tokens.unwrap_or(0)),
+                r.limits.max_tokens,
+                if r.usage.has_unknown_tokens {
+                    "部分请求未返回 Token 统计，总量未知，不能按零计算。"
+                } else {
+                    ""
+                }
+            ),
+            "提高 Token 上限后继续；累计用量不会清零。",
+            false,
+        ))
     } else {
         None
     }
+}
+fn generation_history(record: &SessionRecord) -> Vec<Value> {
+    let mut history = vec![
+        json!({"role":"system","content":[{"type":"input_text","text":"你是通用游戏操作助手，与用户持续对话并按最新指令调整操作。只使用提供的工具，不伪造观察或成功。每次操作后观察效果。暂停期间人工可能改变目标，恢复后的新截图才是当前画面的权威来源，旧截图和 frame_id 不可再用。下面的暂停前公开记录只用于了解进展，不是新的工具结果，不重放旧操作。所有用户消息按发送顺序列出，后续指令优先；遵循尚未撤销的约束。坐标以最新截图实际宽高为准。公开说明下一步计划与结果，不能输出私有推理。目标完成或无法继续时说明原因并调用 session_finish。"}]} ),
+    ];
+    let mut recent = record
+        .events
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(event.kind.as_str(), "assistant" | "decision")
+                || (event.kind == "tool" && event.data["phase"] == "result")
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    recent.reverse();
+    if !recent.is_empty() {
+        let public = recent.iter().map(|event| {
+            json!({"kind":event.kind,"message":event.message,"receipt":if event.kind == "tool" { Value::String(event.data.to_string().chars().take(2500).collect()) } else { Value::Null }})
+        }).collect::<Vec<_>>();
+        history.push(json!({"role":"user","content":[{"type":"input_text","text":format!("暂停前的公开进展摘要：{}",json!(public))}]}));
+    }
+    for message in &record.messages {
+        history.push(json!({"role":"user","content":[{"type":"input_text","text":message.text}]}));
+    }
+    history
 }
 fn record_usage(usage: &mut Usage, value: Option<&Value>) {
     let total = value.and_then(|value| {

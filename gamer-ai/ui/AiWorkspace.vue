@@ -1,32 +1,31 @@
 <script setup>
-import { computed, inject, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
-import { PROTOCOLS, displayTime, eventDetails, eventImage, isActive, stateLabel, usageValue } from './ai-format'
+import { PROTOCOLS, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
 
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const context = computed(() => workspace?.getSnapshot?.() || {})
 const deviceId = computed(() => context.value.deviceId || '')
 const packageId = computed(() => context.value.currentPackageId || '')
 const deviceName = computed(() => context.value.device?.name || deviceId.value || '未选择设备')
-const activeTab = ref('play')
-const tabs = [{ key: 'play', label: '自动游玩' }, { key: 'settings', label: '模型连接' }, { key: 'mcp', label: '外部 MCP' }]
+const settingsSection = ref(''), timelineElement = ref(null), nearBottom = ref(true), newConversation = ref(false)
 const saved = ref(null), sessions = ref([]), selectedId = ref(''), tokens = ref([])
-const busy = ref(''), controlBusy = ref(''), error = ref(''), feedback = ref(''), statusFresh = ref(false)
+const busy = ref(''), controlBusy = ref(''), messageBusy = ref(false), error = ref(''), feedback = ref(''), statusFresh = ref(false)
 const goal = ref(''), mode = ref('api')
 const limits = reactive({ max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 })
 const limitFields = [
   { key: 'max_turns', label: '最大模型轮数', min: 1, max: 500 },
   { key: 'max_actions', label: '最大工具次数', min: 1, max: 2000 },
   { key: 'max_seconds', label: '最长活动时长（秒）', min: 10, max: 7200 },
-  { key: 'max_tokens', label: '累计 token 上限', min: 2048, max: 2000000 },
+  { key: 'max_tokens', label: '累计 token 上限（0 表示无上限）', min: 0, max: 2000000 },
   { key: 'max_failures', label: '连续失败上限', min: 1, max: 20 },
 ]
 const settings = reactive({ base_url: PROTOCOLS.responses.baseUrl, model: 'glm-5.3-flash', protocol: 'responses', request_timeout_secs: 60, api_key: '' })
 const tokenForm = reactive({ label: '', control: false, ttl_seconds: 120 })
 const createdToken = ref(null), copied = ref('')
 const mcpEndpoint = `${globalThis.location?.origin || 'http://127.0.0.1:8443'}/api/extensions/gamer-ai/mcp`
-const selectedSession = computed(() => sessions.value.find(s => s.session_id === selectedId.value)
+const selectedSession = computed(() => newConversation.value ? null : sessions.value.find(s => s.session_id === selectedId.value)
   || sessions.value.find(s => s.device_id === deviceId.value && isActive(s))
   || sessions.value.find(s => s.device_id === deviceId.value) || null)
 const currentActive = computed(() => sessions.value.find(s => s.device_id === deviceId.value && isActive(s)))
@@ -36,10 +35,23 @@ const goalBytes = computed(() => new TextEncoder().encode(goal.value.trim()).len
 const canStart = computed(() => !!deviceId.value && !!packageId.value && !!goal.value.trim() && goalBytes.value <= 8000
   && statusFresh.value && !currentActive.value && (mode.value === 'mcp' || !!saved.value?.has_key))
 const boundElsewhere = computed(() => selectedSession.value && (selectedSession.value.device_id !== deviceId.value || selectedSession.value.content_package !== packageId.value))
+const canFollowUp = computed(() => statusFresh.value && !boundElsewhere.value && selectedSession.value?.mode === 'api'
+  && ['running', 'paused'].includes(selectedSession.value?.state) && !!goal.value.trim() && goalBytes.value <= 8000)
+const canSend = computed(() => !messageBusy.value && !controlBusy.value && limitsValid.value
+  && (isActive(selectedSession.value) ? canFollowUp.value : canStart.value && !busy.value))
+const sendLabel = computed(() => !isActive(selectedSession.value) ? (mode.value === 'mcp' ? '建立外部控制会话' : '发送目标')
+  : selectedSession.value.state === 'paused' ? '发送并继续' : '发送新指令')
+const limitsChanged = computed(() => !!selectedSession.value && limitFields.some(field => limits[field.key] !== selectedSession.value.limits?.[field.key]))
+const limitsValid = computed(() => limitFields.every(field => Number.isInteger(limits[field.key])
+  && limits[field.key] >= field.min && limits[field.key] <= field.max)
+  && (limits.max_tokens === 0 || limits.max_tokens >= 2048))
+const hardUsage = computed(() => ({ max_turns: selectedSession.value?.usage?.turns || 0,
+  max_actions: selectedSession.value?.usage?.actions || 0, max_seconds: selectedSession.value?.usage?.active_seconds || 0,
+  max_tokens: selectedSession.value?.usage?.total_tokens ?? selectedSession.value?.usage?.known_tokens ?? 0 }))
+const budgetBlocked = computed(() => Object.entries(hardUsage.value).some(([key, value]) => (key !== 'max_tokens' || limits.max_tokens > 0) && value >= limits[key]))
 const canPause = computed(() => statusFresh.value && ['starting', 'running', 'resuming'].includes(selectedSession.value?.state))
-const canResume = computed(() => statusFresh.value && selectedSession.value?.state === 'paused')
-const events = computed(() => (selectedSession.value?.events || []).slice(-200))
-const lastImage = computed(() => [...events.value].reverse().map(eventImage).find(Boolean) || '')
+const canResume = computed(() => statusFresh.value && selectedSession.value?.state === 'paused' && limitsValid.value && !budgetBlocked.value)
+const timeline = computed(() => chatTimeline(selectedSession.value))
 const clientConfig = computed(() => JSON.stringify({ mcpServers: { gamer: { url: mcpEndpoint,
   headers: { Authorization: `Bearer ${createdToken.value?.token || '<在面板中创建的连接令牌>'}` } } } }, null, 2))
 const probe = computed(() => saved.value?.probe)
@@ -88,22 +100,60 @@ async function operate(label, fn) {
   finally { if (!disposed) busy.value = '' }
 }
 async function start() {
-  if (!canStart.value) return
+  if (!canStart.value || !limitsValid.value) return
   await operate('正在开始', async () => {
     const result = await call('session.start', { device_id: deviceId.value, content_package: packageId.value,
       goal: goal.value.trim(), mode: mode.value, limits: { ...limits } })
     selectedId.value = result?.session?.session_id || result?.session_id || ''
+    newConversation.value = false
+    goal.value = ''
     await refresh()
     feedback.value = mode.value === 'mcp' ? '外部控制会话已建立；客户端可使用匹配目标的控制令牌调用工具。' : 'AI 会话已提交。'
   })
 }
+async function sendMessage(resume = true) {
+  if (!canSend.value) return
+  if (resume && (!limitsValid.value || (selectedSession.value?.state === 'paused' && budgetBlocked.value))) return
+  if (!isActive(selectedSession.value)) return start()
+  const session = selectedSession.value, message = goal.value.trim()
+  messageBusy.value = true; error.value = ''; feedback.value = ''
+  try {
+    const reply = await call('session.message', { session_id: session.session_id, message, resume,
+      ...(limitsChanged.value ? { limits: { ...limits } } : {}) })
+    if (reply?.session) sessions.value = sessions.value.map(item => item.session_id === session.session_id ? reply.session : item)
+    goal.value = ''
+    feedback.value = reply?.resumed ? '新指令已发送，AI 将使用最新画面继续。' : '消息已接收，会话保持暂停。'
+    if (reply?.resume_error) error.value = `消息已接收，恢复未完成：${typeof reply.resume_error === 'string' ? reply.resume_error : reply.resume_error.message || '请检查暂停原因'}`
+    try { await refresh() } catch (e) { statusFresh.value = false; error.value = `消息已接收，但状态刷新失败：${e.message || '请刷新会话'}` }
+  } catch (e) { if (!disposed) error.value = `${e.message || '发送结果未确认'}；请刷新会话确认后再决定是否重试。` }
+  finally { if (!disposed) messageBusy.value = false }
+}
+function toggleSettings(section) { settingsSection.value = settingsSection.value === section ? '' : section }
+function selectConversation(value) { newConversation.value = false; selectedId.value = value }
+function clearConversation() { if (!currentActive.value) { newConversation.value = true; selectedId.value = ''; goal.value = '' } }
+function onTimelineScroll() {
+  const el = timelineElement.value
+  if (el) nearBottom.value = el.scrollHeight - el.clientHeight - el.scrollTop < 80
+}
+watch(() => `${selectedSession.value?.session_id}:${timeline.value.map(item => `${item.key}:${item.seq || ''}`).join('|')}`, async (value, previous) => {
+  if (value.split(':')[0] !== previous?.split(':')[0]) nearBottom.value = true
+  if (!nearBottom.value) return
+  await nextTick()
+  if (timelineElement.value) timelineElement.value.scrollTop = timelineElement.value.scrollHeight
+})
+watch(() => `${selectedSession.value?.session_id}:${selectedSession.value?.state}`, () => {
+  if (!selectedSession.value) return
+  for (const field of limitFields) if (selectedSession.value.limits?.[field.key] != null) limits[field.key] = selectedSession.value.limits[field.key]
+}, { immediate: true })
 async function control(action) {
   const session = selectedSession.value
   if (!session || controlBusy.value) return
   controlBusy.value = action === 'pause' ? '正在请求暂停' : action === 'resume' ? '正在请求恢复' : '正在请求停止'
   error.value = ''; feedback.value = ''
   try {
-    await call(`session.${action}`, { session_id: session.session_id })
+    const reply = await call(`session.${action}`, { session_id: session.session_id,
+      ...(action === 'resume' && limitsChanged.value ? { limits: { ...limits } } : {}) })
+    if (reply?.session) sessions.value = sessions.value.map(item => item.session_id === session.session_id ? reply.session : item)
     await refresh()
   } catch (e) { if (!disposed) error.value = e.message || '会话控制失败' }
   finally { if (!disposed) controlBusy.value = '' }
@@ -165,59 +215,31 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
 
 <template>
   <div class="ai-workspace">
-    <nav class="workbench-tabs" aria-label="AI 助手功能">
-      <button v-for="tab in tabs" :key="tab.key" type="button" class="tab-btn" :class="{ active: activeTab === tab.key }"
-        :aria-pressed="activeTab === tab.key" :aria-controls="`ai-${tab.key}`" @click="activeTab = tab.key">{{ tab.label }}</button>
-    </nav>
-    <div class="ai-content">
-      <p v-if="error" role="alert" class="error">{{ error }}</p>
-      <p v-if="feedback" role="status" class="feedback">{{ feedback }}</p>
-      <p v-if="busy" role="status" class="hint">{{ busy }}…</p>
-      <p v-if="controlBusy" role="status" class="hint">{{ controlBusy }}…</p>
-      <div v-show="activeTab === 'play'" id="ai-play" class="section-stack">
-        <section aria-label="游玩目标">
-          <div class="heading"><h3>游玩目标</h3><span class="tag">通用视觉操作</span></div>
-          <div class="context-line"><span>设备：{{ deviceName }}</span><span>配置包：{{ packageId || '未选择' }}</span><span v-if="context.androidPackageName">应用：{{ context.androidPackageName }}</span></div>
-          <p v-if="!deviceId || !packageId" class="hint">请在工作台选择设备和配置包。应用目标取设备配置，配置包提供数据上下文。</p>
-          <form @submit.prevent="start">
-            <fieldset :disabled="!!busy || !!currentActive">
-              <label>控制方式<select v-model="mode" aria-label="控制方式"><option value="api">内置 AI · 模型 API</option><option value="mcp">外部 AI · MCP 客户端</option></select></label>
-              <label>目标描述<textarea v-model="goal" aria-label="目标描述" rows="4" maxlength="8000" required placeholder="描述需要完成的目标、成功条件以及操作限制" /></label>
-              <p v-if="goalBytes > 8000" class="error">目标超过 8000 字节，请缩短描述。</p>
-              <p class="hint">根据截图判断和操作，不预设游戏流程。首版适合允许等待模型响应的操作。</p>
-              <details class="budget-settings" open><summary>运行预算</summary><div class="budget-grid"><label v-for="field in limitFields" :key="field.key">{{ field.label }}<input v-model.number="limits[field.key]" :aria-label="field.label" type="number" :min="field.min" :max="field.max" step="1" required /></label></div></details>
-              <button type="submit" class="primary" :disabled="!canStart">{{ mode === 'mcp' ? '建立外部控制会话' : '开始自动游玩' }}</button>
-            </fieldset>
-          </form>
-          <p v-if="mode === 'api' && !saved?.has_key" class="hint">先在“模型连接”中保存 API 密钥并测试连接。</p>
-          <p v-if="mode === 'mcp'" class="hint">先建立会话，再在“外部 MCP”创建控制令牌。外部客户端只能控制授权的目标；暂停后客户端不能自行恢复。</p>
-          <p v-if="currentActive" class="hint">当前设备已有 AI 会话；暂停时保留运行槽，先停止才能开始另一次运行。</p>
-        </section>
-        <section aria-label="AI 会话">
-          <div class="heading"><h3>当前会话</h3><button type="button" :disabled="!!busy" @click="operate('刷新状态', refresh)">刷新</button></div>
-          <label v-if="sessions.length > 1">查看会话<select :value="selectedSession?.session_id || ''" aria-label="查看会话" @change="selectedId = $event.target.value"><option v-for="session in sessions" :key="session.session_id" :value="session.session_id">{{ sessionTitle(session) }}</option></select></label>
-          <template v-if="selectedSession">
-            <p class="session-state" role="status" data-testid="session-state">{{ stateLabel(selectedSession.state) }}</p>
-            <p class="hint control-hint" data-testid="control-hint">{{ controlHint(selectedSession) }}</p>
-            <p v-if="!statusFresh" class="error">状态尚未同步，暂停和继续暂不可用；仍可请求停止。</p>
-            <p v-if="boundElsewhere" class="hint">此会话绑定设备 {{ selectedSession.device_id }} / 配置包 {{ selectedSession.content_package }}，工作台切换不会更改它的运行目标。</p>
-            <p class="session-goal">{{ selectedSession.goal }}</p>
-            <div class="actions"><button v-if="canPause" type="button" :disabled="!!controlBusy" @click="control('pause')">暂停 AI</button><button v-if="canResume" type="button" class="primary" :disabled="!!controlBusy" @click="control('resume')">继续 AI</button><button v-if="isActive(selectedSession)" type="button" :disabled="!!controlBusy" @click="control('stop')">停止会话</button></div>
-            <p v-if="selectedSession.reason" class="reason">{{ selectedSession.reason }}</p>
-            <dl class="usage-grid"><div><dt>模型轮数</dt><dd>{{ usageValue(selectedSession.usage, ['turns']) }} / {{ selectedSession.limits?.max_turns }}</dd></div><div><dt>工具调用</dt><dd>{{ usageValue(selectedSession.usage, ['actions']) }} / {{ selectedSession.limits?.max_actions }}</dd></div><div><dt>活动秒数</dt><dd>{{ usageValue(selectedSession.usage, ['active_seconds']) }} / {{ selectedSession.limits?.max_seconds }}</dd></div><div><dt>累计 token</dt><dd>{{ usageValue(selectedSession.usage, ['total_tokens']) }} / {{ selectedSession.limits?.max_tokens }}</dd></div><div><dt>连续失败</dt><dd>{{ usageValue(selectedSession.usage, ['consecutive_failures']) }} / {{ selectedSession.limits?.max_failures }}</dd></div></dl>
-            <p class="hint">暂停不重置预算。达到预算或连续失败上限时暂停；停止后可调整预算并开始新会话。供应商未返回 token 用量时显示“未知”。</p>
-            <details class="identity"><summary>会话标识</summary><p>Session：{{ selectedSession.session_id }}</p><p>Run：{{ selectedSession.run_id }}</p><p>控制方式：{{ selectedSession.mode === 'mcp' ? '外部 MCP' : '内置 API' }} · generation {{ selectedSession.generation }}</p></details>
-          </template>
-          <p v-else class="hint">尚无会话。关闭面板不会停止服务端运行；需要结束时使用“停止会话”。</p>
-        </section>
-        <section v-if="selectedSession" aria-label="观察与操作记录">
-          <div class="heading"><h3>观察与操作记录</h3><span class="hint">最近 {{ events.length }} 条</span></div>
-          <figure v-if="lastImage"><img :src="lastImage" alt="AI 最近一次观察的目标截图" /><figcaption>最近一次观察；投屏画面可能已发生变化。</figcaption></figure>
-          <ol v-if="events.length" class="events"><li v-for="(event, index) in events" :key="event.seq ?? index"><div class="event-header"><time>{{ displayTime(event.at) }}</time><b>{{ event.kind }}</b><span v-if="eventImage(event)">截图</span></div><p>{{ event.message }}</p><details v-if="eventDetails(event.data)"><summary>详情</summary><pre>{{ eventDetails(event.data) }}</pre></details></li></ol>
-          <p v-else class="hint">等待观察或操作事件。</p>
-        </section>
+    <header class="agent-header">
+      <div class="agent-title"><span class="agent-avatar" aria-hidden="true">AI</span><h3>Agent</h3><span class="model-label">{{ saved?.model || '配置模型' }}</span></div>
+      <div class="header-actions">
+        <button type="button" :disabled="!!currentActive" title="新会话不会删除历史记录" @click="clearConversation">新会话</button>
+        <button type="button" aria-controls="ai-settings" :aria-expanded="settingsSection === 'settings'" @click="toggleSettings('settings')">模型</button>
+        <button type="button" aria-controls="ai-mcp" :aria-expanded="settingsSection === 'mcp'" @click="toggleSettings('mcp')">MCP</button>
+        <button type="button" aria-controls="ai-budget" :aria-expanded="settingsSection === 'budget'" @click="toggleSettings('budget')">预算</button>
       </div>
-      <div v-show="activeTab === 'settings'" id="ai-settings" class="section-stack">
+    </header>
+    <div class="scope-line"><span>{{ deviceName }}</span><span>{{ packageId || '未选配置包' }}</span><span v-if="context.androidPackageName">{{ context.androidPackageName }}</span></div>
+    <div v-if="selectedSession" class="session-toolbar">
+      <span class="session-state" role="status" data-testid="session-state">{{ stateLabel(selectedSession.state) }}</span>
+      <div class="actions">
+        <button v-if="canPause" type="button" :disabled="!!controlBusy || messageBusy" @click="control('pause')">暂停 AI</button>
+        <button v-if="selectedSession.state === 'paused'" type="button" :disabled="!canResume || !!controlBusy || messageBusy" @click="control('resume')">继续 AI</button>
+        <button v-if="isActive(selectedSession)" type="button" :disabled="!!controlBusy" @click="control('stop')">停止会话</button>
+      </div>
+    </div>
+    <div class="conversation-selector" v-if="sessions.length">
+      <label>会话<select :value="newConversation ? '' : selectedSession?.session_id || ''" aria-label="查看会话" @change="selectConversation($event.target.value)"><option v-if="newConversation" value="">新会话</option><option v-for="session in sessions" :key="session.session_id" :value="session.session_id">{{ sessionTitle(session) }}</option></select></label>
+      <button type="button" @click="refresh().catch(e => error = e.message)">刷新</button>
+    </div>
+    <p v-if="boundElsewhere" class="scope-warning">此会话绑定设备 {{ selectedSession.device_id }} / 配置包 {{ selectedSession.content_package }}。切换工作台不会改写会话；请返回对应上下文发送消息，或新建当前目标的会话。</p>
+    <div v-show="!!settingsSection" class="settings-drawer">
+      <div v-show="settingsSection === 'settings'" id="ai-settings" class="section-stack">
         <section aria-label="模型连接设置">
           <h3>模型连接</h3>
           <p class="hint">连接设置保存在运行 Gamer 服务端的电脑，密钥不随配置包导出。协议切换仅在显式保存后生效。</p>
@@ -241,7 +263,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
           <p v-if="!probe.ok" class="hint">可显式选择另一协议及对应地址，保存后再次测试。运行期间不会自动切换协议。</p>
         </section>
       </div>
-      <div v-show="activeTab === 'mcp'" id="ai-mcp" class="section-stack">
+      <div v-show="settingsSection === 'mcp'" id="ai-mcp" class="section-stack">
         <section aria-label="MCP 接入">
           <h3>本机 MCP</h3>
           <p class="hint">使用 Streamable HTTP，仅接受运行 Gamer 服务端电脑上的客户端连接。独立 Bearer 令牌不使用管理登录 Cookie；可撤销，并有有效期。</p>
@@ -266,19 +288,64 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
           <p v-else class="hint">暂无连接令牌。</p>
         </section>
       </div>
-      <p class="hint persistent-note">关闭面板不会停止 AI。停用插件或退出服务端会结束会话；控制令牌失效会暂停外部会话。</p>
+
+      <section v-show="settingsSection === 'budget'" id="ai-budget" class="section-stack" aria-label="运行预算">
+        <h3>运行预算</h3>
+        <p class="hint">暂停保留运行槽与累计用量。可在暂停时提高预算，再明确继续；只有修改过的预算才会提交。</p>
+        <fieldset :disabled="isActive(selectedSession) && selectedSession.state !== 'paused'">
+          <label>控制方式<select v-model="mode" aria-label="控制方式" :disabled="isActive(selectedSession)"><option value="api">内置 AI · 模型 API</option><option value="mcp">外部 AI · MCP 客户端</option></select></label>
+          <div class="budget-grid"><label v-for="field in limitFields" :key="field.key">{{ field.label }}<input v-model.number="limits[field.key]" :aria-label="field.label" type="number" :min="field.min" :max="field.max" step="1" required /></label></div>
+        </fieldset>
+        <p class="hint">Token 上限可设为 0（无上限），或 2,048–2,000,000；其他预算须在输入框标注的范围内。</p>
+        <p v-if="!limitsValid" class="error">运行预算超出允许范围，请修正后发送或继续。</p>
+        <dl v-if="selectedSession" class="usage-grid"><div><dt>模型轮数</dt><dd>{{ usageValue(selectedSession.usage, ['turns']) }} / {{ selectedSession.limits?.max_turns }}</dd></div><div><dt>工具调用</dt><dd>{{ usageValue(selectedSession.usage, ['actions']) }} / {{ selectedSession.limits?.max_actions }}</dd></div><div><dt>活动秒数</dt><dd>{{ usageValue(selectedSession.usage, ['active_seconds']) }} / {{ selectedSession.limits?.max_seconds }}</dd></div><div><dt>累计 token</dt><dd>{{ tokenUsage(selectedSession.usage) }} / {{ selectedSession.limits?.max_tokens === 0 ? '不限' : usageValue(selectedSession.limits, ['max_tokens']) }}</dd><small v-if="selectedSession.usage?.has_unknown_tokens">部分请求用量未知</small></div></dl>
+        <button v-if="selectedSession?.state === 'paused'" type="button" :disabled="!limitsChanged || !limitsValid || budgetBlocked || !!controlBusy || messageBusy" @click="control('resume')">调整预算并继续</button>
+        <p v-if="budgetBlocked && selectedSession?.state === 'paused'" class="error">当前上限已耗尽，请提高对应预算。累计用量不会重置。</p>
+      </section>
     </div>
+    <main id="ai-play" class="agent-chat">
+      <div ref="timelineElement" class="chat-scroll" @scroll="onTimelineScroll">
+        <div v-if="!selectedSession" class="chat-empty"><span class="agent-avatar" aria-hidden="true">AI</span><h3>描述你希望完成的事情</h3><p>AI 会观察画面并操作。你可以继续发送指令来调整方向，随时暂停接管。</p><p v-if="!deviceId || !packageId">请先在工作台选择设备和配置包。</p><button v-if="mode === 'api' && !saved?.has_key" type="button" @click="toggleSettings('settings')">配置模型连接</button></div>
+        <ol v-else class="events chat-timeline" role="log" aria-label="对话与执行进度" aria-live="polite">
+          <li v-for="item in timeline" :key="item.key" :class="['message', `message-${item.kind}`]">
+            <div class="message-heading"><b>{{ item.kind === 'user' ? '你' : item.kind === 'assistant' ? 'AI' : item.kind === 'decision' ? '公开决策说明' : item.kind === 'pause' ? item.pause?.title || 'AI 已暂停' : item.kind === 'tool' ? item.label : ['capture', 'observation'].includes(item.kind) ? '观察画面' : item.kind === 'error' ? '执行遇到问题' : '执行进度' }}</b><time>{{ displayTime(item.at) }}</time><span v-if="item.kind === 'tool'" class="tool-status" :class="item.status">{{ item.status === 'running' ? '执行中' : ['error', 'failed'].includes(item.status) ? '失败' : '完成' }}</span></div>
+            <p class="message-text">{{ item.message }}</p>
+            <template v-if="item.kind === 'pause'">
+              <p v-if="item.current && selectedSession.usage?.known_tokens > 0 && selectedSession.usage?.total_tokens == null" class="pause-usage">累计 token：{{ tokenUsage(selectedSession.usage) }} / {{ selectedSession.limits?.max_tokens === 0 ? '不限' : usageValue(selectedSession.limits, ['max_tokens']) }}<span v-if="selectedSession.usage?.has_unknown_tokens">（部分请求用量未知）</span></p>
+              <p class="pause-next">{{ pauseGuidance({ reason: item.message, pause_reason: item.pause }) }}</p>
+              <button v-if="selectedSession.state === 'paused' && /预算|token|上限/i.test(item.message)" type="button" @click="settingsSection = 'budget'">调整运行预算</button>
+            </template>
+            <details v-if="!['user', 'decision'].includes(item.kind) && (eventDetails(item.data) || eventImage(item))" class="message-details"><summary>{{ eventImage(item) ? '查看参数、结果与截图' : '查看参数与结果' }}</summary><pre v-if="eventDetails(item.data)">{{ eventDetails(item.data) }}</pre><figure v-if="eventImage(item)"><img :src="eventImage(item)" alt="此次操作关联的目标截图" /><figcaption>此次观察的画面，当前投屏可能已变化。</figcaption></figure></details>
+          </li>
+        </ol>
+        <p v-if="selectedSession?.state === 'running'" class="live-progress"><span class="status-dot" aria-hidden="true"></span>会话进行中，等待 AI 回复或下一项执行进度。</p>
+      </div>
+      <div class="composer-area">
+        <p v-if="error" role="alert" class="error">{{ error }}</p><p v-if="feedback" role="status" class="feedback">{{ feedback }}</p>
+        <p v-if="busy" role="status" class="hint">{{ busy }}…</p><p v-if="controlBusy || messageBusy" role="status" class="hint">{{ controlBusy || '正在发送新指令' }}…</p>
+        <p v-if="selectedSession" class="hint control-hint" data-testid="control-hint">{{ controlHint(selectedSession) }}</p>
+        <p v-if="!statusFresh" class="error">会话状态尚未同步；请刷新后发送，仍可请求停止。</p>
+        <form class="chat-composer" @submit.prevent="sendMessage(true)">
+          <textarea v-model="goal" aria-label="消息" rows="3" maxlength="8000" :disabled="messageBusy" placeholder="描述目标，或补充新的指令…" @keydown.ctrl.enter.prevent="sendMessage(true)" @keydown.meta.enter.prevent="sendMessage(true)" />
+          <div class="composer-footer"><span>{{ selectedSession?.mode === 'mcp' || (!selectedSession && mode === 'mcp') ? '外部 MCP' : 'Agent' }}<span v-if="goalBytes > 8000" class="error"> · 超过 8000 字节</span></span><div class="actions"><button v-if="selectedSession?.state === 'paused' && selectedSession.mode === 'api'" type="button" :disabled="!canSend" @click="sendMessage(false)">仅发送，保持暂停</button><button type="submit" class="primary" :disabled="!canSend || (selectedSession?.state === 'paused' && budgetBlocked)">{{ sendLabel }}</button></div></div>
+        </form>
+        <p v-if="selectedSession?.state === 'running' && selectedSession.mode === 'api'" class="hint">发送新指令会打断本轮，等待当前动作收尾后，按新指令继续。不会更换会话目标。</p>
+        <p v-else-if="selectedSession?.state === 'paused' && selectedSession.mode === 'api'" class="hint">发送并继续会收回人工控制；也可以仅发送，保持暂停。预算用尽时先提高上限。</p>
+        <p v-if="selectedSession?.mode === 'mcp' && isActive(selectedSession)" class="hint">外部会话的后续指令由 MCP 客户端发送；这里可查看真实执行进度并暂停/停止。</p>
+        <p v-if="mode === 'mcp' && !isActive(selectedSession)" class="hint">先发送目标建立会话，再打开 MCP 设置创建控制令牌。</p>
+        <p class="hint persistent-note">关闭面板不会停止会话。显示公开回答和真实操作，不展示私密推理过程。</p>
+      </div>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.ai-workspace{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;gap:8px;overflow:hidden;color:var(--text-0,#edf0ee)}
-.workbench-tabs{display:flex;gap:4px;flex-shrink:0;border-bottom:1px solid var(--border,#454b4e);padding-bottom:6px;flex-wrap:wrap}
-.tab-btn{height:28px;padding:3px 10px;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--text-2,#c5cbc8);font-size:13px}.tab-btn.active{border-color:var(--border,#454b4e);background:var(--bg-2,#282b2d);color:var(--text-0,#edf0ee);font-weight:700}
-.ai-content{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:8px;scrollbar-gutter:stable}.ai-content>*{box-sizing:border-box;flex-shrink:0;width:100%;max-width:820px;margin-inline:auto}.section-stack{display:grid;gap:16px}section{display:grid;gap:12px;border:1px solid var(--border,#454b4e);border-radius:6px;padding:16px;min-width:0}
-h3,p,figure{margin:0}h3{font-size:15px}.heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.hint,figcaption{font-size:12px;color:var(--text-2,#c5cbc8);line-height:1.7}.context-line{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--text-2,#c5cbc8);overflow-wrap:anywhere}.tag{font-size:11px;padding:3px 7px;background:var(--bg-2,#282b2d);border-radius:3px;color:var(--text-2,#c5cbc8)}
-fieldset{border:0;padding:0;margin:0;min-width:0;display:grid;gap:12px}label{display:grid;gap:6px;font-size:13px}input,select,textarea{box-sizing:border-box;width:100%;min-width:0;padding:8px;border:1px solid var(--border,#454b4e);border-radius:3px;background:var(--bg-1,#181b1c);color:inherit;font:inherit}textarea{resize:vertical;line-height:1.6}button{padding:7px 12px;border-radius:3px;border:1px solid var(--border,#454b4e);background:var(--bg-2,#282b2d);color:inherit;cursor:pointer;justify-self:start;font-size:12px}button:hover:not(:disabled){border-color:var(--accent,#e4c956)}button.primary{color:var(--accent,#e4c956);border-color:var(--accent,#e4c956)}button:disabled,fieldset:disabled{opacity:.55;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent,#e4c956);outline-offset:2px}form{display:grid;gap:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}
-.budget-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;padding-top:12px}summary{font-size:12px;cursor:pointer;color:var(--text-2,#c5cbc8)}.session-state{font-size:14px;color:var(--accent,#e4c956);font-weight:700}.session-goal,.reason{line-height:1.7;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}.reason{color:var(--text-2,#c5cbc8)}.usage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:0}.usage-grid dt{font-size:11px;color:var(--text-2,#c5cbc8)}.usage-grid dd{font-size:12px;margin:4px 0 0}.identity p{font-size:11px;overflow-wrap:anywhere;margin-top:6px;color:var(--text-2,#c5cbc8)}
-figure{display:grid;gap:6px}figure img{display:block;max-width:100%;max-height:360px;object-fit:contain;justify-self:center;border:1px solid var(--border,#454b4e)}.events,.checks,.token-list{padding:0;margin:0;list-style:none}.events{max-height:440px;overflow:auto}.events li{display:grid;gap:6px;padding:10px 0;border-bottom:1px solid var(--border,#454b4e);font-size:12px}.events li p{white-space:pre-wrap;line-height:1.6;overflow-wrap:anywhere}.event-header{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.event-header time{color:var(--text-2,#c5cbc8);font-size:11px}.event-header b{color:var(--accent,#e4c956);font-size:11px}.event-header span{font-size:11px}.error{color:var(--danger,#ef9292);font-size:12px;overflow-wrap:anywhere;line-height:1.6}.feedback{color:#77cbb4;font-size:12px;line-height:1.6}.checks li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:12px;padding:6px 0;overflow-wrap:anywhere}.endpoint-tip{display:grid;gap:6px}.endpoint-tip .hint{overflow-wrap:anywhere}pre{font-size:11px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg-1,#181b1c);padding:10px;border-radius:3px;max-height:260px;overflow:auto}.token-list li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border,#454b4e)}.token-list li>div{min-width:0;overflow-wrap:anywhere;font-size:12px}.token-list button{flex-shrink:0}.persistent-note{text-align:center}
-@media(max-width:420px){section{padding:12px}.budget-grid,.usage-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.context-line{display:grid;gap:4px}.actions button{flex:1}.ai-content{padding:4px}}
+.conversation-selector label{white-space:nowrap}
+.ai-workspace{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;overflow:hidden;color:var(--text-0,#edf0ee);position:relative;background:var(--bg-1,#181b1c)}
+.agent-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--border,#454b4e);flex-wrap:wrap;flex-shrink:0}.agent-title{display:flex;align-items:center;gap:8px;min-width:0}.agent-avatar{display:inline-grid;place-items:center;width:27px;height:27px;border:1px solid var(--border,#454b4e);border-radius:7px;font-size:10px;font-weight:700;color:var(--accent,#e4c956);background:var(--bg-2,#282b2d)}h3{font-size:13px;margin:0}.model-label{font-size:11px;color:var(--text-2,#c5cbc8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px}.header-actions,.actions{display:flex;gap:5px;flex-wrap:wrap}.header-actions button{padding:4px 7px;font-size:11px;background:transparent}.header-actions button[aria-expanded=true]{color:var(--accent,#e4c956);border-color:var(--accent,#e4c956)}
+.scope-line{display:flex;gap:6px 14px;flex-wrap:wrap;padding:6px 12px;font-size:10px;color:var(--text-2,#c5cbc8);overflow-wrap:anywhere;flex-shrink:0}.session-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 12px 8px;flex-wrap:wrap;flex-shrink:0}.session-state{font-size:11px;color:var(--accent,#e4c956)}.conversation-selector{display:flex;gap:6px;align-items:center;padding:0 12px 6px}.conversation-selector label{display:flex;align-items:center;gap:6px;flex:1;min-width:0;font-size:10px;color:var(--text-2,#c5cbc8)}.conversation-selector select{font-size:10px;padding:4px}.scope-warning{margin:0;padding:7px 12px;font-size:11px;line-height:1.6;color:var(--accent,#e4c956);background:var(--bg-2,#282b2d)}
+.settings-drawer{flex-shrink:0;max-height:44%;min-height:0;overflow:auto;padding:8px 12px;border-block:1px solid var(--border,#454b4e);background:var(--bg-2,#282b2d)}.section-stack,section,fieldset{display:grid;gap:10px;min-width:0}section+section{margin-top:12px}fieldset{border:0;padding:0;margin:0}label{display:grid;gap:5px;font-size:11px}input,select,textarea{box-sizing:border-box;width:100%;min-width:0;padding:7px;border:1px solid var(--border,#454b4e);border-radius:4px;background:var(--bg-1,#181b1c);color:inherit;font:inherit}form{display:grid;gap:8px}button{padding:5px 9px;border-radius:4px;border:1px solid var(--border,#454b4e);background:var(--bg-2,#282b2d);color:inherit;cursor:pointer;justify-self:start;font-size:11px}button.primary{color:var(--accent,#e4c956);border-color:var(--accent,#e4c956)}button:hover:not(:disabled){border-color:var(--accent,#e4c956)}button:disabled,fieldset:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent,#e4c956);outline-offset:2px}.budget-grid,.usage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.usage-grid{margin:0;font-size:11px}.usage-grid dt{color:var(--text-2,#c5cbc8)}.usage-grid dd{margin:4px 0}.usage-grid small{font-size:10px;color:var(--text-2,#c5cbc8)}.context-line{display:flex;gap:8px;flex-wrap:wrap;font-size:11px}.heading{display:flex;gap:8px;align-items:center;justify-content:space-between}.endpoint-tip{display:grid;gap:6px}
+.agent-chat{display:flex;flex:1;min-height:0;flex-direction:column}.chat-scroll{flex:1;min-height:0;overflow:auto;padding:14px 12px;scrollbar-gutter:stable}.chat-empty{display:grid;gap:12px;justify-items:start;margin:20px 8px;color:var(--text-2,#c5cbc8);font-size:12px;line-height:1.7}.chat-empty .agent-avatar{width:36px;height:36px}.chat-timeline{list-style:none;margin:0;padding:0;display:grid;gap:16px}.message{min-width:0;font-size:12px;line-height:1.7;overflow-wrap:anywhere}.message-heading{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--text-2,#c5cbc8);margin-bottom:5px}.message-heading b{font-size:11px;color:var(--text-0,#edf0ee)}.message-heading time{font-size:9px;margin-left:auto}.message-text{margin:0;white-space:pre-wrap}.message-user{margin-left:18px;padding:10px 12px;border:1px solid var(--border,#454b4e);border-radius:8px;background:var(--bg-2,#282b2d)}.message-decision,.message-progress,.message-model,.message-state{border-left:2px solid var(--border,#454b4e);padding-left:10px;color:var(--text-2,#c5cbc8)}.message-tool,.message-observation,.message-capture{border:1px solid var(--border,#454b4e);border-radius:6px;padding:9px 11px;background:var(--bg-2,#282b2d)}.tool-status{font-size:9px;color:#77cbb4}.tool-status.running{color:var(--accent,#e4c956)}.tool-status.error,.tool-status.failed{color:var(--danger,#ef9292)}.message-pause{border:1px solid var(--accent,#e4c956);border-radius:6px;padding:12px;background:var(--bg-2,#282b2d)}.message-pause .message-heading b{color:var(--accent,#e4c956)}.pause-next{margin:8px 0;font-size:11px;color:var(--text-2,#c5cbc8)}.pause-usage{margin:8px 0 0;font-size:11px;color:var(--accent,#e4c956)}.message-error{border-left:2px solid var(--danger,#ef9292);padding-left:10px;color:var(--danger,#ef9292)}summary{cursor:pointer;font-size:10px;color:var(--text-2,#c5cbc8)}.message-details{margin-top:7px}pre{margin:8px 0 0;font-size:10px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg-1,#181b1c);padding:9px;border-radius:4px;max-height:240px;overflow:auto}figure{margin:9px 0 0;display:grid;gap:5px}figure img{max-width:100%;max-height:300px;object-fit:contain;border-radius:4px}figcaption{font-size:10px;color:var(--text-2,#c5cbc8)}.live-progress{margin:14px 0 0;font-size:10px;color:var(--text-2,#c5cbc8);display:flex;align-items:center;gap:7px}.status-dot{width:5px;height:5px;border-radius:50%;background:var(--accent,#e4c956)}
+.composer-area{flex-shrink:0;padding:10px 12px;border-top:1px solid var(--border,#454b4e);display:grid;gap:6px;background:var(--bg-1,#181b1c)}.chat-composer{border:1px solid var(--border,#454b4e);border-radius:7px;overflow:hidden;gap:0}.chat-composer:focus-within{border-color:var(--accent,#e4c956)}.chat-composer textarea{border:0;outline:0;background:transparent;resize:vertical;min-height:66px;max-height:180px;font-size:12px;line-height:1.7}.composer-footer{display:flex;justify-content:space-between;align-items:center;gap:6px;padding:6px 8px;font-size:10px;color:var(--text-2,#c5cbc8);flex-wrap:wrap}.composer-footer .actions button{font-size:10px}.hint,.feedback,.error{margin:0;font-size:10px;line-height:1.6;overflow-wrap:anywhere}.hint{color:var(--text-2,#c5cbc8)}.feedback{color:#77cbb4}.error{color:var(--danger,#ef9292)}.persistent-note{font-size:9px}.checks,.token-list{list-style:none;padding:0;margin:0;font-size:11px}.checks li{display:flex;gap:6px;flex-wrap:wrap;padding:4px 0}.token-list li{display:flex;gap:8px;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border,#454b4e)}.token-list li>div{min-width:0;overflow-wrap:anywhere}.token-list button{flex-shrink:0}.identity p{font-size:10px}
+@media(max-width:360px){.model-label{max-width:100px}.agent-header{padding:8px}.header-actions{gap:3px}.composer-area,.chat-scroll{padding:10px 8px}.message-user{margin-left:8px}.composer-footer .actions{width:100%;justify-content:flex-end}}
 </style>

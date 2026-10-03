@@ -21,7 +21,7 @@ export function eventDetails(data) {
   function redact(value) {
     if (Array.isArray(value)) return value.map(redact)
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
-      .filter(([key]) => !/image_data_url|api_key|authorization|token|password|secret|base64/i.test(key))
+      .filter(([key]) => !(value.type === 'image' && key === 'data') && !/image_data_url|image_url|api_key|authorization|token|password|secret|base64|reasoning|chain.of.thought|private.thought/i.test(key))
       .map(([key, child]) => [key, redact(child)]))
     if (typeof value === 'string' && value.startsWith('data:image/')) return '[图片]'
     return value
@@ -38,4 +38,79 @@ export function displayTime(value) {
 export const PROTOCOLS = {
   responses: { label: 'Responses', baseUrl: 'https://open.bigmodel.cn/api/v1' },
   chat_completions: { label: 'Chat Completions', baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+}
+
+export const TOOL_LABELS = {
+  target_list: '查看目标', context_get: '读取上下文', session_status: '查询会话', screen_capture: '观察画面',
+  input_tap: '点击', input_press: '长按', input_swipe: '滑动', input_key: '按键', input_text: '输入文字',
+  app_launch: '启动应用', app_stop: '停止应用', wait: '等待', session_finish: '结束会话',
+}
+export function pauseGuidance(session) {
+  if (session?.pause_reason?.suggestion) return session.pause_reason.suggestion
+  const reason = session?.reason || ''
+  if (/预算|上限|token/i.test(reason)) return '请打开运行预算，提高已耗尽的上限，再明确继续。调整预算会保留本会话的累计用量。'
+  if (/租约|令牌|MCP/.test(reason)) return '请检查外部客户端连接和令牌，再由你点击“继续 AI”；重新连接不会自行恢复。'
+  if (/目标|绑定|断开|重建/.test(reason)) return '请检查目标连接。目标身份改变时，先停止旧会话，再开始新会话。'
+  if (/失败|模型|请求|观察/.test(reason)) return '请检查连接和当前画面，可补充指令后明确继续；重复失败时先测试模型连接。'
+  return '现在可以人工操作，也可以补充指令。需要 AI 继续时，请明确发送并继续或点击“继续 AI”。'
+}
+export function tokenUsage(usage) {
+  if (usage?.total_tokens != null) return usageValue(usage, ['total_tokens'])
+  if (Number(usage?.known_tokens) > 0) return `至少 ${usageValue(usage, ['known_tokens'])}`
+  return '未知'
+}
+export function chatTimeline(session) {
+  if (!session) return []
+  const messages = session.messages || []
+  const known = new Map(messages.map(message => [message.id, message]))
+  const used = new Set(), items = [], calls = new Map()
+  const publicKinds = new Set(['user', 'assistant', 'decision', 'tool', 'tool_start', 'tool_result', 'observation', 'capture', 'state', 'error', 'model', 'progress'])
+  for (const event of (session.events || []).slice(-200)) {
+    if (!publicKinds.has(event.kind)) continue
+    const messageId = event.data?.message_id
+    if (event.kind === 'user' && messageId && used.has(messageId)) continue
+    if (messageId) used.add(messageId)
+    const stored = known.get(messageId)
+    const entry = { ...event, key: messageId ? `message:${messageId}` : `event:${event.seq}`, message: stored?.text ?? event.message, at: stored?.at || event.at }
+    const callId = event.data?.call_id || event.data?.operation_id
+    const callKey = callId ? `${event.data?.generation ?? event.generation ?? 'legacy'}:${callId}` : ''
+    if (['tool_start', 'tool_result', 'tool'].includes(event.kind)) {
+      entry.kind = 'tool'
+      entry.tool = event.data?.tool || event.data?.name || ''
+      entry.label = TOOL_LABELS[entry.tool] || entry.tool || '工具操作'
+      entry.status = event.data?.phase === 'start' || event.kind === 'tool_start' ? 'running'
+        : event.data?.ok === false || event.data?.is_error || event.data?.result?.isError ? 'error' : event.data?.status || 'success'
+      if (callKey && calls.has(callKey)) {
+        const previous = calls.get(callKey)
+        Object.assign(previous, entry, { key: previous.key, data: { ...previous.data, ...entry.data } })
+        continue
+      }
+      if (callKey) calls.set(callKey, entry)
+    }
+    if (event.kind === 'state' && (event.data?.state === 'paused' || event.data?.manual_allowed === true)) {
+      entry.kind = 'pause'; entry.pause = event.data?.pause_reason
+      entry.message = entry.pause?.detail || entry.message
+    }
+    items.push(entry)
+  }
+  for (const message of messages) {
+    if (message.role !== 'user' || used.has(message.id)) continue
+    items.push({ key: `message:${message.id}`, kind: 'user', message: message.text, at: message.at, data: {} })
+  }
+  if (!messages.length && session.goal && !items.some(item => item.kind === 'user' && item.message === session.goal)) {
+    items.unshift({ key: `goal:${session.session_id}`, kind: 'user', message: session.goal, data: {} })
+  }
+  items.sort((a, b) => {
+    const left = Date.parse(a.at), right = Date.parse(b.at)
+    if (Number.isFinite(left) && Number.isFinite(right)) return left - right
+    return Number.isFinite(left) ? -1 : Number.isFinite(right) ? 1 : 0
+  })
+  if (session.state === 'paused') {
+    const reason = session.pause_reason?.detail || session.reason || '会话已暂停'
+    const existing = items.findLast(item => item.kind === 'pause')
+    if (existing && (existing.message === reason || existing.message === session.reason || existing.pause?.at && existing.pause.at === session.pause_reason?.at)) { existing.pause = session.pause_reason; existing.current = true }
+    else items.push({ key: `pause:${session.generation}`, kind: 'pause', message: reason, pause: session.pause_reason, current: true, data: {} })
+  }
+  if (session.state === 'finished' && session.reason && !items.some(item => item.kind === 'state' && item.message?.includes(session.reason))) items.push({ key: `end:${session.session_id}`, kind: 'state', message: `会话结束：${session.reason}`, data: {} })
+  return items
 }

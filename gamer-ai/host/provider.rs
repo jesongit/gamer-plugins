@@ -26,8 +26,65 @@ pub struct ModelTurn {
     pub items: Vec<Value>,
     pub calls: Vec<ToolCall>,
     pub text: String,
+    /// Explicitly public summary_text only; never raw reasoning or encrypted content.
+    pub summary: Vec<String>,
     pub usage: Option<Value>,
     pub request_attempts: u32,
+}
+
+#[derive(Debug)]
+struct ApiFailure {
+    code: &'static str,
+    http_status: Option<u16>,
+    detail: String,
+    retryable: bool,
+    usage: Option<Value>,
+}
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+impl std::error::Error for ApiFailure {}
+fn api_failure(
+    code: &'static str,
+    http_status: Option<u16>,
+    detail: impl Into<String>,
+    retryable: bool,
+) -> anyhow::Error {
+    ApiFailure {
+        code,
+        http_status,
+        detail: detail.into(),
+        retryable,
+        usage: None,
+    }
+    .into()
+}
+pub(super) fn error_details(error: &anyhow::Error) -> Value {
+    if let Some(failure) = error.downcast_ref::<ApiFailure>() {
+        json!({"code":failure.code,"http_status":failure.http_status,"detail":failure.detail,"retryable":failure.retryable})
+    } else {
+        json!({"code":"model_response_error","detail":error.to_string(),"retryable":true})
+    }
+}
+pub(super) fn error_usage(error: &anyhow::Error) -> Option<&Value> {
+    error
+        .downcast_ref::<ApiFailure>()
+        .and_then(|failure| failure.usage.as_ref())
+}
+fn redact_error(error: anyhow::Error, key: &str) -> anyhow::Error {
+    let safe: String = error
+        .to_string()
+        .replace(key, "[redacted]")
+        .chars()
+        .take(1000)
+        .collect();
+    if let Some(failure) = error.downcast_ref::<ApiFailure>() {
+        api_failure(failure.code, failure.http_status, safe, failure.retryable)
+    } else {
+        api_failure("model_response_error", None, safe, true)
+    }
 }
 
 pub struct Provider {
@@ -127,8 +184,14 @@ impl Provider {
         .map_err(|error| transport_error(&error))?;
         let status = response.status();
         let bytes = read_limited(response, cancel).await?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("AI API 返回非 JSON 响应（HTTP {}）", status.as_u16()))?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            api_failure(
+                "invalid_response",
+                Some(status.as_u16()),
+                format!("AI API 返回非 JSON 响应（HTTP {}）", status.as_u16()),
+                status.is_server_error() || status.is_success(),
+            )
+        })?;
         if !status.is_success() {
             let message = value
                 .pointer("/error/message")
@@ -140,14 +203,33 @@ impl Provider {
                 .chars()
                 .take(512)
                 .collect();
-            anyhow::bail!("AI API HTTP {}: {}（未自动重试）", status.as_u16(), safe);
+            return Err(api_failure(
+                "http_error",
+                Some(status.as_u16()),
+                format!("AI API HTTP {}: {}（未自动重试）", status.as_u16(), safe),
+                status.is_server_error() || status.as_u16() == 429,
+            ));
         }
         ensure!(!cancel.load(Ordering::Acquire), "CANCELLED: AI 请求已取消");
-        let mut turn = if self.config.protocol == "responses" {
-            parse_responses(value)?
+        let usage = value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .cloned();
+        let parsed = if self.config.protocol == "responses" {
+            parse_responses(value)
         } else {
-            parse_chat(value)?
+            parse_chat(value)
         };
+        let mut turn = parsed.map_err(|error| {
+            let safe = redact_error(error, &self.config.api_key);
+            match safe.downcast::<ApiFailure>() {
+                Ok(mut failure) => {
+                    failure.usage = usage;
+                    failure.into()
+                }
+                Err(error) => error,
+            }
+        })?;
         turn.request_attempts = 1;
         Ok(turn)
     }
@@ -340,16 +422,16 @@ async fn read_limited(mut response: reqwest::Response, cancel: &AtomicBool) -> R
 fn transport_error(error: &reqwest::Error) -> anyhow::Error {
     // reqwest's Display can include URLs. Keep supplier diagnostics separate
     // and never include headers, response bodies or the connection credential.
-    let reason = if error.is_timeout() {
-        "请求超时"
+    let (code, reason) = if error.is_timeout() {
+        ("request_timeout", "请求超时")
     } else if error.is_connect() {
-        "无法连接"
+        ("connection_failed", "无法连接")
     } else if error.is_body() {
-        "读取响应失败"
+        ("response_read_failed", "读取响应失败")
     } else {
-        "网络请求失败"
+        ("network_error", "网络请求失败")
     };
-    anyhow::anyhow!("AI API {}（未自动重试）", reason)
+    api_failure(code, None, format!("AI API {}（未自动重试）", reason), true)
 }
 
 fn tool_output(output: &Value, call_id: &str) -> Result<(String, Vec<Value>)> {
@@ -613,10 +695,48 @@ fn parse_call(item: &Value) -> Result<ToolCall> {
 
 fn parse_responses(value: Value) -> Result<ModelTurn> {
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        anyhow::bail!("AI Responses 返回错误");
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("供应商未提供错误详情");
+        return Err(api_failure(
+            "response_failed",
+            None,
+            format!(
+                "AI Responses 返回错误：{}",
+                message.chars().take(512).collect::<String>()
+            ),
+            true,
+        ));
     }
     if let Some(status) = value.get("status").and_then(Value::as_str) {
-        ensure!(status == "completed", "AI Responses 未完整结束：{}", status);
+        if status != "completed" {
+            let reason = value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str);
+            let (code, detail, retryable) = match reason {
+                Some("max_output_tokens") => (
+                    "output_limit",
+                    "模型输出达到本轮响应 token 上限，回答或工具调用未完整生成；本轮未执行这些操作"
+                        .to_string(),
+                    false,
+                ),
+                Some("content_filter") => (
+                    "content_filter",
+                    "供应商内容过滤导致回答未完整生成；请调整指令或场景".to_string(),
+                    false,
+                ),
+                _ => (
+                    "incomplete_response",
+                    format!(
+                        "AI Responses 未完整结束：{}；本轮未执行未完成的操作",
+                        status.chars().take(64).collect::<String>()
+                    ),
+                    true,
+                ),
+            };
+            return Err(api_failure(code, None, detail, retryable));
+        }
     }
     let output = value
         .get("output")
@@ -625,6 +745,7 @@ fn parse_responses(value: Value) -> Result<ModelTurn> {
     let mut items = Vec::new();
     let mut calls = Vec::new();
     let mut texts = Vec::new();
+    let mut summary = Vec::new();
     let mut seen = HashSet::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
@@ -654,9 +775,25 @@ fn parse_responses(value: Value) -> Result<ModelTurn> {
                     items.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}));
                 }
             }
-            // Hidden reasoning is intentionally not logged or requested. Public
-            // assistant text and function calls are enough for this V1 adapter.
-            Some("reasoning") => {}
+            Some("reasoning") => {
+                // Suppliers may omit a public summary. Do not use content,
+                // reasoning_content, encrypted_content, or invent a substitute.
+                if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+                    for part in parts.iter().take(8) {
+                        if part.get("type").and_then(Value::as_str) == Some("summary_text") {
+                            if let Some(text) = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.trim().is_empty())
+                            {
+                                if summary.len() < 8 {
+                                    summary.push(text.chars().take(4000).collect());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => anyhow::bail!("AI Responses 返回不支持的 output 类型"),
         }
     }
@@ -669,6 +806,7 @@ fn parse_responses(value: Value) -> Result<ModelTurn> {
         items,
         calls,
         text: texts.join("\n"),
+        summary,
         usage,
         request_attempts: 1,
     })
@@ -684,13 +822,27 @@ fn parse_chat(value: Value) -> Result<ModelTurn> {
         "AI Chat Completions 必须返回一个 choice"
     );
     let choice = &choices[0];
-    ensure!(
-        matches!(
-            choice.get("finish_reason").and_then(Value::as_str),
-            Some("stop" | "tool_calls")
-        ),
-        "AI Chat Completions 未完整结束"
-    );
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    if !matches!(finish_reason, Some("stop" | "tool_calls")) {
+        let (code, detail, retryable) = match finish_reason {
+            Some("length") => (
+                "output_limit",
+                "模型输出达到本轮响应 token 上限，回答或工具调用未完整生成；本轮未执行这些操作",
+                false,
+            ),
+            Some("content_filter") => (
+                "content_filter",
+                "供应商内容过滤导致回答未完整生成；请调整指令或场景",
+                false,
+            ),
+            _ => (
+                "incomplete_response",
+                "AI Chat Completions 未完整结束；本轮未执行未完成的操作",
+                true,
+            ),
+        };
+        return Err(api_failure(code, None, detail, retryable));
+    }
     let message = choice
         .get("message")
         .context("AI Chat Completions 缺少 message")?;
@@ -735,6 +887,7 @@ fn parse_chat(value: Value) -> Result<ModelTurn> {
         items,
         calls,
         text,
+        summary: Vec::new(),
         usage: value
             .get("usage")
             .filter(|value| value.is_object())
@@ -746,6 +899,53 @@ fn parse_chat(value: Value) -> Result<ModelTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_summary_is_separate_from_private_reasoning() {
+        let turn = parse_responses(json!({"status":"completed","output":[
+            {"type":"reasoning","encrypted_content":"private-encrypted","content":[{"type":"reasoning_text","text":"private-thought"}],
+             "summary":[{"type":"summary_text","text":"先核对当前画面，再选择入口。"},{"type":"reasoning_text","text":"private-ignored"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"准备打开设置。"}]}
+        ]})).unwrap();
+        assert_eq!(turn.summary, ["先核对当前画面，再选择入口。"]);
+        assert_eq!(turn.text, "准备打开设置。");
+        assert!(!serde_json::to_string(&turn.items)
+            .unwrap()
+            .contains("private"));
+        let chat = parse_chat(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"公开回答","reasoning_content":"private-thought"}}]})).unwrap();
+        assert!(chat.summary.is_empty());
+        assert!(!serde_json::to_string(&chat.items)
+            .unwrap()
+            .contains("private"));
+    }
+
+    #[test]
+    fn incomplete_responses_explain_the_limit_and_never_execute_partial_calls() {
+        let error = parse_responses(json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{"type":"function_call","call_id":"partial","name":"input_tap","arguments":"{}"}]})).unwrap_err();
+        let details = error_details(&error);
+        assert_eq!(details["code"], "output_limit");
+        assert_eq!(details["retryable"], false);
+        assert!(details["detail"].as_str().unwrap().contains("本轮未执行"));
+        let chat = parse_chat(json!({"choices":[{"finish_reason":"length","message":{"role":"assistant","content":""}}]})).unwrap_err();
+        assert_eq!(error_details(&chat)["code"], "output_limit");
+    }
+
+    #[test]
+    fn provider_error_details_redact_credentials_and_keep_actionable_fields() {
+        let error = api_failure(
+            "http_error",
+            Some(401),
+            "AI API HTTP 401: echoed-test-key",
+            false,
+        );
+        let error = redact_error(error, "echoed-test-key");
+        let details = error_details(&error);
+        assert_eq!(details["http_status"], 401);
+        assert_eq!(details["retryable"], false);
+        assert!(!details.to_string().contains("echoed-test-key"));
+        assert!(details["detail"].as_str().unwrap().contains("[redacted]"));
+    }
 
     #[test]
     fn tool_images_are_real_visual_input_in_both_protocols() {

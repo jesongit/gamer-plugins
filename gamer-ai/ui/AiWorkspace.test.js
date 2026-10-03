@@ -30,6 +30,15 @@ beforeEach(() => {
     if (action === 'session.start') { sessions = [{ ...makeSession('starting', values.mode), ...values }]; return { session_id: 's1', run_id: 'r1' } }
     if (action === 'session.pause') { sessions[0].state = 'pausing'; return {} }
     if (action === 'session.resume') { sessions[0].state = 'resuming'; return {} }
+    if (action === 'session.message') {
+      const message = { id: 'm2', role: 'user', text: values.message, at: '2026-10-03T12:01:00Z' }
+      sessions[0].messages ||= [{ id: 'm1', role: 'user', text: sessions[0].goal, at: '2026-10-03T12:00:00Z' }]
+      sessions[0].messages.push(message)
+      sessions[0].events.push({ seq: sessions[0].events.length + 1, kind: 'user', message: message.text, at: message.at, data: { message_id: message.id } })
+      if (values.limits) sessions[0].limits = values.limits
+      sessions[0].state = values.resume ? 'running' : 'paused'
+      return { session: structuredClone(sessions[0]), resumed: values.resume }
+    }
     if (action === 'session.stop') { sessions[0].state = 'finished'; sessions[0].reason = 'cancelled'; return {} }
     if (action === 'mcp.tokens.create') { const value = { ...values, token_id: 't1', token: 'temporary-test-token', expires_at: 1800000000 }; tokens.push({ ...value, token: undefined }); return value }
     if (action === 'mcp.tokens.revoke') { tokens = tokens.filter(token => token.token_id !== values.token_id); return {} }
@@ -47,7 +56,7 @@ it('打开面板只读取配置、会话和令牌，关闭不取消服务端运�
 
 it('开始会话使用宿主设备与配置包，不从Android包名推导；提交完整预算', async () => {
   const wrapper = await mountWorkspace()
-  await wrapper.get('[aria-label="目标描述"]').setValue('  完成新手教程  ')
+  await wrapper.get('[aria-label="消息"]').setValue('  完成新手教程  ')
   await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.start', {
     device_id: 'phone', content_package: 'default', goal: '完成新手教程', mode: 'api',
@@ -95,7 +104,6 @@ it('连接能力测试尚未返回时，仍可暂停和停止正在运行的会�
   await wrapper.get('[aria-controls="ai-settings"]').trigger('click')
   await button(wrapper, '测试已保存配置').trigger('click'); await flushPromises()
   expect(wrapper.text()).toContain('测试已保存的连接…')
-  await wrapper.get('[aria-controls="ai-play"]').trigger('click')
   expect(button(wrapper, '暂停 AI').element.disabled).toBe(false)
   expect(button(wrapper, '停止会话').element.disabled).toBe(false)
   await button(wrapper, '暂停 AI').trigger('click'); await flushPromises()
@@ -186,9 +194,8 @@ it('外部MCP不要求API密钥，控制令牌需已建立同目标的外部会�
   await wrapper.get('[aria-controls="ai-mcp"]').trigger('click')
   await wrapper.get('[aria-label="授权范围"]').setValue('true')
   expect(button(wrapper, '创建连接令牌').element.disabled).toBe(true)
-  await wrapper.get('[aria-controls="ai-play"]').trigger('click')
   await wrapper.get('[aria-label="控制方式"]').setValue('mcp')
-  await wrapper.get('[aria-label="目标描述"]').setValue('通过外部客户端控制')
+  await wrapper.get('[aria-label="消息"]').setValue('通过外部客户端控制')
   expect(button(wrapper, '建立外部控制会话').element.disabled).toBe(false)
   await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
   await wrapper.get('[aria-controls="ai-mcp"]').trigger('click')
@@ -215,4 +222,140 @@ it('观察记录只展示真实data图片，事件详情去掉秘密及大块图
   expect(wrapper.get('.events pre').text()).not.toContain('never-display')
   expect(wrapper.get('.events pre').text()).not.toContain('AA==')
   expect(wrapper.get('.events pre').text()).not.toContain('secret')
+})
+
+it('运行中发送新指令明确打断后继续，使用同一会话且保留原始目标', async () => {
+  sessions = [makeSession()]
+  const wrapper = await mountWorkspace()
+  expect(wrapper.get('#ai-play').text()).toContain('发送新指令会打断本轮')
+  await wrapper.get('[aria-label="消息"]').setValue('先检查右上角的设置按钮')
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.message', { session_id: 's1', message: '先检查右上角的设置按钮', resume: true })
+  expect(mocks.call.mock.calls.some(call => call[1] === 'session.start' || call[1] === 'session.resume')).toBe(false)
+  expect(sessions[0].goal).toBe('完成教程')
+  expect(wrapper.findAll('.message-user').map(item => item.text().includes('先检查')).filter(Boolean)).toHaveLength(1)
+  expect(wrapper.findAll('.message-user')).toHaveLength(2)
+  expect(wrapper.get('[aria-label="消息"]').element.value).toBe('')
+})
+
+it('暂停时可仅发送指令，保持暂停且不静默恢复', async () => {
+  sessions = [makeSession('paused')]
+  const wrapper = await mountWorkspace()
+  await wrapper.get('[aria-label="消息"]').setValue('我先人工调整，请等候')
+  await button(wrapper, '仅发送，保持暂停').trigger('click'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.message', { session_id: 's1', message: '我先人工调整，请等候', resume: false })
+  expect(wrapper.get('[data-testid="session-state"]').text()).toContain('已暂停')
+  expect(wrapper.text()).toContain('消息已接收，会话保持暂停')
+})
+
+it('消息被接收但恢复失败时保留气泡并清草稿，说明仍暂停', async () => {
+  sessions = [makeSession('paused')]
+  const wrapper = await mountWorkspace()
+  const implementation = mocks.call.getMockImplementation()
+  mocks.call.mockImplementation(async (id, action, values) => {
+    if (action !== 'session.message') return implementation(id, action, values)
+    const reply = await implementation(id, action, { ...values, resume: false })
+    return { ...reply, resume_error: '目标已断开' }
+  })
+  await wrapper.get('[aria-label="消息"]').setValue('连接恢复后再继续')
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  expect(wrapper.get('[role="alert"]').text()).toContain('消息已接收，恢复未完成：目标已断开')
+  expect(wrapper.get('[aria-label="消息"]').element.value).toBe('')
+  expect(wrapper.findAll('.message-user').some(item => item.text().includes('连接恢复后再继续'))).toBe(true)
+  expect(wrapper.get('[data-testid="session-state"]').text()).toContain('已暂停')
+})
+
+it('预算暂停显示已知token下限，提高上限时才提交完整新预算', async () => {
+  sessions = [{ ...makeSession('paused'), reason: 'Token 使用达到预算', usage: { ...makeSession().usage, known_tokens: 105396, has_unknown_tokens: true } }]
+  const wrapper = await mountWorkspace()
+  expect(wrapper.get('.message-pause').text()).toContain('至少 105,396 / 100,000')
+  expect(wrapper.get('.message-pause').text()).toContain('部分请求用量未知')
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(true)
+  await button(wrapper, '调整运行预算').trigger('click')
+  expect(wrapper.get('[aria-label="最大模型轮数"]').element.value).toBe('100')
+  await wrapper.get('[aria-label="累计 token 上限（0 表示无上限）"]').setValue(200000)
+  await button(wrapper, '调整预算并继续').trigger('click'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.resume', { session_id: 's1', limits: { max_turns: 100, max_actions: 200, max_seconds: 600, max_tokens: 200000, max_failures: 3 } })
+})
+
+it('token上限可设0解除预算暂停，其余预算保留正数下限', async () => {
+  sessions = [{ ...makeSession('paused'), reason: 'Token 使用达到预算', usage: { ...makeSession().usage, known_tokens: 105396, has_unknown_tokens: true } }]
+  const wrapper = await mountWorkspace()
+  await button(wrapper, '调整运行预算').trigger('click')
+  const tokenBudget = wrapper.get('[aria-label="累计 token 上限（0 表示无上限）"]')
+  expect(tokenBudget.attributes('min')).toBe('0')
+  expect(wrapper.get('[aria-label="最大模型轮数"]').attributes('min')).toBe('1')
+  await tokenBudget.setValue(0)
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(false)
+  await wrapper.get('[aria-label="消息"]').setValue('提高预算，继续当前任务')
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.message', { session_id: 's1', message: '提高预算，继续当前任务', resume: true,
+    limits: { max_turns: 100, max_actions: 200, max_seconds: 600, max_tokens: 0, max_failures: 3 } })
+  expect(wrapper.get('.usage-grid').text()).toContain('不限')
+})
+
+it('时间线合并工具进度与结果、公开摘要，隐藏私密推理并折叠截图', async () => {
+  sessions = [{ ...makeSession(), messages: [{ id: 'm1', role: 'user', text: '完成教程', at: '2026-10-03T12:00:00Z' }], events: [
+    { seq: 1, kind: 'user', message: '完成教程', at: '2026-10-03T12:00:00Z', data: { message_id: 'm1' } },
+    { seq: 2, kind: 'decision', message: '先观察按钮位置，再进行点击', data: { category: 'summary', generation: 1 } },
+    { seq: 3, kind: 'tool_start', message: '正在点击', data: { call_id: 'c1', tool: 'input_tap', arguments: { x: 12, y: 20 } } },
+    { seq: 4, kind: 'tool_result', message: '点击已注入，请观察后续画面', data: { call_id: 'c1', tool: 'input_tap', status: 'success', result: { ok: true } } },
+    { seq: 5, kind: 'observation', message: '已观察新画面', data: { image_data_url: 'data:image/png;base64,AA==' } },
+    { seq: 6, kind: 'reasoning', message: 'NEVER_DISPLAY_PRIVATE_REASONING', data: {} },
+  ] }]
+  const wrapper = await mountWorkspace()
+  expect(wrapper.findAll('.message-user')).toHaveLength(1)
+  expect(wrapper.findAll('.message-tool')).toHaveLength(1)
+  expect(wrapper.get('.message-tool').text()).toContain('点击已注入')
+  expect(wrapper.get('.message-tool pre').text()).toContain('"x": 12')
+  expect(wrapper.get('.message-tool pre').text()).toContain('"ok": true')
+  expect(wrapper.get('.message-decision').text()).toContain('公开决策说明')
+  expect(wrapper.get('.message-user').find('details').exists()).toBe(false)
+  expect(wrapper.get('.message-decision').find('details').exists()).toBe(false)
+  expect(wrapper.text()).not.toContain('NEVER_DISPLAY_PRIVATE_REASONING')
+  expect(wrapper.get('.message-observation details').attributes('open')).toBeUndefined()
+})
+
+it('查看其他工作台scope的会话时禁发后续消息，显式新会话绑定当前scope', async () => {
+  sessions = [makeSession('paused')]
+  const wrapper = await mountWorkspace()
+  context.deviceId = 'browser'; context.currentPackageId = 'other'; await flushPromises()
+  await wrapper.get('[aria-label="消息"]').setValue('新设备执行目标')
+  expect(button(wrapper, '发送并继续').element.disabled).toBe(true)
+  await button(wrapper, '新会话').trigger('click')
+  await wrapper.get('[aria-label="消息"]').setValue('当前设备观察画面')
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  const start = mocks.call.mock.calls.find(call => call[1] === 'session.start')
+  expect(start[2].device_id).toBe('browser')
+  expect(start[2].content_package).toBe('other')
+})
+
+it('预算输入校验拒绝不足2048的非零token与小数预算，设为0可继续', async () => {
+  sessions = [makeSession('paused')]
+  const wrapper = await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-budget"]').trigger('click')
+  await wrapper.get('[aria-label="消息"]').setValue('继续原任务')
+  const tokenBudget = wrapper.get('[aria-label="累计 token 上限（0 表示无上限）"]')
+  await tokenBudget.setValue(1024)
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(true)
+  expect(button(wrapper, '发送并继续').element.disabled).toBe(true)
+  expect(button(wrapper, '调整预算并继续').element.disabled).toBe(true)
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  expect(mocks.call.mock.calls.some(call => call[1] === 'session.message')).toBe(false)
+  await tokenBudget.setValue(0)
+  expect(button(wrapper, '发送并继续').element.disabled).toBe(false)
+  await wrapper.get('[aria-label="最大模型轮数"]').setValue(12.5)
+  expect(button(wrapper, '发送并继续').element.disabled).toBe(true)
+  expect(wrapper.get('#ai-budget').text()).toContain('运行预算超出允许范围')
+})
+
+it('真实tool phase开始显示执行中，结果失败后更新同一张工具卡', async () => {
+  sessions = [{ ...makeSession(), events: [{ seq: 1, kind: 'tool', message: '正在执行 input_tap', data: { phase: 'start', generation: 1, call_id: 'c1', tool: 'input_tap', arguments: { x: 4, y: 8 } } }] }]
+  const wrapper = await mountWorkspace()
+  expect(wrapper.get('.tool-status').text()).toBe('执行中')
+  sessions[0].events.push({ seq: 2, kind: 'tool', message: '工具 input_tap 执行失败', data: { phase: 'result', generation: 1, call_id: 'c1', tool: 'input_tap', ok: false, result: { error: 'stale_frame' } } })
+  await button(wrapper, '刷新').trigger('click'); await flushPromises()
+  expect(wrapper.findAll('.message-tool')).toHaveLength(1)
+  expect(wrapper.get('.tool-status').text()).toBe('失败')
+  expect(wrapper.get('.message-tool pre').text()).toContain('stale_frame')
 })
