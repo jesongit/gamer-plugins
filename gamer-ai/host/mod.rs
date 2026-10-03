@@ -98,6 +98,7 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
     })
 }
 
+#[derive(Clone)]
 pub struct Runtime {
     pub devices: Arc<DeviceManager>,
     pub packages: Arc<PackageStore>,

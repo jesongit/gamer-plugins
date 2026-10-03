@@ -206,34 +206,7 @@ impl MemoryStore {
                 chunk.state == "claimed" && chunk.claim_id.as_deref() == Some(claim_id),
                 "memory.import_claim_conflict"
             );
-            let disposition = required(&outcome, "disposition")?.to_owned();
-            ensure!(
-                ["created", "updated", "merged", "retained", "skipped", "failed"]
-                    .contains(&disposition.as_str()),
-                "memory.import_disposition_invalid"
-            );
-            if matches!(disposition.as_str(), "created" | "updated" | "merged") {
-                let target_op = required(&outcome, "operation_id")?;
-                let e = self
-                    .packages
-                    .read_text(
-                        pkg,
-                        PLUGIN,
-                        &format!("memory-operations/{}.json", hash(target_op)),
-                    )?
-                    .context("memory.import_target_not_committed")?;
-                let receipt: Value = serde_json::from_str(&e.content)?;
-                ensure!(
-                    receipt["result"]["saved"] == true,
-                    "memory.import_target_not_committed"
-                );
-                if let Some(target) = outcome.get("id").and_then(Value::as_str) {
-                    ensure!(
-                        receipt["result"]["id"] == target,
-                        "memory.import_target_mismatch"
-                    );
-                }
-            }
+            let disposition = self.validate_import_outcome_unlocked(pkg, &outcome)?;
             chunk.state = "completed".into();
             chunk.outcome = Some(outcome);
             chunk.claim_id = None;
@@ -247,6 +220,58 @@ impl MemoryStore {
             self.save_job(&job)?;
             Ok(job_summary(&job))
         })
+    }
+    /// Preflight gives the model a normal tool error so it can correct a bad
+    /// target. Final completion repeats the same checks under its commit gate.
+    pub(in super::super) fn validate_import_outcome(
+        &self,
+        pkg: &str,
+        job_id: &str,
+        outcome: &Value,
+    ) -> Result<()> {
+        let _guard = self.gate.lock();
+        self.packages.with_package_read(pkg, || {
+            ensure!(
+                self.import_job_active_unlocked(pkg, job_id)?,
+                "memory.import_not_active"
+            );
+            self.validate_import_outcome_unlocked(pkg, outcome)
+                .map(|_| ())
+        })
+    }
+    fn validate_import_outcome_unlocked(&self, pkg: &str, outcome: &Value) -> Result<String> {
+        let disposition = required(outcome, "disposition")?.to_owned();
+        ensure!(
+            ["created", "updated", "merged", "retained", "skipped", "failed"]
+                .contains(&disposition.as_str()),
+            "memory.import_disposition_invalid"
+        );
+        if matches!(disposition.as_str(), "created" | "updated" | "merged") {
+            let target_op = required(outcome, "operation_id")?;
+            let entry = self
+                .packages
+                .read_text(
+                    pkg,
+                    PLUGIN,
+                    &format!("memory-operations/{}.json", hash(target_op)),
+                )?
+                .context("memory.import_target_not_committed")?;
+            let receipt: Value = serde_json::from_str(&entry.content)?;
+            ensure!(
+                receipt["result"]["saved"] == true,
+                "memory.import_target_not_committed"
+            );
+            self.ensure_import_guide_target(pkg, required(&receipt["result"], "id")?)?;
+            if let Some(target) = outcome.get("id").and_then(Value::as_str) {
+                ensure!(
+                    receipt["result"]["id"] == target,
+                    "memory.import_target_mismatch"
+                );
+            }
+        } else if disposition == "retained" {
+            self.ensure_import_guide_target(pkg, required(outcome, "id")?)?;
+        }
+        Ok(disposition)
     }
     pub fn fail_import_chunk(
         &self,
@@ -612,6 +637,16 @@ impl MemoryStore {
         let _guard = self.gate.lock();
         self.packages
             .with_package_read(pkg, || self.read_job(pkg, job_id))
+    }
+    pub(in super::super) fn import_source_text(&self, pkg: &str, job_id: &str) -> Result<String> {
+        let _guard = self.gate.lock();
+        self.packages.with_package_read(pkg, || {
+            let job = self.read_job(pkg, job_id)?;
+            Ok(self
+                .read_source(pkg, &job.source_id, Some(job.source_revision))?
+                .0
+                .text)
+        })
     }
     pub(super) fn source_conflicts(&self, pkg: &str, m: &Memory) -> Result<Vec<Value>> {
         let mut conflicts = Vec::new();

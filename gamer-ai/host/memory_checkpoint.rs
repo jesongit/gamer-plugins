@@ -144,6 +144,16 @@ fn due(record: &Record, checkpoint: &Checkpoint, events: &[Value], force: bool) 
 
 impl State {
     pub(super) async fn checkpoint_games(self: &Arc<Self>) {
+        // Separate compensation remains eligible even if the experience cursor
+        // already archived the entire old session.
+        if let Ok(records) = self.conversations.game_definition_records() {
+            for record in records {
+                let _guard = self.memory_checkpoint_gate.lock().await;
+                if let Err(error) = self.recover_game_definitions(&record).await {
+                    tracing::warn!(%error,conversation=%record.conversation_id,"补偿用户定义失败");
+                }
+            }
+        }
         let records = match self.conversations.game_records() {
             Ok(records) => records,
             Err(error) => {
@@ -183,6 +193,7 @@ impl State {
         if record.state == "package_deleted" {
             return Ok(());
         }
+        self.recover_game_definitions(record).await?;
         let _package = self
             .runtime
             .packages
@@ -429,6 +440,42 @@ impl State {
         Ok(())
     }
 
+    async fn recover_game_definitions(&self, record: &Record) -> Result<()> {
+        let events = self
+            .conversations
+            .unscanned_game_users(&record.conversation_id, record.latest_seq)?;
+        for event in &events {
+            let message = event["data"]["message_id"].as_str().unwrap_or("");
+            if !message.is_empty()
+                && !self
+                    .conversations
+                    .definition_is_linked(&record.conversation_id, message)?
+            {
+                if let Some(result) = self
+                    .protect_journal_definition(
+                        &record.content_package,
+                        &record.conversation_id,
+                        message,
+                        event["message"].as_str().unwrap_or(""),
+                        &AtomicBool::new(false),
+                    )
+                    .await?
+                {
+                    self.conversations.event(&record.conversation_id,"memory_staged","已保存受保护的用户定义",json!({"message_id":message,"memory":result,"automatic":true,"recovered":true}))?;
+                }
+            }
+            self.conversations.save_definition_scan(
+                &record.conversation_id,
+                event["seq"].as_u64().unwrap_or(0),
+            )?;
+        }
+        if events.len() < 128 {
+            self.conversations
+                .save_definition_scan(&record.conversation_id, record.latest_seq)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn sync_memory_job_events(&self) -> Result<()> {
         for (id, package, job, last) in self.conversations.memory_job_links()? {
             let Ok(record) = self.memory.import_job_record(&package, &job) else {
@@ -485,11 +532,10 @@ impl State {
                 .as_ref()
                 .is_err_and(|error| error.to_string().contains("permanently_deleted"));
             let mut definition_deleted = false;
-            let source = self.memory.import_job_record(package, job)?;
+            let source_text = self.memory.import_source_text(package, job)?;
             for (memory, literal) in self.conversations.memory_definition_links(&id)? {
                 let safe = public_text(&literal);
-                if safe.is_empty() || !source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
-                {
+                if safe.is_empty() || !source_text.contains(&safe) {
                     continue;
                 }
                 let original = self
@@ -536,7 +582,7 @@ impl State {
         job: &str,
     ) -> Result<Vec<super::memory::ImportOrigin>> {
         let mut origins = Vec::new();
-        let source = self.memory.import_job_record(package, job)?;
+        let source_text = self.memory.import_source_text(package, job)?;
         for (id, linked_package, linked_job, _) in self.conversations.memory_job_links()? {
             if linked_package != package || linked_job != job {
                 continue;
@@ -546,8 +592,7 @@ impl State {
             }
             for (memory, literal) in self.conversations.memory_definition_links(&id)? {
                 let safe = public_text(&literal);
-                if !safe.is_empty() && source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
-                {
+                if !safe.is_empty() && source_text.contains(&safe) {
                     origins.push(super::memory::ImportOrigin::Definition {
                         id: memory,
                         literal,
@@ -1345,6 +1390,155 @@ mod tests {
             }
             ai.state.stop_all().await;
         }
+    }
+    #[tokio::test]
+    async fn completed_checkpoint_recovers_real_seq_1402_user_definition_once_and_honors_deletion()
+    {
+        let (root, ai, _extensions) = fixture().await;
+        freeze(&ai.state).await;
+        let id = "old-user-definition";
+        let literal =
+            "双箭头是二倍速，后面那个才是自动战斗，另外你可以点在后面的按钮可以退出这次啊";
+        game(&ai, id);
+        for seq in 1..1402 {
+            game_event(
+                &ai,
+                id,
+                "assistant_delta",
+                "",
+                json!({"delta":format!("旧流式输出{seq}：▶▶就是自动战斗")}),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            game_event(
+                &ai,
+                id,
+                "user",
+                literal,
+                json!({"message_id":"real-human-1402","turn_id":"game:1:turn:63"})
+            )
+            .unwrap(),
+            1402
+        );
+        for _ in 1403..=1424 {
+            game_event(
+                &ai,
+                id,
+                "assistant_delta",
+                "",
+                json!({"delta":"旧流式输出"}),
+            )
+            .unwrap();
+        }
+        ai.state
+            .conversations
+            .save_memory_checkpoint(
+                id,
+                &Checkpoint {
+                    seq: 1424,
+                    saved_at: Some(Utc::now().to_rfc3339()),
+                    suppressed: false,
+                },
+            )
+            .unwrap();
+        assert!(ai.state.conversations.game_records().unwrap().is_empty());
+        ai.state.enabled.store(false, Ordering::Release);
+        ai.state.checkpoint_games().await;
+        let definitions = ai
+            .state
+            .memory
+            .call(
+                "memory_list",
+                "default",
+                json!({"protected_only":true,"validation":"any"}),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(definitions["total"], 1);
+        let memory = definitions["items"][0]["id"].as_str().unwrap();
+        let saved = ai
+            .state
+            .memory
+            .call("memory_get", "default", json!({"id":memory}), None, false)
+            .await
+            .unwrap();
+        assert_eq!(saved["memory"]["body"], literal);
+        assert_eq!(saved["memory"]["validation"], "pending");
+        assert!(saved["memory"]["protected_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "body"));
+        assert_eq!(
+            ai.state
+                .conversations
+                .memory_definition_links(id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(ai
+            .state
+            .conversations
+            .game_definition_records()
+            .unwrap()
+            .is_empty());
+        ai.state.checkpoint_games().await;
+        assert_eq!(
+            ai.state
+                .memory
+                .call("memory_get", "default", json!({"id":memory}), None, false)
+                .await
+                .unwrap()["revision"],
+            saved["revision"]
+        );
+        ai.state.memory.call("memory_delete","default",json!({"id":memory,"expected_version":saved["version"],"operation_id":"delete-recovered-definition","reason":"用户删除旧定义"}),None,true).await.unwrap();
+        // A repeated durable human message still points to the deleted original;
+        // neither a restart nor a replay creates a replacement definition.
+        game_event(
+            &ai,
+            id,
+            "user",
+            literal,
+            json!({"message_id":"real-human-1402"}),
+        )
+        .unwrap();
+        let restored = AiService::new(ai.state.runtime.clone(), root.path()).unwrap();
+        restored.state.checkpoint_games().await;
+        assert_eq!(
+            restored
+                .state
+                .memory
+                .call("memory_get", "default", json!({"id":memory}), None, false)
+                .await
+                .unwrap()["memory"]["status"],
+            "deleted"
+        );
+        assert_eq!(
+            restored
+                .state
+                .memory
+                .call(
+                    "memory_list",
+                    "default",
+                    json!({"protected_only":true,"status":"active"}),
+                    None,
+                    false
+                )
+                .await
+                .unwrap()["total"],
+            0
+        );
+        assert!(restored
+            .state
+            .conversations
+            .game_definition_records()
+            .unwrap()
+            .is_empty());
+        ai.state.stop_all().await;
     }
     #[tokio::test]
     async fn restart_honors_deletion_of_a_legacy_terminal_source_using_its_exact_job_link() {

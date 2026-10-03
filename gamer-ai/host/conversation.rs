@@ -108,6 +108,8 @@ impl Conversations {
             CREATE TABLE IF NOT EXISTS memory_checkpoints(conversation TEXT PRIMARY KEY,record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memory_job_links(conversation TEXT NOT NULL,package TEXT NOT NULL,job TEXT NOT NULL,summary TEXT NOT NULL DEFAULT '',PRIMARY KEY(conversation,job));
             CREATE TABLE IF NOT EXISTS memory_definition_links(conversation TEXT NOT NULL,message TEXT NOT NULL,memory TEXT NOT NULL,PRIMARY KEY(conversation,message));
+            CREATE TABLE IF NOT EXISTS memory_definition_scans(conversation TEXT PRIMARY KEY,seq INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS game_user_definition_events ON events(conversation,seq) WHERE json_extract(event,'$.kind')='user' AND (json_extract(event,'$.data.origin')='gameplay' OR json_extract(event,'$.data.turn_id') LIKE 'game:%') AND json_extract(event,'$.data.message_id') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS inbox_queue ON inbox(conversation,status,at);")?;
         db.execute("INSERT OR IGNORE INTO memory_job_links(conversation,package,job) SELECT e.conversation,c.package,json_extract(e.event,'$.data.result.job_id') FROM events e JOIN conversations c ON c.id=e.conversation WHERE json_extract(e.event,'$.kind')='memory_job' AND json_extract(e.event,'$.data.result.job_id') IS NOT NULL",[])?;
         db.execute("INSERT OR IGNORE INTO memory_definition_links(conversation,message,memory) SELECT e.conversation,json_extract(e.event,'$.data.message_id'),json_extract(e.event,'$.data.memory.id') FROM events e WHERE json_extract(e.event,'$.kind')='memory_staged' AND json_extract(e.event,'$.data.message_id') IS NOT NULL AND json_extract(e.event,'$.data.memory.id') IS NOT NULL",[])?;
@@ -290,6 +292,33 @@ impl Conversations {
     ) -> Result<()> {
         self.db.lock().execute("INSERT OR IGNORE INTO memory_definition_links(conversation,message,memory) VALUES(?1,?2,?3)",params![id,message,memory])?;
         Ok(())
+    }
+    /// Definition recovery has its own cursor: a completed experience checkpoint
+    /// must not hide a human correction that older hosts never protected.
+    pub(super) fn game_definition_records(&self) -> Result<Vec<Record>> {
+        let db = self.db.lock();
+        let mut query = db.prepare("SELECT c.record FROM conversations c LEFT JOIN memory_definition_scans s ON s.conversation=c.id WHERE json_extract(c.record,'$.game_session_id')=c.id AND json_extract(c.record,'$.state')!='package_deleted' AND EXISTS(SELECT 1 FROM events e WHERE e.conversation=c.id AND e.seq>COALESCE(s.seq,0) AND json_extract(e.event,'$.kind')='user' AND (json_extract(e.event,'$.data.origin')='gameplay' OR json_extract(e.event,'$.data.turn_id') LIKE 'game:%') AND json_extract(e.event,'$.data.message_id') IS NOT NULL) ORDER BY c.rowid ASC LIMIT 100")?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect();
+        records
+    }
+    pub(super) fn unscanned_game_users(&self, id: &str, through: u64) -> Result<Vec<Value>> {
+        let db = self.db.lock();
+        let mut query = db.prepare("SELECT e.event FROM events e WHERE e.conversation=?1 AND e.seq>COALESCE((SELECT seq FROM memory_definition_scans WHERE conversation=?1),0) AND e.seq<=?2 AND json_extract(e.event,'$.kind')='user' AND (json_extract(e.event,'$.data.origin')='gameplay' OR json_extract(e.event,'$.data.turn_id') LIKE 'game:%') AND json_extract(e.event,'$.data.message_id') IS NOT NULL ORDER BY e.seq LIMIT 128")?;
+        let events = query
+            .query_map(params![id, through], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect();
+        events
+    }
+    pub(super) fn save_definition_scan(&self, id: &str, seq: u64) -> Result<()> {
+        self.db.lock().execute("INSERT INTO memory_definition_scans(conversation,seq) VALUES(?1,?2) ON CONFLICT(conversation) DO UPDATE SET seq=MAX(seq,excluded.seq)",params![id,seq])?;
+        Ok(())
+    }
+    pub(super) fn definition_is_linked(&self, id: &str, message: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT EXISTS(SELECT 1 FROM memory_definition_links WHERE conversation=?1 AND message=?2)",params![id,message],|row|row.get(0))?)
     }
     pub(super) fn memory_definition_links(&self, id: &str) -> Result<Vec<(String, String)>> {
         let db = self.db.lock();
@@ -1345,6 +1374,21 @@ impl State {
         text: &str,
         cancel: &AtomicBool,
     ) -> Result<Option<Value>> {
+        self.authorize(Some(crate::extensions::Permission::ResourceRead))?;
+        self.authorize(Some(crate::extensions::Permission::UiHost))?;
+        self.protect_journal_definition(package, conversation_id, message_id, text, cancel)
+            .await
+    }
+    /// Only called with trusted human journal events, including local shutdown
+    /// compensation. No model request or device control is performed here.
+    pub(super) async fn protect_journal_definition(
+        &self,
+        package: &str,
+        conversation_id: &str,
+        message_id: &str,
+        text: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Value>> {
         if !memory_instruction(text, "memory_create", &json!({})) {
             return Ok(None);
         }
@@ -1360,8 +1404,6 @@ impl State {
             !text.trim().is_empty() && text.len() <= 32000,
             "用户定义超过32000字节"
         );
-        self.authorize(Some(crate::extensions::Permission::ResourceRead))?;
-        self.authorize(Some(crate::extensions::Permission::UiHost))?;
         let _activity = self.runtime.packages.acquire_activity(package)?;
         let result=self.memory.call_cancellable("memory_create",package,json!({"operation_id":format!("human-definition:{message_id}"),"title":format!("用户定义：{}",text.chars().take(100).collect::<String>()),"body":text,"kind":"definition","sources":[{"type":"conversation","conversation_id":conversation_id,"message_id":message_id,"excerpt":text}],"reason":"用户明确要求保留，原文保护；尚未实机验证"}),None,true,cancel).await?;
         self.conversations.link_memory_definition(

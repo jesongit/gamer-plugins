@@ -266,6 +266,80 @@ async fn chinese_alias_queries_and_version_filters_reconcile_external_edits() {
     assert!(injection.is_ok());
 }
 #[tokio::test]
+async fn import_outcomes_and_writes_reject_canonical_raw_drafts() {
+    let (s, _temp) = store();
+    let raw=s.call("memory_create","game-a",json!({"id":"raw-evidence","title":"待复核原稿","body":"用户原始回执","validation":"pending","tags":["session_receipts_pending"],"operation_id":"raw-receipt"}),None,false).await.unwrap();
+    let imported=s.call("memory_import","game-a",json!({"operation_id":"raw-target-test","filename":"guide.md","text":"# 原稿\n等待提炼"}),None,false).await.unwrap();
+    let job = imported["job_id"].as_str().unwrap();
+    let claim = s
+        .claim_import_chunk("game-a", job, "raw-claim")
+        .unwrap()
+        .unwrap();
+    for disposition in ["retained", "created", "updated", "merged"] {
+        let mut outcome = json!({"disposition":disposition,"operation_id":"raw-receipt"});
+        if disposition == "retained" {
+            outcome["id"] = json!("raw-evidence");
+        }
+        let error = s
+            .complete_import_chunk(
+                "game-a",
+                job,
+                claim["chunk"]["id"].as_str().unwrap(),
+                "raw-claim",
+                outcome,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("raw_draft_not_guide"),
+            "{disposition}: {error}"
+        );
+    }
+    let origins = [ImportOrigin::Draft("raw-evidence".into())];
+    let error=s.call_import_for_origins_cancellable("memory_update","game-a",json!({"id":"raw-evidence","expected_version":raw["version"],"patch":{"body":"AI改写原稿","tags":[]},"operation_id":"overwrite-origin","reason":"提炼"}),job,&origins,&AtomicBool::new(false)).await.unwrap_err();
+    assert!(error.to_string().contains("raw_draft_not_guide"));
+    assert_eq!(
+        s.call(
+            "memory_get",
+            "game-a",
+            json!({"id":"raw-evidence"}),
+            None,
+            false
+        )
+        .await
+        .unwrap()["memory"]["body"],
+        "用户原始回执"
+    );
+    let guide = create(&s, "game-a", "real-guide", "正常攻略", "已提炼步骤", false).await;
+    for (name, args) in [
+        (
+            "memory_create",
+            json!({"title":"伪原稿","body":"伪原稿","tags":["session_receipts_pending"],"operation_id":"forge-raw"}),
+        ),
+        (
+            "memory_update",
+            json!({"id":"real-guide","expected_version":guide["version"],"patch":{"tags":["session_receipts_pending"]},"operation_id":"forge-raw-update","reason":"更改"}),
+        ),
+    ] {
+        assert!(s
+            .call_import_cancellable(name, "game-a", args, job, &AtomicBool::new(false))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("raw_draft_not_editable"));
+    }
+    assert_eq!(s.import_job_record("game-a", job).unwrap().processed, 0);
+    let finished = s
+        .complete_import_chunk(
+            "game-a",
+            job,
+            claim["chunk"]["id"].as_str().unwrap(),
+            "raw-claim",
+            json!({"disposition":"retained","id":"real-guide"}),
+        )
+        .unwrap();
+    assert_eq!(finished["processed"], 1);
+}
+#[tokio::test]
 async fn import_queue_survives_restart_deduplicates_and_requires_committed_targets() {
     let (s, temp) = store();
     let args = json!({"operation_id":"import-one","filename":"攻略.md","text":"# 奖励\n\n1. 打开邮箱。\n2. 领取奖励，直到邮箱空了。"});

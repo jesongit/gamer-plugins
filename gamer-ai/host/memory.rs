@@ -282,6 +282,20 @@ impl MemoryStore {
                     self.import_job_active_unlocked(package, job_id)?,
                     "memory.import_not_active"
                 );
+                let proposed_tags = if name == "memory_create" {
+                    &args["tags"]
+                } else {
+                    &args["patch"]["tags"]
+                };
+                ensure!(
+                    !proposed_tags.as_array().is_some_and(|tags| tags
+                        .iter()
+                        .any(|tag| tag == "session_receipts_pending")),
+                    "memory.import_raw_draft_not_editable"
+                );
+                if name != "memory_create" {
+                    self.ensure_import_guide_target(package, id(&args)?)?;
+                }
                 for origin in origins {
                     let (id, literal) = match origin {
                         ImportOrigin::Draft(id) => (id, None),
@@ -321,6 +335,20 @@ impl MemoryStore {
             );
         }
         Ok(result)
+    }
+    /// Canonical tags determine whether a target is an actual guide. Session
+    /// receipts remain raw evidence regardless of the target id or model claim.
+    fn ensure_import_guide_target(&self, package: &str, memory_id: &str) -> Result<()> {
+        let (memory, _) = self.read_memory(package, memory_id)?;
+        ensure!(memory.status == "active", "memory.import_target_inactive");
+        ensure!(
+            !memory
+                .tags
+                .iter()
+                .any(|tag| tag == "session_receipts_pending"),
+            "memory.import_raw_draft_not_guide"
+        );
+        Ok(())
     }
     pub async fn call_cancellable(
         &self,
