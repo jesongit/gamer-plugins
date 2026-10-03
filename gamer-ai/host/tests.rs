@@ -27,6 +27,12 @@ async fn fixture() -> (tempfile::TempDir, Arc<AiService>, Arc<ExtensionService>)
     let root = tempfile::tempdir().unwrap();
     let cfg = crate::config::Config {
         data_dir: root.path().into(),
+        // This process-local opt-in only selects the isolated test browser;
+        // it does not alter production config or global browser detection.
+        browser_path: std::env::var("GAMER_AI_TEST_BROWSER")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         ..Default::default()
     };
     let db = Arc::new(Store::open(&cfg).unwrap());
@@ -671,8 +677,10 @@ async fn tokens_are_target_scoped_private_revocable_and_lifecycle_bound() {
 
 /// Uses an isolated local page, browser profile and synthetic model. No ADB or
 /// real game/account is touched. Opt in on machines with Chrome/Edge installed.
+/// Set GAMER_AI_TEST_BROWSER to an explicit Chrome/Edge executable for this
+/// test process when the system's automatically detected browser cannot run headless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed Chrome/Edge; local AI gameplay integration"]
+#[ignore = "requires Chrome/Edge (optional GAMER_AI_TEST_BROWSER path); local AI gameplay integration"]
 async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
     use axum::{
         response::Html,

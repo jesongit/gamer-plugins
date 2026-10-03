@@ -277,7 +277,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
             <label>控制租约超时（秒）<input v-model.number="tokenForm.ttl_seconds" aria-label="控制租约超时（秒）" type="number" min="30" max="3600" step="1" required /></label>
             <button type="submit" :disabled="!deviceId || !packageId || (tokenForm.control && !controlSession)">创建连接令牌</button>
           </fieldset></form>
-          <p v-if="tokenForm.control && !controlSession" class="hint">请先在“自动游玩”选择“外部 AI”并建立当前设备与配置包的控制会话。</p>
+          <p v-if="tokenForm.control && !controlSession" class="hint">请先在新会话的“预算”中选择“外部 AI”，并建立当前设备与配置包的控制会话。</p>
           <p v-if="controlSession" class="hint">外部控制会话：{{ stateLabel(controlSession.state) }}。控制客户端仍须遵守暂停状态，不能自行恢复或更换目标。</p>
           <template v-if="createdToken"><label>新连接令牌<input :value="createdToken.token" type="password" readonly aria-label="新连接令牌" @focus="$event.target.select()" /></label><div class="actions"><button type="button" @click="copy(createdToken.token, '令牌')">{{ copied === '令牌' ? '已复制令牌' : '复制令牌' }}</button><button type="button" @click="createdToken = null">收起令牌</button></div><p class="hint">令牌有效期 24 小时；控制租约 {{ createdToken.ttl_seconds }} 秒。客户端须在租约期限内发送有效工具请求或 ping 续租；失联、令牌到期或撤销会暂停，需要用户恢复。</p></template>
           <details :open="!!createdToken"><summary>客户端配置示例</summary><pre>{{ clientConfig }}</pre><button type="button" @click="copy(clientConfig, '配置')">{{ copied === '配置' ? '已复制配置' : '复制配置' }}</button><p class="hint">示例适用于支持 URL 与 headers 的 MCP 客户端，请按客户端要求填写。完整令牌只在创建时提供，不会写入配置包或浏览器存储。</p></details>
