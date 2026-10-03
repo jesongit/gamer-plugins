@@ -1149,7 +1149,7 @@ impl State {
                 protocol_version,
             } => mcp::success(
                 id,
-                json!({"protocolVersion":if ["2025-11-25","2025-06-18","2025-03-26"].contains(&protocol_version.as_str()){protocol_version}else{"2025-11-25".into()},"capabilities":{"tools":{}},"serverInfo":{"name":ID,"version":"0.1.0"},"instructions":"截图查看目标；输入需用户在 Gamer 面板开始外部 MCP 控制会话，暂停后由用户恢复。"}),
+                mcp::initialize_result(&protocol_version),
             ),
             Request::Ping { id } => {
                 if token.control {

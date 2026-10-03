@@ -136,12 +136,17 @@ pub fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 pub fn initialize_result(requested_version: &str) -> Value {
+    let manifest: toml::Value =
+        toml::from_str(include_str!("../manifest.toml")).expect("builtin AI manifest must be valid");
+    let plugin_version = manifest["version"]
+        .as_str()
+        .expect("builtin AI manifest must declare a version");
     let version = match requested_version {
         "2025-03-26" | "2025-06-18" | "2025-11-25" => requested_version,
         _ => PROTOCOL_VERSION,
     };
     json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},
-        "serverInfo":{"name":"gamer-ai","version":"0.1.0"},
+        "serverInfo":{"name":"gamer-ai","version":plugin_version},
         "instructions":"Observe with screen_capture before input. Input requires the user's active MCP control session. A paused session cannot be resumed by tools."})
 }
 
