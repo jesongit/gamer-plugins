@@ -19,21 +19,43 @@ export function mergeEvents(current, incoming) {
   for (const event of incoming || []) if (Number.isSafeInteger(event.seq)) bySeq.set(event.seq, event)
   return [...bySeq.values()].sort((left, right) => left.seq - right.seq)
 }
+function displayTurnId(rawId) {
+  const game = /^game:(.+):(\d+):(\d+)$/.exec(rawId)
+  return game ? `game:${game[1]}:${game[2]}` : rawId
+}
 export function conversationTurns(events) {
-  const turns = [], byTurn = new Map(), messages = new Map(), calls = new Map(), owners = new Map()
+  const turns = [], byTurn = new Map(), messages = new Map(), calls = new Map(), owners = new Map(), memoryProgress = new Map()
   let fallback = 'history'
-  function turn(id) {
-    if (!byTurn.has(id)) { const value = { id, users: [], process: [], answers: [], notices: [], completed: false }; byTurn.set(id, value); turns.push(value) }
-    return byTurn.get(id)
+  function turn(rawId) {
+    const game = /^game:(.+):(\d+):(\d+)$/.exec(rawId)
+    const id = displayTurnId(rawId)
+    if (!byTurn.has(id)) { const value = { id, anchors: [], game: !!game, gameSession: game?.[1], generation: game ? Number(game[2]) : null, users: [], process: [], answers: [], notices: [], completed: false }; byTurn.set(id, value); turns.push(value) }
+    const value = byTurn.get(id)
+    if (rawId !== id && !value.anchors.includes(rawId)) value.anchors.push(rawId)
+    return value
   }
   for (const event of events) {
     const data = event.data || {}
     if (event.kind === 'user') fallback = data.turn_id || data.message_id || `user:${event.seq}`
     const group = turn(data.turn_id || fallback)
+    if (group.game && data.turn_id && fallback !== data.turn_id) {
+      const previous = byTurn.get(displayTurnId(fallback))
+      if (previous && previous !== group) {
+        const after = Math.max(0,...[...previous.process,...previous.answers].map(item=>item.seq))
+        const messagesToMove = previous.users.filter(message=>message.gameplay && message.seq > after)
+        for (const message of messagesToMove) { group.users.push(message); owners.set(message.id, group) }
+        previous.users = previous.users.filter(message=>!messagesToMove.includes(message))
+        if (!previous.users.length && !previous.process.length && !previous.answers.length && !previous.notices.length) {
+          group.anchors.push(...previous.anchors.filter(anchor=>!group.anchors.includes(anchor)))
+          previous.anchors = []
+        }
+      }
+    }
+    if (data.turn_id && /^(assistant_|tool_|user_status)/.test(event.kind)) fallback = data.turn_id
     if (event.kind === 'user') {
       const id = data.message_id || `user:${event.seq}`
       if (messages.has(id)) continue
-      const value = { id, kind: 'user', text: event.message, status: data.status || 'received', at: event.at, seq: event.seq }
+      const value = { id, kind: 'user', text: event.message, status: data.status || 'received', at: event.at, seq: event.seq, gameplay: group.game || data.origin === 'gameplay' }
       messages.set(id, value); owners.set(id,group); group.users.push(value)
     } else if (event.kind === 'user_status') {
       const value = messages.get(data.message_id)
@@ -53,6 +75,8 @@ export function conversationTurns(events) {
       }
       if (event.kind === 'assistant_final') {
         value.text = data.text ?? event.message ?? value.text; value.status = data.interrupted ? 'interrupted' : 'complete'
+        const thinking = messages.get(`${data.message_id}:thinking`)
+        if (thinking) thinking.status = data.interrupted ? 'interrupted' : 'complete'
         if(Array.isArray(data.summary) && data.summary.length) {
           const summaryId=`${data.message_id}:summary`,summary=messages.get(summaryId)
           if(summary) {summary.text=data.summary.join('\n');summary.status='complete'}
@@ -71,11 +95,21 @@ export function conversationTurns(events) {
       if (event.kind === 'tool_end') value.status = data.ok === false || data.result?.isError ? 'failed' : 'complete'
       value.image = toolImage(data);value.receipt=toolReceipt(data.result)
     } else if (event.kind === 'state') {
-      if (['idle', 'cancelled', 'error'].includes(data.state)) group.completed = true
-      if (group.completed) for (const value of [...group.process, ...group.answers]) {
-        if (value.status === 'streaming') value.status = data.state === 'idle' && value.kind === 'thinking' ? 'complete' : 'interrupted'
+      const terminal = ['idle', 'cancelled', 'error', 'finished', 'interrupted', 'stopped', 'failed'].includes(data.state) || group.game && data.state === 'paused'
+      const settled = terminal && group.game ? turns.filter(value => value.game && value.gameSession === group.gameSession && value.generation <= group.generation) : terminal ? [group] : []
+      for (const completed of settled) {
+        completed.completed = true
+        for (const value of [...completed.process, ...completed.answers]) {
+          if (value.status === 'streaming') value.status = ['idle','finished'].includes(data.state) && value.kind === 'thinking' ? 'complete' : 'interrupted'
+        }
       }
       if (['cancelled', 'error', 'paused'].includes(data.state)) group.notices.push({ ...event, id: `state:${event.seq}`, text: data.detail || event.message })
+    } else if (event.kind === 'memory_job' || event.kind === 'memory_staged') {
+      const id = `${event.kind}:${data.job_id || data.memory?.id || data.memory_id || event.seq}`
+      const previous = memoryProgress.get(id)
+      if (previous) previous.group.notices = previous.group.notices.filter(notice => notice.id !== id)
+      const notice = { ...event, id, text: event.message, memory: true }
+      group.notices.push(notice); memoryProgress.set(id, { group, notice })
     } else if (event.kind === 'compression') {
       group.notices.push({ ...event, id: `compression:${event.seq}`, text: event.message || '早期过程已压缩，用户指令及相关记忆保留。' })
     }
@@ -85,7 +119,8 @@ export function conversationTurns(events) {
 }
 export function diagnosticCategory(event) {
   const category = event.data?.category
-  if (category) return category
+  if (['request','usage','provider'].includes(category)) return 'model'
+  if (['model','tool','memory','state','error'].includes(category)) return category
   if (event.kind.startsWith('tool')) return 'tool'
   if (event.kind.startsWith('memory')) return 'memory'
   if (event.kind === 'state') return 'state'

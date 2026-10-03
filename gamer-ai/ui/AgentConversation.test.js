@@ -1,15 +1,18 @@
 import { beforeEach,afterEach,expect,it,vi } from 'vitest'
 import { mount,flushPromises } from '@vue/test-utils'
+import { reactive } from 'vue'
+import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 const mocks=vi.hoisted(()=>({call:vi.fn()}))
 vi.mock('../../../web/src/api',()=>({api:{callExtension:mocks.call}}))
 import AgentConversation from './AgentConversation.vue'
-let wrappers,record,events,session,diagnostics,older
+let wrappers,record,events,session,diagnostics,older,context
 const button=(wrapper,label)=>wrapper.findAll('button').find(item=>item.text()===label)
 const limits={max_turns:40,max_actions:120,max_seconds:600,max_tokens:100000,max_failures:3}
 const ev=(seq,kind,data={},message='')=>({seq,kind,message,at:'2026-10-03T12:00:00Z',data:{turn_id:'turn-1',...data}})
-async function create(props={}){const wrapper=mount(AgentConversation,{props:{packageId:'default',...props}});wrappers.push(wrapper);await flushPromises();return wrapper}
+async function create(props={}){const wrapper=mount(AgentConversation,{props:{packageId:'default',...props},global:{provide:{[WORKSPACE_CONTEXT_KEY]:{getSnapshot:()=>context}}}});wrappers.push(wrapper);await flushPromises();return wrapper}
 beforeEach(()=>{
   wrappers=[];record=null;events=[];older=[];diagnostics=[];session=[]
+  context=reactive({deviceId:'phone',currentPackageId:'default',androidPackageName:'com.game'})
   mocks.call.mockReset().mockImplementation(async(_,action,values={})=>{
     if(action==='settings.get')return{has_key:true,model:'test'}
     if(action==='services.get')return{search:{enabled:false}}
@@ -118,7 +121,7 @@ it('聊天记忆工具结果展示有效验证状态与旧来源复核警告',as
 })
 it('聊天全部预算0会提交，非零秒预算9阻止发送',async()=>{
   const wrapper=await create()
-  await button(wrapper,'聊天预算').trigger('click')
+  await button(wrapper,'预算').trigger('click')
   for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="聊天${field}预算"]`).setValue(0)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('讨论方案')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
@@ -155,4 +158,85 @@ it('诊断分类、定位与导出只读脱敏快照，保留预算计数',async
   const text=await captured[0].text()
   expect(text).toContain('known_tokens');expect(text).toContain('42');expect(text).not.toContain('redact-me')
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.diagnostics',{conversation_id:'c1',export:true})
+})
+
+it('同一输入框启动游玩，使用独立游玩预算与显式宿主设备，不先建普通聊天',async()=>{
+  const implementation=mocks.call.getMockImplementation()
+  mocks.call.mockImplementation(async(id,action,values)=>{
+    if(action==='session.start') {
+      session=[{session_id:'s1',device_id:values.device_id,content_package:values.content_package,mode:values.mode,state:'starting',limits:values.limits}]
+      record={conversation_id:'s1',game_session_id:'s1',content_package:values.content_package,state:'idle',limits:values.limits}
+      events=[ev(1,'user',{message_id:'goal'},values.goal)]
+      return{session_id:'s1',conversation_id:'s1'}
+    }
+    return implementation(id,action,values)
+  })
+  const wrapper=await create()
+  await wrapper.get('[aria-label="消息模式"]').setValue('game')
+  await button(wrapper,'预算').trigger('click')
+  for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('  完成新手教程  ')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.start',{device_id:'phone',content_package:'default',goal:'完成新手教程',mode:'api',limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  expect(mocks.call.mock.calls.some(call=>call[1]==='conversation.create')).toBe(false)
+  expect(wrapper.get('[aria-label="聊天历史"]').element.value).toBe('s1')
+  expect(wrapper.get('.user-message').text()).toContain('完成新手教程')
+  expect(wrapper.get('[aria-label="Agent 消息"]').element.value).toBe('')
+})
+
+it.each([['running',true],['paused',false]])('游戏对话 %s 的后续引导自动绑定自身会话，暂停不会隐式恢复',async(state,resume)=>{
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state,limits}]
+  const wrapper=await create()
+  expect(wrapper.get('[aria-label="消息模式"]').element.value).toBe('game')
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('先检查背包，再去右边')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'先检查背包，再去右边',attached_memory:[],game_session_id:'s1',resume})
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
+})
+
+it('公开推理默认展开且不被完成步骤折叠，用户收起后增量不强行展开',async()=>{
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout']})
+  record={conversation_id:'c1',content_package:'default',state:'running',limits}
+  events=[ev(1,'user',{message_id:'m1'},'怎么操作'),ev(2,'assistant_delta',{message_id:'a1',channel:'thinking',delta:'先**检查地图**，'}),ev(3,'tool_start',{name:'screenshot',call_id:'capture1'})]
+  const wrapper=await create()
+  expect(wrapper.get('.reasoning').element.open).toBe(true)
+  expect(wrapper.get('.reasoning strong').text()).toBe('检查地图')
+  wrapper.get('.reasoning').element.open=false
+  events.push(ev(4,'assistant_delta',{message_id:'a1',channel:'thinking',delta:'再规划路径。'}),ev(5,'assistant_final',{message_id:'a1',text:'向右移动。'}),ev(6,'state',{state:'idle'}));record.state='idle'
+  await vi.advanceTimersByTimeAsync(500);await flushPromises()
+  expect(wrapper.get('.reasoning').element.open).toBe(false)
+  expect(wrapper.get('.reasoning').text()).toContain('再规划路径')
+  expect(wrapper.get('.process').element.open).toBe(false)
+  expect(wrapper.get('.final-answer').text()).toContain('向右移动')
+})
+
+it('缺少推理明确显示供应商未返回，记忆草稿与整理失败直接显示并可进记忆库',async()=>{
+  record={conversation_id:'c1',content_package:'default',state:'idle',limits}
+  events=[ev(1,'assistant_final',{message_id:'a1',text:'这条路线完成了。'}),ev(2,'memory_staged',{memory:{id:'m1',revision:2,validation:'pending'},job_id:'j1'},'记忆草稿已保存，等待空闲整理'),ev(3,'memory_job',{job_id:'j1',memory_id:'m1',state:'running',result:{processed:1,total:3,counts:{created:1}}},'后台正在整理攻略'),ev(4,'memory_job',{job_id:'j1',memory_id:'m1',state:'failed',result:{processed:1,total:3,counts:{created:1,failed:1},error:'连接超时'}},'攻略整理失败'),ev(5,'state',{state:'idle'})]
+  const wrapper=await create()
+  expect(wrapper.get('.reasoning-status').text()).toContain('未记录公开推理或摘要')
+  expect(wrapper.findAll('.memory-notice')).toHaveLength(2)
+  expect(wrapper.text()).toContain('等待空闲整理')
+  expect(wrapper.text()).toContain('待验证')
+  expect(wrapper.text()).toContain('攻略整理失败')
+  expect(wrapper.text()).not.toContain('后台正在整理攻略')
+  expect(wrapper.get('.memory-notice.failed pre').text()).toContain('连接超时')
+  expect(wrapper.get('.memory-notice.failed pre').text()).toContain('processed')
+  await button(wrapper,'查看记忆').trigger('click')
+  expect(wrapper.emitted('memory')).toHaveLength(1)
+})
+it.each([['running',true],['paused',false],['paused',true]])('游玩 %s 引导resume=%s时提交编辑后的游玩预算，避免发送仍用旧预算',async(state,resume)=>{
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state,limits:{...limits},usage:{turns:40,known_tokens:100000,total_tokens:null}}]
+  const wrapper=await create()
+  await button(wrapper,'预算').trigger('click')
+  for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
+  if(state==='paused'&&resume)await wrapper.get('.resume-choice input[type="checkbox"]').setValue(true)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('继续按新预算探索')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'继续按新预算探索',attached_memory:[],game_session_id:'s1',resume,limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  await wrapper.get('[aria-label="游玩活动秒数预算"]').setValue(9)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('不应提交非法预算')
+  expect(wrapper.get('.composer button[type="submit"]').element.disabled).toBe(true)
 })

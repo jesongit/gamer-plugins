@@ -169,7 +169,7 @@ it('协议选择不偷偷换端点，显式填入后保存；成功清空密钥�
   await button(wrapper, '保存并测试连接').trigger('click'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'settings.save', {
     expected_version: 'v1', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.3-flash',
-    protocol: 'chat_completions', request_timeout_secs: 60, public_reasoning_content: false, api_key: 'draft-test-key',
+    protocol: 'chat_completions', request_timeout_secs: 60, max_output_tokens:16384, public_reasoning_content: true, api_key: 'draft-test-key',
   })
   expect(wrapper.get('[aria-label="API 密钥"]').element.value).toBe('')
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'connection.probe', {})
@@ -177,20 +177,22 @@ it('协议选择不偷偷换端点，显式填入后保存；成功清空密钥�
   expect(wrapper.text()).toContain('图片与工具闭环测试通过')
 })
 
-it('公开思考默认关闭，只在Chat协议显式开启并保存，切回Responses关闭', async () => {
+it('公开思考默认展示，跨协议保留选择且单次输出0独立于累计预算', async () => {
   const wrapper = await mountWorkspace()
   await wrapper.get('[aria-controls="ai-settings"]').trigger('click')
   const toggle = wrapper.get('[aria-label="显示供应商公开思考"]')
-  expect(toggle.element.checked).toBe(false)
-  expect(toggle.element.disabled).toBe(true)
+  expect(toggle.element.checked).toBe(true)
+  expect(toggle.element.disabled).toBe(false)
   await wrapper.get('[aria-label="API 协议"]').setValue('chat_completions')
-  await toggle.setValue(true)
+  await wrapper.get('[aria-label="单次输出 Token 上限"]').setValue(0)
   await wrapper.get('#ai-settings form').trigger('submit'); await flushPromises()
   expect(mocks.call.mock.calls.find(call => call[1] === 'settings.save')[2].public_reasoning_content).toBe(true)
+  expect(mocks.call.mock.calls.find(call => call[1] === 'settings.save')[2].max_output_tokens).toBe(0)
   expect(toggle.element.checked).toBe(true)
   await wrapper.get('[aria-label="API 协议"]').setValue('responses')
-  expect(toggle.element.checked).toBe(false)
-  expect(toggle.element.disabled).toBe(true)
+  expect(toggle.element.checked).toBe(true)
+  expect(toggle.element.disabled).toBe(false)
+  await toggle.setValue(false)
   await wrapper.get('#ai-settings form').trigger('submit'); await flushPromises()
   expect(mocks.call.mock.calls.filter(call => call[1] === 'settings.save').at(-1)[2].public_reasoning_content).toBe(false)
 })

@@ -5,16 +5,17 @@ import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 import { PROTOCOLS, budgetValue, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
 
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
-const emit = defineEmits(['session-start'])
+const props = defineProps({ settingsOnly: { type: Boolean, default: false }, initialSection: { type: String, default: 'settings' }, initialGameOptions: { type: Object, default: null } })
+const emit = defineEmits(['session-start', 'settings-changed', 'game-options'])
 const context = computed(() => workspace?.getSnapshot?.() || {})
 const deviceId = computed(() => context.value.deviceId || '')
 const packageId = computed(() => context.value.currentPackageId || '')
 const deviceName = computed(() => context.value.device?.name || deviceId.value || '未选择设备')
-const settingsSection = ref(''), timelineElement = ref(null), nearBottom = ref(true), newConversation = ref(false)
+const settingsSection = ref(props.settingsOnly ? props.initialSection : ''), timelineElement = ref(null), nearBottom = ref(true), newConversation = ref(false)
 const saved = ref(null), sessions = ref([]), selectedId = ref(''), tokens = ref([])
 const busy = ref(''), controlBusy = ref(''), messageBusy = ref(false), error = ref(''), feedback = ref(''), statusFresh = ref(false)
-const goal = ref(''), mode = ref('api')
-const limits = reactive({ max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 })
+const goal = ref(''), mode = ref(props.initialGameOptions?.mode || 'api')
+const limits = reactive({...(props.initialGameOptions?.limits || { max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 })})
 const limitFields = [
   { key: 'max_turns', label: '最大模型轮数（0 表示无上限）', min: 0, nonZeroMin: 1, max: 500 },
   { key: 'max_actions', label: '最大工具次数（0 表示无上限）', min: 0, nonZeroMin: 1, max: 2000 },
@@ -22,11 +23,12 @@ const limitFields = [
   { key: 'max_tokens', label: '累计 token 上限（0 表示无上限）', min: 0, nonZeroMin: 2048, max: 2000000 },
   { key: 'max_failures', label: '连续失败上限（0 表示无上限）', min: 0, nonZeroMin: 1, max: 20 },
 ]
-const settings = reactive({ base_url: PROTOCOLS.responses.baseUrl, model: 'glm-5.3-flash', protocol: 'responses', request_timeout_secs: 60, public_reasoning_content: false, api_key: '' })
+const settings = reactive({ base_url: PROTOCOLS.responses.baseUrl, model: 'glm-5.3-flash', protocol: 'responses', request_timeout_secs: 60, max_output_tokens: 16384, public_reasoning_content: true, api_key: '' })
 const tokenForm = reactive({ label: '', control: false, ttl_seconds: 120, device_scope: 'selected', memory_read: false, memory_write: false, protected_write: false, web_search: false })
 const createdToken = ref(null), copied = ref('')
 const mcpEndpoint = `${globalThis.location?.origin || 'http://127.0.0.1:8443'}/api/extensions/gamer-ai/mcp`
-const selectedSession = computed(() => newConversation.value ? null : sessions.value.find(s => s.session_id === selectedId.value)
+const selectedSession = computed(() => props.settingsOnly && props.initialGameOptions?.session_id ? sessions.value.find(s => s.session_id === props.initialGameOptions.session_id)
+  : newConversation.value ? null : sessions.value.find(s => s.session_id === selectedId.value)
   || sessions.value.find(s => s.device_id === deviceId.value && isActive(s))
   || sessions.value.find(s => s.device_id === deviceId.value) || null)
 const currentActive = computed(() => sessions.value.find(s => s.device_id === deviceId.value && isActive(s)))
@@ -70,8 +72,8 @@ let timer, disposed = false
 
 function applySettings(value) {
   saved.value = value
-  for (const key of ['base_url', 'model', 'protocol', 'request_timeout_secs']) if (value?.[key] != null) settings[key] = value[key]
-  settings.public_reasoning_content = settings.protocol === 'chat_completions' && value?.public_reasoning_content === true
+  for (const key of ['base_url', 'model', 'protocol', 'request_timeout_secs', 'max_output_tokens']) if (value?.[key] != null) settings[key] = value[key]
+  settings.public_reasoning_content = value?.public_reasoning_content !== false
   settings.api_key = ''
 }
 async function refresh() {
@@ -131,7 +133,6 @@ async function sendMessage(resume = true) {
   finally { if (!disposed) messageBusy.value = false }
 }
 function toggleSettings(section) { settingsSection.value = settingsSection.value === section ? '' : section }
-watch(() => settings.protocol, protocol => { if (protocol !== 'chat_completions') settings.public_reasoning_content = false })
 function selectConversation(value) { newConversation.value = false; selectedId.value = value }
 function clearConversation() { if (!currentActive.value) { newConversation.value = true; selectedId.value = ''; goal.value = '' } }
 function onTimelineScroll() {
@@ -165,9 +166,10 @@ async function saveSettings(test = false) {
   await operate(test ? '保存并测试连接' : '保存连接设置', async () => {
     const values = { expected_version: saved.value?.version ?? null, base_url: settings.base_url.trim(),
       model: settings.model.trim(), protocol: settings.protocol, request_timeout_secs: settings.request_timeout_secs,
-      public_reasoning_content: settings.protocol === 'chat_completions' && settings.public_reasoning_content }
+      max_output_tokens: settings.max_output_tokens, public_reasoning_content: settings.public_reasoning_content }
     if (settings.api_key.trim()) values.api_key = settings.api_key.trim()
     applySettings(await call('settings.save', values))
+    emit('settings-changed')
     feedback.value = '连接设置已保存。'
     if (test) await probeSaved()
   })
@@ -218,21 +220,23 @@ onMounted(async () => {
   if (!disposed) timer = setTimeout(poll, 1500)
 })
 onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key = ''; createdToken.value = null })
+watch(() => props.initialSection, section => { if (props.settingsOnly) settingsSection.value = section })
+watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-options',{limits:{...limits},mode:mode.value}) })
 </script>
 
 <template>
-  <div class="ai-workspace">
+  <div :class="['ai-workspace', { 'settings-only': settingsOnly }]">
     <header class="agent-header">
-      <div class="agent-title"><span class="agent-avatar" aria-hidden="true">AI</span><h3>Agent</h3><span class="model-label">{{ saved?.model || '配置模型' }}</span></div>
+      <div v-if="!settingsOnly" class="agent-title"><span class="agent-avatar" aria-hidden="true">AI</span><h3>Agent</h3><span class="model-label">{{ saved?.model || '配置模型' }}</span></div>
       <div class="header-actions">
-        <button type="button" :disabled="!!currentActive" title="新会话不会删除历史记录" @click="clearConversation">新会话</button>
+        <button v-if="!settingsOnly" type="button" :disabled="!!currentActive" title="新会话不会删除历史记录" @click="clearConversation">新会话</button>
         <button type="button" aria-controls="ai-settings" :aria-expanded="settingsSection === 'settings'" @click="toggleSettings('settings')">模型</button>
         <button type="button" aria-controls="ai-mcp" :aria-expanded="settingsSection === 'mcp'" @click="toggleSettings('mcp')">MCP</button>
         <button type="button" aria-controls="ai-budget" :aria-expanded="settingsSection === 'budget'" @click="toggleSettings('budget')">预算</button>
       </div>
     </header>
     <div class="scope-line"><span>{{ deviceName }}</span><span>{{ packageId || '未选配置包' }}</span><span v-if="context.androidPackageName">{{ context.androidPackageName }}</span></div>
-    <div v-if="selectedSession" class="session-toolbar">
+    <div v-if="selectedSession && !settingsOnly" class="session-toolbar">
       <span class="session-state" role="status" data-testid="session-state">{{ stateLabel(selectedSession.state) }}</span>
       <div class="actions">
         <button v-if="canPause" type="button" :disabled="!!controlBusy || messageBusy" @click="control('pause')">暂停 AI</button>
@@ -240,7 +244,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
         <button v-if="isActive(selectedSession)" type="button" :disabled="!!controlBusy" @click="control('stop')">停止会话</button>
       </div>
     </div>
-    <div class="conversation-selector" v-if="sessions.length">
+    <div class="conversation-selector" v-if="sessions.length && !settingsOnly">
       <label>会话<select :value="newConversation ? '' : selectedSession?.session_id || ''" aria-label="查看会话" @change="selectConversation($event.target.value)"><option v-if="newConversation" value="">新会话</option><option v-for="session in sessions" :key="session.session_id" :value="session.session_id">{{ sessionTitle(session) }}</option></select></label>
       <button type="button" @click="refresh().catch(e => error = e.message)">刷新</button>
     </div>
@@ -252,12 +256,13 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
           <p class="hint">连接设置保存在运行 Gamer 服务端的电脑，密钥不随配置包导出。协议切换仅在显式保存后生效。</p>
           <form autocomplete="off" @submit.prevent="saveSettings(false)"><fieldset :disabled="!!busy">
             <label>API 协议<select v-model="settings.protocol" aria-label="API 协议"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></label>
-            <label><input v-model="settings.public_reasoning_content" type="checkbox" aria-label="显示供应商公开思考" :disabled="settings.protocol !== 'chat_completions'" />显示供应商公开思考（Chat Completions）</label><p class="hint">默认关闭。开启后展示供应商 API 公开返回的 reasoning_content，适用于智谱等支持此字段的模型；不会读取隐藏推理。Responses 只展示公开摘要。</p>
+            <label class="token-check"><input v-model="settings.public_reasoning_content" type="checkbox" aria-label="显示供应商公开思考" />显示供应商公开推理</label><p class="hint">默认开启。展示 API 实际公开返回的推理或摘要；支持智谱官方 GLM Responses 的 reasoning_text、Chat Completions 的公开 reasoning_content，普通 Responses 的公开摘要仍可显示。模型未返回时会显示说明。</p>
             <label>API 基础地址<input v-model="settings.base_url" aria-label="API 基础地址" type="url" required placeholder="https://open.bigmodel.cn/api/v1" /></label>
             <div class="endpoint-tip"><span class="hint">智谱 {{ PROTOCOLS[settings.protocol]?.label }} 地址：{{ PROTOCOLS[settings.protocol]?.baseUrl }}</span><button type="button" @click="settings.base_url = PROTOCOLS[settings.protocol].baseUrl">填入此地址</button></div>
             <label>模型名称<input v-model="settings.model" aria-label="模型名称" required placeholder="glm-5.3-flash" /></label>
             <label>API 密钥<input v-model="settings.api_key" aria-label="API 密钥" type="password" autocomplete="new-password" :required="!saved?.has_key" :placeholder="saved?.has_key ? '已保存，留空沿用；输入可更新' : '输入 API 密钥'" /></label>
             <label>请求超时（秒）<input v-model.number="settings.request_timeout_secs" aria-label="请求超时（秒）" type="number" min="5" max="600" step="1" required /></label>
+            <label>单次输出 Token 上限<input v-model.number="settings.max_output_tokens" aria-label="单次输出 Token 上限" type="number" min="0" max="131072" step="1" required /><small class="hint">包含供应商计算的推理输出；0 使用供应商默认值，与会话累计 Token 预算分别设置。</small></label>
             <div class="actions"><button type="submit">保存连接设置</button><button type="submit" class="primary" @click.prevent="saveSettings(true)">保存并测试连接</button><button type="button" :disabled="!saved?.has_key" @click="testConnection">测试已保存配置</button></div>
           </fieldset></form>
           <p class="hint">测试使用合成图片和无设备副作用的工具，验证看图、工具调用和结果回传；不操作游戏。</p>
@@ -316,7 +321,8 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
         <p v-if="budgetBlocked && selectedSession?.state === 'paused'" class="error">当前上限已耗尽，请提高对应预算或设为 0（无上限）。累计用量不会重置。</p>
       </section>
     </div>
-    <main id="ai-play" class="agent-chat">
+    <div v-if="settingsOnly" class="settings-feedback"><p v-if="error" role="alert" class="error">{{ error }}</p><p v-if="feedback" role="status" class="feedback">{{ feedback }}</p><p v-if="busy" role="status" class="hint">{{ busy }}…</p></div>
+    <main v-else id="ai-play" class="agent-chat">
       <div ref="timelineElement" class="chat-scroll" @scroll="onTimelineScroll">
         <div v-if="!selectedSession" class="chat-empty"><span class="agent-avatar" aria-hidden="true">AI</span><h3>描述你希望完成的事情</h3><p>AI 会观察画面并操作。你可以继续发送指令来调整方向，随时暂停接管。</p><p v-if="!deviceId || !packageId">请先在工作台选择设备和配置包。</p><button v-if="mode === 'api' && !saved?.has_key" type="button" @click="toggleSettings('settings')">配置模型连接</button></div>
         <ol v-else class="events chat-timeline" role="log" aria-label="对话与执行进度" aria-live="polite">
@@ -354,6 +360,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
 
 <style scoped>
 .token-check{display:flex;align-items:center;gap:8px}.token-check input{width:auto}
+.settings-only .settings-drawer{flex:1;max-height:none;border:0}.settings-only .agent-header{padding:8px 12px}.settings-feedback{padding:10px 12px}.settings-only .scope-line{padding:8px 12px;border-bottom:1px solid var(--border,#454b4e)}
 .conversation-selector label{white-space:nowrap}
 .ai-workspace{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;overflow:hidden;color:var(--text-0,#edf0ee);position:relative;background:var(--bg-1,#181b1c)}
 .agent-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--border,#454b4e);flex-wrap:wrap;flex-shrink:0}.agent-title{display:flex;align-items:center;gap:8px;min-width:0}.agent-avatar{display:inline-grid;place-items:center;width:27px;height:27px;border:1px solid var(--border,#454b4e);border-radius:7px;font-size:10px;font-weight:700;color:var(--accent,#e4c956);background:var(--bg-2,#282b2d)}h3{font-size:13px;margin:0}.model-label{font-size:11px;color:var(--text-2,#c5cbc8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px}.header-actions,.actions{display:flex;gap:5px;flex-wrap:wrap}.header-actions button{padding:4px 7px;font-size:11px;background:transparent}.header-actions button[aria-expanded=true]{color:var(--accent,#e4c956);border-color:var(--accent,#e4c956)}

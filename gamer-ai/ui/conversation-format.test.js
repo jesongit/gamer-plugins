@@ -52,3 +52,95 @@ it('诊断保留真实token计数而移除密钥、Cookie、Bearer和私有推�
 it('逐行差异显示新增、删除和未变正文', () => {
   expect(lineDiff('前提\n旧步骤','前提\n新步骤')).toEqual([{type:'same',text:'前提'},{type:'removed',text:'旧步骤'},{type:'added',text:'新步骤'}])
 })
+it('63轮游戏请求合为同一代次的步骤，保留原始定位锚点及独立工具收据，终态完成', () => {
+  const events=[event(1,'user',{message_id:'goal',origin:'gameplay'},'完成教程')]
+  for(let step=1;step<=63;step++) {
+    const turnId=`game:session-uuid:1:${step}`
+    events.push(event(events.length+1,'assistant_start',{turn_id:turnId,message_id:turnId}))
+    events.push(event(events.length+1,'assistant_final',{turn_id:turnId,message_id:turnId,text:`第${step}步公开说明`}))
+    events.push(event(events.length+1,'tool_start',{turn_id:turnId,call_id:`call-${step}`,name:'tap'}))
+    events.push(event(events.length+1,'tool_end',{turn_id:turnId,call_id:`call-${step}`,name:'tap',ok:true}))
+  }
+  events.push(event(events.length+1,'state',{state:'finished'},'游玩已结束'))
+  const turns=conversationTurns(events)
+  expect(turns).toHaveLength(1)
+  expect(turns[0]).toMatchObject({id:'game:session-uuid:1',game:true,completed:true})
+  expect(turns[0].users[0].text).toBe('完成教程')
+  expect(turns[0].anchors).toHaveLength(63)
+  expect(turns[0].process).toHaveLength(63)
+  expect(turns[0].answers).toHaveLength(63)
+  expect(new Set(turns[0].process.map(item=>item.id)).size).toBe(63)
+  expect(turns[0].anchors).toContain('game:session-uuid:1:63')
+  const tail=conversationTurns(events.slice(60))
+  expect(tail).toHaveLength(1);expect(tail[0].completed).toBe(true)
+  expect(conversationTurns(mergeEvents(events.slice(60),events.slice(0,60)))).toEqual(turns)
+})
+it('恢复新代次分组、暂停是已结算状态，失败工具保持失败且完整公开推理不被final清空', () => {
+  const turns=conversationTurns([
+    event(1,'assistant_delta',{turn_id:'game:s:1:1',message_id:'m1',channel:'thinking',delta:'检查地图'}),
+    event(2,'assistant_final',{turn_id:'game:s:1:1',message_id:'m1',text:'地图加载失败'}),
+    event(3,'tool_end',{turn_id:'game:s:1:1',call_id:'call',name:'screenshot',ok:false}),
+    event(4,'state',{state:'paused'},'等待用户恢复'),
+    event(5,'assistant_final',{turn_id:'game:s:2:2',message_id:'m2',text:'重新观察'}),
+    event(6,'state',{state:'finished'}),
+  ])
+  expect(turns).toHaveLength(2)
+  expect(turns.map(turn=>turn.id)).toEqual(['game:s:1','game:s:2'])
+  expect(turns[0].completed).toBe(true)
+  expect(turns[0].process[0].text).toBe('检查地图')
+  expect(turns[0].process[1].status).toBe('failed')
+  expect(turns[1].completed).toBe(true)
+})
+it('真实初始目标0:0进入1:0截图及1:1模型组，新指导移到恢复后的下一代次', () => {
+  const turns=conversationTurns([
+    event(1,'user',{turn_id:'game:uuid:0:0',message_id:'goal'},'完成新手教程'),
+    event(2,'state',{turn_id:'game:uuid:0:0',state:'starting'}),
+    event(3,'state',{turn_id:'game:uuid:1:0',state:'running'}),
+    event(4,'tool_start',{turn_id:'game:uuid:1:0',call_id:'initial',name:'screen_capture'}),
+    event(5,'tool_end',{turn_id:'game:uuid:1:0',call_id:'initial',name:'screen_capture',ok:true}),
+    event(6,'assistant_final',{turn_id:'game:uuid:1:1',message_id:'a1',text:'向右走'}),
+    event(7,'state',{turn_id:'game:uuid:1:1',state:'pausing'}),
+    event(8,'user',{turn_id:'game:uuid:1:1',message_id:'guide'},'改为向左走'),
+    event(9,'state',{turn_id:'game:uuid:1:1',state:'paused'}),
+    event(10,'state',{turn_id:'game:uuid:2:1',state:'resuming'}),
+    event(11,'assistant_final',{turn_id:'game:uuid:2:2',message_id:'a2',text:'已观察左侧道路'}),
+    event(12,'state',{state:'finished'}),
+  ])
+  expect(turns.map(turn=>turn.id)).toEqual(['game:uuid:1','game:uuid:2'])
+  expect(turns[0].users.map(item=>item.text)).toEqual(['完成新手教程'])
+  expect(turns[0].anchors).toContain('game:uuid:0:0')
+  expect(turns[1].users.map(item=>item.text)).toEqual(['改为向左走'])
+  expect(turns[0].process).toHaveLength(1)
+  expect(turns[0].completed).toBe(true)
+  expect(turns[1].completed).toBe(true)
+})
+it('Core暂停递增代次结算上一运行组，恢复时不吞普通聊天排队/已纳入的用户', () => {
+  const base=[
+    event(1,'user',{turn_id:'game:uuid:0:0',message_id:'goal',origin:'gameplay'},'游玩目标'),
+    event(2,'assistant_final',{turn_id:'game:uuid:1:1',message_id:'a1',text:'走到商店'}),
+    event(3,'tool_start',{turn_id:'game:uuid:1:1',call_id:'tap1',name:'input_tap'}),
+    event(4,'tool_end',{turn_id:'game:uuid:1:1',call_id:'tap1',name:'input_tap',ok:true}),
+    event(5,'state',{turn_id:'game:uuid:1:1',state:'pausing'}),
+    event(6,'state',{turn_id:'game:uuid:2:1',state:'paused'},'可人工操作'),
+    event(7,'user',{message_id:'chat-input',status:'queued'},'暂停中解释一下装备'),
+  ]
+  const queuedResume=conversationTurns([...base,event(8,'state',{turn_id:'game:uuid:2:1',state:'resuming'}),event(9,'state',{turn_id:'game:uuid:3:1',state:'running'}),event(10,'assistant_final',{turn_id:'game:uuid:3:2',message_id:'a2',text:'继续探索'})])
+  expect(queuedResume.find(turn=>turn.id==='game:uuid:1').completed).toBe(true)
+  expect(queuedResume.find(turn=>turn.id==='chat-input').users[0].text).toBe('暂停中解释一下装备')
+  expect(queuedResume.find(turn=>turn.id==='game:uuid:3').users).toHaveLength(0)
+  const claimedResume=conversationTurns([...base,
+    event(8,'user_status',{message_id:'chat-input',turn_id:'ordinary-chat-turn',status:'incorporated'}),
+    event(9,'state',{turn_id:'ordinary-chat-turn',state:'running'}),
+    event(10,'state',{turn_id:'game:uuid:2:1',state:'resuming'}),
+    event(11,'state',{turn_id:'game:uuid:3:1',state:'running'}),
+    event(12,'assistant_final',{turn_id:'ordinary-chat-turn',message_id:'chat-reply',text:'装备的属性解释'}),
+    event(13,'state',{turn_id:'ordinary-chat-turn',state:'idle'}),
+    event(14,'assistant_final',{turn_id:'game:uuid:3:2',message_id:'a2',text:'继续探索'}),
+    event(15,'state',{turn_id:'game:uuid:3:2',state:'finished'}),
+  ])
+  const chat=claimedResume.find(turn=>turn.id==='ordinary-chat-turn')
+  expect(chat.users[0].text).toBe('暂停中解释一下装备')
+  expect(chat.answers[0].text).toBe('装备的属性解释')
+  expect(chat.completed).toBe(true)
+  expect(claimedResume.find(turn=>turn.id==='game:uuid:3').users).toHaveLength(0)
+})
