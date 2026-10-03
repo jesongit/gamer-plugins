@@ -1147,10 +1147,7 @@ impl State {
             Request::Initialize {
                 id,
                 protocol_version,
-            } => mcp::success(
-                id,
-                mcp::initialize_result(&protocol_version),
-            ),
+            } => mcp::success(id, mcp::initialize_result(&protocol_version)),
             Request::Ping { id } => {
                 if token.control {
                     if let Some(s) = self.active(&token.device_id) {

@@ -136,8 +136,8 @@ pub fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 pub fn initialize_result(requested_version: &str) -> Value {
-    let manifest: toml::Value =
-        toml::from_str(include_str!("../manifest.toml")).expect("builtin AI manifest must be valid");
+    let manifest: toml::Value = toml::from_str(include_str!("../manifest.toml"))
+        .expect("builtin AI manifest must be valid");
     let plugin_version = manifest["version"]
         .as_str()
         .expect("builtin AI manifest must declare a version");
