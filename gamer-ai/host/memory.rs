@@ -157,6 +157,11 @@ pub struct ImportChunk {
     pub claimed_at: Option<i64>,
     pub outcome: Option<Value>,
 }
+/// Trusted host provenance, never supplied by a model's JSON arguments.
+pub(super) enum ImportOrigin {
+    Draft(String),
+    Definition { id: String, literal: String },
+}
 fn unknown() -> String {
     "unknown".into()
 }
@@ -238,6 +243,18 @@ impl MemoryStore {
         job_id: &str,
         cancel: &AtomicBool,
     ) -> Result<Value> {
+        self.call_import_for_origins_cancellable(name, package, args, job_id, &[], cancel)
+            .await
+    }
+    pub(super) async fn call_import_for_origins_cancellable(
+        &self,
+        name: &str,
+        package: &str,
+        args: Value,
+        job_id: &str,
+        origins: &[ImportOrigin],
+        cancel: &AtomicBool,
+    ) -> Result<Value> {
         ensure!(
             ["memory_create", "memory_update", "memory_set_status"].contains(&name),
             "memory.import_tool_invalid"
@@ -265,6 +282,33 @@ impl MemoryStore {
                     self.import_job_active_unlocked(package, job_id)?,
                     "memory.import_not_active"
                 );
+                for origin in origins {
+                    let (id, literal) = match origin {
+                        ImportOrigin::Draft(id) => (id, None),
+                        ImportOrigin::Definition { id, literal } => (id, Some(literal)),
+                    };
+                    let (memory, _) = self.read_memory(package, id)?;
+                    ensure!(memory.status == "active", "memory.import_origin_inactive");
+                    if let Some(literal) = literal {
+                        ensure!(
+                            &memory.body == literal,
+                            "memory.import_user_definition_changed"
+                        );
+                    } else {
+                        ensure!(
+                            memory.validation == "pending"
+                                && memory
+                                    .tags
+                                    .iter()
+                                    .any(|tag| tag == "session_receipts_pending")
+                                && !memory
+                                    .protected_fields
+                                    .iter()
+                                    .any(|field| matches!(field.as_str(), "body" | "sources")),
+                            "memory.import_draft_changed_or_protected"
+                        );
+                    }
+                }
                 self.mutate(name, package, &args, false)
             })?
         };

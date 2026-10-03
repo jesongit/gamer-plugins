@@ -126,7 +126,7 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Arc<AiService>, Arc<Extensi
     (root, ai, extensions)
 }
 use std::io::Cursor;
-fn record() -> SessionRecord {
+pub(super) fn record() -> SessionRecord {
     SessionRecord {
         session_id: "s".into(),
         run_id: "r".into(),
@@ -244,7 +244,7 @@ fn unlimited_limits() -> Limits {
         max_failures: 0,
     }
 }
-fn session_record(record: SessionRecord, lease: Option<ControlLease>) -> Arc<Session> {
+pub(super) fn session_record(record: SessionRecord, lease: Option<ControlLease>) -> Arc<Session> {
     Arc::new(Session {
         record: Mutex::new(record),
         lease: AsyncMutex::new(lease),

@@ -13,7 +13,6 @@ use std::{
 };
 
 const RESPONSE_BYTES_LIMIT: usize = 2 * 1024 * 1024;
-const DEFAULT_OUTPUT_LIMIT: u32 = 2048;
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {
@@ -34,8 +33,8 @@ pub struct ModelTurn {
     pub diagnostics: Value,
 }
 
-/// Only supplier-published output. Chat reasoning_content requires an explicit
-/// model setting; Responses raw/encrypted reasoning is never emitted.
+/// Only supplier-published output. Responses reasoning_text is accepted only
+/// from the documented official GLM endpoint; encrypted content is never emitted.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelStreamEvent {
@@ -147,6 +146,7 @@ impl Provider {
             protocol: config.protocol.clone(),
             request_timeout_secs: config.request_timeout_secs,
             public_reasoning_content: config.public_reasoning_content,
+            max_output_tokens: config.max_output_tokens,
         })?;
         ensure!(!config.api_key.is_empty(), "AI API 密钥未配置");
         let http = reqwest::Client::builder()
@@ -157,16 +157,12 @@ impl Provider {
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .context("无法创建 AI HTTP 客户端")?;
+        let max_output_tokens = config.max_output_tokens;
         Ok(Self {
             config,
             http,
-            max_output_tokens: DEFAULT_OUTPUT_LIMIT,
+            max_output_tokens,
         })
-    }
-
-    pub fn with_output_limit(mut self, limit: u32) -> Self {
-        self.max_output_tokens = limit.clamp(128, 4096);
-        self
     }
 
     pub async fn turn(
@@ -220,6 +216,7 @@ impl Provider {
         });
         let mut state = StreamState::new(self.config.protocol == "responses", &self.config.api_key);
         state.public_reasoning_content = self.config.public_reasoning_content;
+        state.published_responses_reasoning = self.published_responses_reasoning();
         let result = self
             .consume_stream(response, cancel, &mut state, &mut on_event)
             .await;
@@ -267,16 +264,39 @@ impl Provider {
             (
                 "responses",
                 json!({"model":self.config.model,"input":responses_history(history)?,
-                "tools":tools,"stream":stream,"store":false,"max_output_tokens":self.max_output_tokens,"parallel_tool_calls":false}),
+                "tools":tools,"stream":stream,"store":false,"parallel_tool_calls":false}),
             )
         } else {
             let converted: Result<Vec<_>> = tools.iter().map(chat_tool).collect();
             (
                 "chat/completions",
                 json!({"model":self.config.model,"messages":chat_history(history)?,
-                "tools":converted?,"stream":stream,"max_tokens":self.max_output_tokens,"parallel_tool_calls":false}),
+                "tools":converted?,"stream":stream,"parallel_tool_calls":false}),
             )
         };
+        if self.max_output_tokens > 0 {
+            let key = if self.config.protocol == "responses" {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[key] = json!(self.max_output_tokens);
+        }
+        // GLM documents public thinking for Chat Completions. Its Responses
+        // API already thinks by default and has no reasoning.summary option.
+        if self.config.protocol == "chat_completions"
+            && self.config.public_reasoning_content
+            && official_glm_endpoint(
+                &self.config.base_url,
+                &self.config.model,
+                "chat_completions",
+            )
+            && ["glm-5", "glm-4.5", "glm-4.6", "glm-4.7"]
+                .iter()
+                .any(|prefix| self.config.model.to_ascii_lowercase().starts_with(*prefix))
+        {
+            body["thinking"] = json!({"type":"enabled"});
+        }
         if tools.is_empty() {
             body.as_object_mut().unwrap().remove("tools");
             body.as_object_mut().unwrap().remove("parallel_tool_calls");
@@ -291,6 +311,11 @@ impl Provider {
             };
         }
         Ok((suffix, body))
+    }
+
+    fn published_responses_reasoning(&self) -> bool {
+        self.config.public_reasoning_content
+            && official_glm_endpoint(&self.config.base_url, &self.config.model, "responses")
     }
 
     async fn consume_stream<F: FnMut(ModelStreamEvent)>(
@@ -337,6 +362,9 @@ impl Provider {
             }
             // Some compatible suppliers return complete JSON despite stream.
             // Preserve their explicitly configured protocol; do not reconnect.
+            if state.responses && state.published_responses_reasoning {
+                state.publish_response_reasoning(&value, on_event);
+            }
             if !state.responses && state.public_reasoning_content {
                 if let Some(thinking) = value
                     .pointer("/choices/0/message/reasoning_content")
@@ -761,6 +789,65 @@ struct ChatCallDelta {
     name: String,
     arguments: String,
 }
+
+/// The meaning of reasoning_text is supplier-specific. GLM explicitly publishes
+/// this output in its Responses schema; an OpenAI-compatible URL alone is not
+/// evidence that raw reasoning from another supplier is public.
+fn official_glm_endpoint(base_url: &str, model: &str, protocol: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("open.bigmodel.cn")
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !model.to_ascii_lowercase().starts_with("glm-")
+    {
+        return false;
+    }
+    match protocol {
+        "responses" => url.path().trim_end_matches('/') == "/api/v1",
+        "chat_completions" => matches!(
+            url.path().trim_end_matches('/'),
+            "/api/paas/v4" | "/api/coding/paas/v4"
+        ),
+        _ => false,
+    }
+}
+
+fn published_glm_reasoning(value: &Value) -> Vec<(usize, String)> {
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    output
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                return None;
+            }
+            let content = item.get("content")?;
+            let parts: Vec<&Value> = if let Some(parts) = content.as_array() {
+                parts.iter().collect()
+            } else if content.is_object() {
+                vec![content]
+            } else {
+                return None;
+            };
+            let text = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("reasoning_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some((index, text))
+        })
+        .collect()
+}
+
 struct StreamState {
     responses: bool,
     streamed: bool,
@@ -777,6 +864,8 @@ struct StreamState {
     summary_redactor: DeltaRedactor,
     thinking_redactor: DeltaRedactor,
     public_reasoning_content: bool,
+    published_responses_reasoning: bool,
+    published_reasoning_by_index: BTreeMap<usize, String>,
 }
 impl StreamState {
     fn new(responses: bool, key: &str) -> Self {
@@ -796,6 +885,50 @@ impl StreamState {
             summary_redactor: DeltaRedactor::new(key),
             thinking_redactor: DeltaRedactor::new(key),
             public_reasoning_content: false,
+            published_responses_reasoning: false,
+            published_reasoning_by_index: BTreeMap::new(),
+        }
+    }
+
+    fn published_reasoning_delta<F: FnMut(ModelStreamEvent)>(
+        &mut self,
+        index: usize,
+        delta: &str,
+        on_event: &mut F,
+    ) {
+        self.published_reasoning_by_index
+            .entry(index)
+            .or_default()
+            .push_str(delta);
+        self.delta("thinking", delta, on_event);
+    }
+
+    fn published_reasoning_done<F: FnMut(ModelStreamEvent)>(
+        &mut self,
+        index: usize,
+        text: &str,
+        on_event: &mut F,
+    ) {
+        let previous = self
+            .published_reasoning_by_index
+            .get(&index)
+            .map(String::as_str)
+            .unwrap_or("");
+        // Done/completed may repeat deltas. Only publish a missing suffix, and
+        // never invent a replacement when the supplier gives inconsistent text.
+        if let Some(suffix) = text.strip_prefix(previous) {
+            let suffix = suffix.to_string();
+            self.published_reasoning_delta(index, &suffix, on_event);
+        }
+    }
+
+    fn publish_response_reasoning<F: FnMut(ModelStreamEvent)>(
+        &mut self,
+        response: &Value,
+        on_event: &mut F,
+    ) {
+        for (index, text) in published_glm_reasoning(response) {
+            self.published_reasoning_done(index, &text, on_event);
         }
     }
     fn delta<F: FnMut(ModelStreamEvent)>(&mut self, channel: &str, delta: &str, on_event: &mut F) {
@@ -882,8 +1015,35 @@ impl StreamState {
                         .context("AI 公开摘要 delta 无效")?,
                     on_event,
                 ),
+                "response.reasoning_text.delta" if self.published_responses_reasoning => {
+                    self.published_reasoning_delta(
+                        value
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                        value
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .context("GLM 公开思考 delta 无效")?,
+                        on_event,
+                    );
+                }
+                "response.reasoning_text.done" if self.published_responses_reasoning => {
+                    self.published_reasoning_done(
+                        value
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                        value
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .context("GLM 公开思考 text 无效")?,
+                        on_event,
+                    );
+                }
                 "response.thinking_text.delta"
-                    if value.get("visibility").and_then(Value::as_str) == Some("public") =>
+                    if self.public_reasoning_content
+                        && value.get("visibility").and_then(Value::as_str) == Some("public") =>
                 {
                     self.delta(
                         "thinking",
@@ -901,6 +1061,9 @@ impl StreamState {
                             == kind.strip_prefix("response."),
                         "AI SSE 终态与 status 不一致"
                     );
+                    if self.published_responses_reasoning {
+                        self.publish_response_reasoning(response, on_event);
+                    }
                     self.final_response = Some(response.clone());
                     return Ok(true);
                 }
@@ -969,10 +1132,11 @@ impl StreamState {
                         self.summary.push_str(summary);
                         self.delta("summary", summary, on_event);
                     }
-                    if let Some(thinking) = delta.get("public_thinking").and_then(Value::as_str) {
-                        self.delta("thinking", thinking, on_event);
-                    }
                     if self.public_reasoning_content {
+                        if let Some(thinking) = delta.get("public_thinking").and_then(Value::as_str)
+                        {
+                            self.delta("thinking", thinking, on_event);
+                        }
                         if let Some(thinking) =
                             delta.get("reasoning_content").and_then(Value::as_str)
                         {
@@ -1353,7 +1517,13 @@ fn message_text(content: &Value) -> Result<String> {
     if let Some(text) = content.as_str() {
         return Ok(text.to_string());
     }
-    let blocks = content.as_array().context("模型回答 content 无效")?;
+    let blocks: Vec<&Value> = if let Some(blocks) = content.as_array() {
+        blocks.iter().collect()
+    } else if content.is_object() {
+        vec![content]
+    } else {
+        anyhow::bail!("模型回答 content 无效");
+    };
     let mut result = Vec::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -1616,8 +1786,191 @@ fn parse_chat(value: Value) -> Result<ModelTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glm_provider(protocol: &str) -> Provider {
+        Provider::new(ConnectionConfig {
+            base_url: if protocol == "responses" {
+                "https://open.bigmodel.cn/api/v1".into()
+            } else {
+                "https://open.bigmodel.cn/api/paas/v4".into()
+            },
+            model: "glm-5.3-flash".into(),
+            protocol: protocol.into(),
+            request_timeout_secs: 90,
+            api_key: "test-only".into(),
+            public_reasoning_content: true,
+            max_output_tokens: super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS,
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn published_chat_reasoning_requires_explicit_opt_in_and_never_enters_history() {
+    fn glm_published_reasoning_is_limited_to_the_documented_official_endpoint() {
+        let provider = glm_provider("responses");
+        assert!(provider.published_responses_reasoning());
+        for (url, model) in [
+            ("https://api.openai.com/v1", "glm-5.3-flash"),
+            (
+                "https://open.bigmodel.cn.evil.example/api/v1",
+                "glm-5.3-flash",
+            ),
+            ("https://open.bigmodel.cn/api/other", "glm-5.3-flash"),
+            ("https://open.bigmodel.cn:8443/api/v1", "glm-5.3-flash"),
+            ("http://open.bigmodel.cn/api/v1", "glm-5.3-flash"),
+            ("https://open.bigmodel.cn/api/v1", "gpt-5"),
+        ] {
+            assert!(!official_glm_endpoint(url, model, "responses"));
+        }
+        let mut provider = provider;
+        provider.config.public_reasoning_content = false;
+        assert!(!provider.published_responses_reasoning());
+    }
+
+    #[test]
+    fn per_request_output_limit_is_configurable_and_zero_uses_supplier_default() {
+        for protocol in ["responses", "chat_completions"] {
+            let mut provider = glm_provider(protocol);
+            let field = if protocol == "responses" {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            let (_, body) = provider.request_body(&[], &[], None, true).unwrap();
+            assert_eq!(body[field], 16384);
+            if protocol == "responses" {
+                // GLM's schema only declares effort; summary is not supported.
+                assert!(body.get("reasoning").is_none());
+            } else {
+                assert_eq!(body["thinking"]["type"], "enabled");
+            }
+            provider.max_output_tokens = 0;
+            let (_, body) = provider.request_body(&[], &[], None, false).unwrap();
+            assert!(body.get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn glm_public_reasoning_streams_once_and_never_enters_model_history() {
+        for enabled in [false, true] {
+            let mut state = StreamState::new(true, "test-secret");
+            state.published_responses_reasoning = enabled;
+            let mut events = Vec::new();
+            let mut emit = |event| events.push(event);
+            for value in [
+                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"先核对 test-"}),
+                json!({"type":"response.reasoning_text.delta","output_index":0,"delta":"secret 画面。"}),
+                json!({"type":"response.reasoning_text.done","output_index":0,"text":"先核对 test-secret 画面。"}),
+                json!({"type":"response.completed","response":{"status":"completed","output":[
+                    {"type":"reasoning","content":{"type":"reasoning_text","text":"先核对 test-secret 画面。"},"encrypted_content":"opaque-private"},
+                    {"type":"message","role":"assistant","content":{"type":"output_text","text":"已经确认。"}}
+                ]}}),
+            ] {
+                state
+                    .event(
+                        SseEvent {
+                            name: String::new(),
+                            data: value.to_string(),
+                        },
+                        &mut emit,
+                    )
+                    .unwrap();
+            }
+            state.flush(&mut emit);
+            let thinking = events
+                .iter()
+                .filter_map(|event| {
+                    if let ModelStreamEvent::ThinkingDelta { delta } = event {
+                        Some(delta.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(
+                thinking,
+                if enabled {
+                    "先核对 [redacted] 画面。"
+                } else {
+                    ""
+                }
+            );
+            let turn = state.finish().unwrap();
+            assert_eq!(turn.text, "已经确认。");
+            assert!(turn.summary.is_empty());
+            let history = serde_json::to_string(&turn.items).unwrap();
+            assert!(!history.contains("先核对"));
+            assert!(!history.contains("opaque-private"));
+        }
+    }
+
+    #[test]
+    fn glm_completed_reasoning_is_emitted_when_deltas_are_omitted() {
+        let mut state = StreamState::new(true, "secret");
+        state.published_responses_reasoning = true;
+        let mut events = Vec::new();
+        state.event(SseEvent { name: String::new(), data: json!({"type":"response.completed","response":{"status":"completed","output":[
+            {"type":"reasoning","content":[{"type":"reasoning_text","text":"补发公开思考 secret"}]},
+            {"type":"message","role":"assistant","content":{"type":"output_text","text":"完成"}}
+        ]}}).to_string() }, &mut |event| events.push(event)).unwrap();
+        state.flush(&mut |event| events.push(event));
+        assert!(serde_json::to_string(&events)
+            .unwrap()
+            .contains("补发公开思考 [redacted]"));
+        assert!(!serde_json::to_string(&state.finish().unwrap().items)
+            .unwrap()
+            .contains("补发"));
+    }
+
+    #[tokio::test]
+    async fn glm_json_fallback_emits_public_reasoning_without_reconnecting_or_history_leak() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let body = json!({"status":"completed","output":[
+                {"type":"reasoning","content":{"type":"reasoning_text","text":"JSON公开思考 test-only"}},
+                {"type":"message","role":"assistant","content":{"type":"output_text","text":"JSON回答"}}
+            ]}).to_string();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let provider = fixture_provider(address, "responses");
+        // The transport is a local fixture. The policy boundary is covered
+        // separately; here the state simulates a verified official GLM request.
+        let response = provider
+            .http
+            .post(format!("http://{address}/v1/responses"))
+            .bearer_auth("test-only")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let mut state = StreamState::new(true, "test-only");
+        state.published_responses_reasoning = true;
+        let mut events = Vec::new();
+        let turn = provider
+            .consume_stream(
+                response,
+                &AtomicBool::new(false),
+                &mut state,
+                &mut |event| events.push(event),
+            )
+            .await
+            .unwrap();
+        state.flush(&mut |event| events.push(event));
+        fixture.await.unwrap();
+        assert_eq!(turn.text, "JSON回答");
+        assert!(serde_json::to_string(&events)
+            .unwrap()
+            .contains("JSON公开思考 [redacted]"));
+        assert!(!serde_json::to_string(&turn.items)
+            .unwrap()
+            .contains("JSON公开思考"));
+    }
+    #[test]
+    fn published_chat_reasoning_setting_controls_visibility_and_never_enters_history() {
         for enabled in [false, true] {
             let mut state = StreamState::new(false, "test-secret");
             state.public_reasoning_content = enabled;
@@ -1685,6 +2038,7 @@ mod tests {
             request_timeout_secs: 5,
             api_key: "test-only".into(),
             public_reasoning_content: false,
+            max_output_tokens: super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS,
         })
         .unwrap()
     }
@@ -1991,6 +2345,7 @@ mod tests {
                 request_timeout_secs: 5,
                 api_key: "test-only".into(),
                 public_reasoning_content: false,
+                max_output_tokens: super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS,
             })
             .unwrap();
             let cancelled = AtomicBool::new(false);
@@ -2090,7 +2445,7 @@ mod tests {
                         } else {
                             "max_output_tokens"
                         }],
-                        2048
+                        super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS
                     );
                     let messages = request[if chat { "messages" } else { "input" }]
                         .as_array()
@@ -2188,6 +2543,7 @@ mod tests {
                 request_timeout_secs: 5,
                 api_key: "test-only".into(),
                 public_reasoning_content: false,
+                max_output_tokens: super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS,
             })
             .unwrap();
             let result = provider.probe(&AtomicBool::new(false)).await.unwrap();

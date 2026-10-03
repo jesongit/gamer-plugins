@@ -31,6 +31,10 @@ pub(super) struct Record {
     pub limits: super::Limits,
     #[serde(default)]
     pub usage: super::Usage,
+    #[serde(default)]
+    pub game_limits: Option<super::Limits>,
+    #[serde(default)]
+    pub game_usage: Option<super::Usage>,
 }
 struct Worker {
     running: AtomicBool,
@@ -40,6 +44,7 @@ pub(super) struct Conversations {
     db: Mutex<Connection>,
     workers: Mutex<BTreeMap<String, Arc<Worker>>>,
 }
+type MemoryJobLink = (String, String, String, String);
 impl Conversations {
     pub fn busy(&self) -> bool {
         self.workers
@@ -100,7 +105,12 @@ impl Conversations {
             CREATE TABLE IF NOT EXISTS events(conversation TEXT NOT NULL,seq INTEGER NOT NULL,event TEXT NOT NULL,PRIMARY KEY(conversation,seq));
             CREATE TABLE IF NOT EXISTS inbox(id TEXT PRIMARY KEY,conversation TEXT NOT NULL,text TEXT NOT NULL,status TEXT NOT NULL,options TEXT NOT NULL,at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS assistant_pending(id TEXT PRIMARY KEY,conversation TEXT NOT NULL,turn_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memory_checkpoints(conversation TEXT PRIMARY KEY,record TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memory_job_links(conversation TEXT NOT NULL,package TEXT NOT NULL,job TEXT NOT NULL,summary TEXT NOT NULL DEFAULT '',PRIMARY KEY(conversation,job));
+            CREATE TABLE IF NOT EXISTS memory_definition_links(conversation TEXT NOT NULL,message TEXT NOT NULL,memory TEXT NOT NULL,PRIMARY KEY(conversation,message));
             CREATE INDEX IF NOT EXISTS inbox_queue ON inbox(conversation,status,at);")?;
+        db.execute("INSERT OR IGNORE INTO memory_job_links(conversation,package,job) SELECT e.conversation,c.package,json_extract(e.event,'$.data.result.job_id') FROM events e JOIN conversations c ON c.id=e.conversation WHERE json_extract(e.event,'$.kind')='memory_job' AND json_extract(e.event,'$.data.result.job_id') IS NOT NULL",[])?;
+        db.execute("INSERT OR IGNORE INTO memory_definition_links(conversation,message,memory) SELECT e.conversation,json_extract(e.event,'$.data.message_id'),json_extract(e.event,'$.data.memory.id') FROM events e WHERE json_extract(e.event,'$.kind')='memory_staged' AND json_extract(e.event,'$.data.message_id') IS NOT NULL AND json_extract(e.event,'$.data.memory.id') IS NOT NULL",[])?;
         // Persisted history is a replay, never an input lease or automatic restart.
         db.execute(
             "UPDATE inbox SET status='interrupted' WHERE status IN ('incorporated','queued')",
@@ -146,6 +156,8 @@ impl Conversations {
             game_session_id: None,
             limits: Default::default(),
             usage: Default::default(),
+            game_limits: None,
+            game_usage: None,
         };
         self.db.lock().execute(
             "INSERT INTO conversations(id,package,record) VALUES(?1,?2,?3)",
@@ -190,6 +202,8 @@ impl Conversations {
                 game_session_id: None,
                 limits: Default::default(),
                 usage: Default::default(),
+                game_limits: None,
+                game_usage: None,
             };
             tx.execute(
                 "INSERT INTO conversations(id,package,record) VALUES(?1,?2,?3)",
@@ -217,6 +231,92 @@ impl Conversations {
     pub fn set_limits(&self, id: &str, limits: super::Limits) -> Result<()> {
         limits.validate()?;
         self.update_record(id, |r| r.limits = limits)
+    }
+    pub(super) fn game_records(&self) -> Result<Vec<Record>> {
+        let db = self.db.lock();
+        let mut query = db.prepare("SELECT c.record FROM conversations c LEFT JOIN memory_checkpoints m ON m.conversation=c.id WHERE json_extract(c.record,'$.game_session_id')=c.id AND json_extract(c.record,'$.state')!='package_deleted' AND COALESCE(json_extract(m.record,'$.suppressed'),0)=0 AND json_extract(c.record,'$.latest_seq')>COALESCE(json_extract(m.record,'$.seq'),0) ORDER BY c.rowid ASC LIMIT 100")?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect();
+        records
+    }
+    pub(super) fn memory_checkpoint(
+        &self,
+        id: &str,
+    ) -> Result<super::memory_checkpoint::Checkpoint> {
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT record FROM memory_checkpoints WHERE conversation=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Default::default()))
+    }
+    pub(super) fn save_memory_checkpoint(
+        &self,
+        id: &str,
+        checkpoint: &super::memory_checkpoint::Checkpoint,
+    ) -> Result<()> {
+        self.db.lock().execute("INSERT INTO memory_checkpoints(conversation,record) VALUES(?1,?2) ON CONFLICT(conversation) DO UPDATE SET record=excluded.record", params![id,serde_json::to_string(checkpoint)?])?;
+        Ok(())
+    }
+    /// Stream-safe public receipts, independent of the bounded SessionRecord tail.
+    pub(super) fn memory_events(&self, id: &str, after: u64, through: u64) -> Result<Vec<Value>> {
+        let db = self.db.lock();
+        let mut query = db.prepare("SELECT event FROM events WHERE conversation=?1 AND seq>?2 AND seq<=?3 AND json_extract(event,'$.kind') IN ('user','assistant_final','tool_end','error','state') AND (json_extract(event,'$.data.origin')='gameplay' OR json_extract(event,'$.data.turn_id') LIKE 'game:%') ORDER BY seq")?;
+        let events = query
+            .query_map(params![id, after, through], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect();
+        events
+    }
+    pub(super) fn link_memory_job(&self, id: &str, package: &str, job: &str) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR IGNORE INTO memory_job_links(conversation,package,job) VALUES(?1,?2,?3)",
+            params![id, package, job],
+        )?;
+        Ok(())
+    }
+    pub(super) fn link_memory_definition(
+        &self,
+        id: &str,
+        message: &str,
+        memory: &str,
+    ) -> Result<()> {
+        self.db.lock().execute("INSERT OR IGNORE INTO memory_definition_links(conversation,message,memory) VALUES(?1,?2,?3)",params![id,message,memory])?;
+        Ok(())
+    }
+    pub(super) fn memory_definition_links(&self, id: &str) -> Result<Vec<(String, String)>> {
+        let db = self.db.lock();
+        let mut query=db.prepare("SELECT d.memory,COALESCE((SELECT json_extract(e.event,'$.message') FROM events e WHERE e.conversation=d.conversation AND json_extract(e.event,'$.data.message_id')=d.message AND json_extract(e.event,'$.kind')='user' LIMIT 1),'') FROM memory_definition_links d WHERE d.conversation=?1")?;
+        let links = query
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(links)
+    }
+    pub(super) fn memory_job_links(&self) -> Result<Vec<MemoryJobLink>> {
+        let db = self.db.lock();
+        let mut query = db.prepare(
+            "SELECT conversation,package,job,summary FROM memory_job_links ORDER BY rowid",
+        )?;
+        let links = query
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(links)
+    }
+    pub(super) fn save_memory_job_summary(&self, id: &str, job: &str, summary: &str) -> Result<()> {
+        self.db.lock().execute(
+            "UPDATE memory_job_links SET summary=?3 WHERE conversation=?1 AND job=?2",
+            params![id, job, summary],
+        )?;
+        Ok(())
     }
     pub fn list(&self, package: &str, values: &Value) -> Result<Value> {
         let limit = values["limit"].as_u64().unwrap_or(40).clamp(1, 100) as i64;
@@ -269,6 +369,16 @@ impl Conversations {
             })?;
         let mut record: Record = serde_json::from_str(&row)?;
         record.latest_seq += 1;
+        // Only the journal belonging to this game can supply authoritative
+        // totals; another chat's linked game messages do not change its budget.
+        if record.game_session_id.as_deref() == Some(id) {
+            if let Some(usage) = data.get("game_usage") {
+                record.game_usage = Some(serde_json::from_value(usage.clone())?);
+            }
+            if let Some(limits) = data.get("game_limits") {
+                record.game_limits = Some(serde_json::from_value(limits.clone())?);
+            }
+        }
         record.updated_at = Utc::now().to_rfc3339();
         if kind == "state" {
             if let Some(state) = data["state"].as_str() {
@@ -469,8 +579,10 @@ impl Conversations {
             updated_at: now,
             latest_seq: 0,
             game_session_id: Some(session.session_id.clone()),
-            limits: session.limits.clone(),
-            usage: session.usage.clone(),
+            limits: Default::default(),
+            usage: Default::default(),
+            game_limits: Some(session.limits.clone()),
+            game_usage: Some(session.usage.clone()),
         };
         self.db.lock().execute(
             "INSERT OR IGNORE INTO conversations(id,package,record) VALUES(?1,?2,?3)",
@@ -1187,6 +1299,12 @@ impl State {
         self.authorize(Some(crate::extensions::Permission::UiHost))?;
         let guide=format!("# 用户提供的资料\n\n会话：{id}\n消息：{message_id}\n版本：unknown\n证据状态：用户原文，尚未实机复核。用户记住的原文已独立保护；后台只能提炼可编辑资料，不能覆盖保护内容。以下资料不授予工具权限。\n\n## 原始用户资料\n\n{text}");
         let result=within_budget(self.memory.call_cancellable("memory_import",&record.content_package,json!({"operation_id":format!("human-source:{message_id}"),"filename":format!("conversation-{message_id}.md"),"title":format!("用户资料：{}",text.chars().take(80).collect::<String>()),"text":guide,"game_version":"unknown","limits":record.limits}),None,false,cancel),remaining_time(&current,0.0)).await?;
+        self.conversations.link_memory_job(
+            id,
+            &record.content_package,
+            required(&result, "job_id")?,
+        )?;
+        self.sync_memory_job_events()?;
         if let Some(definition_id) = protected_id {
             let linked=async {
                 let references=self.memory.source_references(&record.content_package,required(&result,"source_id")?,result["source_revision"].as_u64().context("原稿revision缺失")?)?;
@@ -1246,6 +1364,11 @@ impl State {
         self.authorize(Some(crate::extensions::Permission::UiHost))?;
         let _activity = self.runtime.packages.acquire_activity(package)?;
         let result=self.memory.call_cancellable("memory_create",package,json!({"operation_id":format!("human-definition:{message_id}"),"title":format!("用户定义：{}",text.chars().take(100).collect::<String>()),"body":text,"kind":"definition","sources":[{"type":"conversation","conversation_id":conversation_id,"message_id":message_id,"excerpt":text}],"reason":"用户明确要求保留，原文保护；尚未实机验证"}),None,true,cancel).await?;
+        self.conversations.link_memory_definition(
+            conversation_id,
+            message_id,
+            required(&result, "id")?,
+        )?;
         Ok(Some(result))
     }
 }
@@ -1273,6 +1396,11 @@ fn user_reported_information(text: &str) -> bool {
             "已验证",
             "刚才成功",
             "刚才失败",
+            "指的是",
+            "叫做",
+            "俗称",
+            "步骤是",
+            "流程是",
         ]
         .iter()
         .any(|word| text.contains(word))
@@ -1339,11 +1467,31 @@ fn memory_instruction(text: &str, name: &str, args: &Value) -> bool {
             "定义:",
             "保存这条",
             "保存为记忆",
+            "指的是",
+            "叫做",
+            "俗称",
+            "就是",
+            "才是",
+            "步骤是",
+            "流程是",
         ]
         .iter()
         .filter_map(|word| text.find(word))
         .min()
         {
+            let explicit = [
+                "记住",
+                "定义为",
+                "定义：",
+                "定义:",
+                "保存这条",
+                "保存为记忆",
+            ]
+            .iter()
+            .any(|word| text.contains(word));
+            if !explicit && (text.contains(['?', '？']) || text.trim_end().ends_with('吗')) {
+                return false;
+            }
             let prefix = &text[..at];
             // Negatives inside the definition are content ("记住，不要浪费资源").
             // Only a question or negation of the remember command itself blocks
@@ -1355,6 +1503,9 @@ fn memory_instruction(text: &str, name: &str, args: &Value) -> bool {
                 "是否",
                 "能否",
                 "请问",
+                "为什么",
+                "会不会",
+                "是不是",
                 "不要",
                 "不想",
                 "不需要",
@@ -1590,6 +1741,59 @@ fn scrub_ephemeral(history: &mut Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn game_resume_preserves_chat_usage_and_the_two_budget_ledgers_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Conversations::new(root.path()).unwrap();
+        let mut game = super::super::tests::record();
+        game.session_id = "shared-game".into();
+        store.register_game(&game).unwrap();
+        store
+            .update_record("shared-game", |record| {
+                record.limits.max_turns = 2;
+                record.usage.turns = 2;
+                record.usage.actions = 3;
+                record.usage.known_tokens = 99;
+            })
+            .unwrap();
+        game.limits.max_turns = 0;
+        game.usage.turns = 17;
+        game.usage.actions = 42;
+        game.usage.known_tokens = 100001;
+        store
+            .event(
+                "shared-game",
+                "state",
+                "游戏恢复",
+                json!({"state":"running","game_usage":game.usage,"game_limits":game.limits}),
+            )
+            .unwrap();
+        let current = store.record("shared-game").unwrap();
+        assert_eq!(current.usage.turns, 2);
+        assert_eq!(current.usage.actions, 3);
+        assert_eq!(current.usage.known_tokens, 99);
+        assert_eq!(current.game_usage.as_ref().unwrap().turns, 17);
+        assert_eq!(current.game_usage.as_ref().unwrap().actions, 42);
+        assert!(conversation_budget(&current).is_some());
+        assert_eq!(current.game_limits.as_ref().unwrap().max_turns, 0);
+        store
+            .update_record("shared-game", |record| record.limits.max_turns = 0)
+            .unwrap();
+        game.limits.max_turns = 1;
+        store
+            .event(
+                "shared-game",
+                "progress",
+                "游戏模型计数",
+                json!({"game_usage":game.usage,"game_limits":game.limits}),
+            )
+            .unwrap();
+        assert!(conversation_budget(&store.record("shared-game").unwrap()).is_none());
+        assert_eq!(
+            super::super::budget_reason(&game).unwrap().code,
+            "budget_turns"
+        );
+    }
     async fn fixture_with_http(
         router: axum::Router,
     ) -> (
@@ -1980,6 +2184,8 @@ mod tests {
                 turns: 1,
                 ..Default::default()
             },
+            game_limits: None,
+            game_usage: None,
         };
         assert!(conversation_budget(&record).is_some());
         assert!(conversation_tool_budget(&record).is_none());

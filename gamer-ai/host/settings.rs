@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+pub(super) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
+fn default_max_output_tokens() -> u32 {
+    DEFAULT_MAX_OUTPUT_TOKENS
+}
+fn default_public_reasoning_content() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsConfig {
@@ -13,8 +21,10 @@ pub struct SettingsConfig {
     pub model: String,
     pub protocol: String,
     pub request_timeout_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_public_reasoning_content")]
     pub public_reasoning_content: bool,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
 }
 
 impl Default for SettingsConfig {
@@ -24,7 +34,8 @@ impl Default for SettingsConfig {
             model: "glm-5.3-flash".into(),
             protocol: "responses".into(),
             request_timeout_secs: 90,
-            public_reasoning_content: false,
+            public_reasoning_content: true,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
 }
@@ -97,6 +108,7 @@ pub struct ConnectionConfig {
     pub request_timeout_secs: u64,
     pub api_key: String,
     pub public_reasoning_content: bool,
+    pub max_output_tokens: u32,
 }
 
 pub struct Settings {
@@ -116,8 +128,10 @@ struct SaveRequest {
     api_key: String,
     #[serde(default)]
     clear_key: bool,
-    #[serde(default)]
+    #[serde(default = "default_public_reasoning_content")]
     public_reasoning_content: bool,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
 }
 
 impl Settings {
@@ -263,6 +277,7 @@ impl Settings {
             protocol: request.protocol,
             request_timeout_secs: request.request_timeout_secs,
             public_reasoning_content: request.public_reasoning_content,
+            max_output_tokens: request.max_output_tokens,
         };
         validate_config(&config)?;
         ensure!(request.api_key.len() <= 4096, "AI 密钥过长");
@@ -345,6 +360,7 @@ impl Settings {
             request_timeout_secs: settings.config.request_timeout_secs,
             api_key: settings.api_key,
             public_reasoning_content: settings.config.public_reasoning_content,
+            max_output_tokens: settings.config.max_output_tokens,
         })
     }
 
@@ -424,6 +440,7 @@ impl PrivateSettings {
             "protocol": self.config.protocol,
             "request_timeout_secs": self.config.request_timeout_secs,
             "public_reasoning_content": self.config.public_reasoning_content,
+            "max_output_tokens": self.config.max_output_tokens,
             "has_key": !self.api_key.is_empty(),
             "probe": self.probe,
         })
@@ -481,12 +498,39 @@ pub(super) fn validate_config(config: &SettingsConfig) -> Result<()> {
         (5..=300).contains(&config.request_timeout_secs),
         "AI 请求超时应为 5 至 300 秒"
     );
+    ensure!(
+        config.max_output_tokens <= 131072,
+        "AI 单次输出上限应为 0 至 131072（0 使用供应商默认值）"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_thinking_defaults_on_and_per_request_output_limit_remains_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings::new(directory.path().join("config.json"));
+        assert_eq!(settings.read().unwrap()["public_reasoning_content"], true);
+        assert_eq!(
+            settings.read().unwrap()["max_output_tokens"],
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        let saved = settings.save(request(Value::Null, "test-key")).unwrap();
+        assert_eq!(saved["public_reasoning_content"], true);
+        assert_eq!(saved["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+        let mut changed = request(saved["version"].clone(), "");
+        changed["public_reasoning_content"] = json!(false);
+        changed["max_output_tokens"] = json!(0);
+        let saved = settings.save(changed).unwrap();
+        assert_eq!(saved["public_reasoning_content"], false);
+        assert_eq!(settings.connection().unwrap().max_output_tokens, 0);
+        let mut invalid = request(saved["version"].clone(), "");
+        invalid["max_output_tokens"] = json!(131073);
+        assert!(settings.save(invalid).is_err());
+    }
 
     fn request(version: Value, key: &str) -> Value {
         json!({"expected_version":version,"base_url":"https://example.com/v1/",
