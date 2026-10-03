@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-ai"
-version = "0.2.0"
+version = "0.2.1"
 name = "AI 助手"
 description = "通过持续对话引导 AI 观察和操作游戏，提供本机 MCP 接入"
 permissions = ["ui.host", "ai.connect", "device.read", "device.app", "input.tap", "input.swipe", "input.key", "input.text", "touch", "runtime.sleep", "log.write"]

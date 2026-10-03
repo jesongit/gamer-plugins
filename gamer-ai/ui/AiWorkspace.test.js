@@ -29,7 +29,7 @@ beforeEach(() => {
     if (action === 'connection.probe') return { ok: true, protocol: saved.protocol, model: saved.model, checks: [{ name: 'image_input', ok: true }] }
     if (action === 'session.start') { sessions = [{ ...makeSession('starting', values.mode), ...values }]; return { session_id: 's1', run_id: 'r1' } }
     if (action === 'session.pause') { sessions[0].state = 'pausing'; return {} }
-    if (action === 'session.resume') { sessions[0].state = 'resuming'; return {} }
+    if (action === 'session.resume') { sessions[0].state = 'resuming'; if (values.limits) sessions[0].limits = values.limits; sessions[0].usage.consecutive_failures = 0; return {} }
     if (action === 'session.message') {
       const message = { id: 'm2', role: 'user', text: values.message, at: '2026-10-03T12:01:00Z' }
       sessions[0].messages ||= [{ id: 'm1', role: 'user', text: sessions[0].goal, at: '2026-10-03T12:00:00Z' }]
@@ -272,19 +272,19 @@ it('预算暂停显示已知token下限，提高上限时才提交完整新预�
   expect(wrapper.get('.message-pause').text()).toContain('部分请求用量未知')
   expect(button(wrapper, '继续 AI').element.disabled).toBe(true)
   await button(wrapper, '调整运行预算').trigger('click')
-  expect(wrapper.get('[aria-label="最大模型轮数"]').element.value).toBe('100')
+  expect(wrapper.get('[aria-label="最大模型轮数（0 表示无上限）"]').element.value).toBe('100')
   await wrapper.get('[aria-label="累计 token 上限（0 表示无上限）"]').setValue(200000)
   await button(wrapper, '调整预算并继续').trigger('click'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.resume', { session_id: 's1', limits: { max_turns: 100, max_actions: 200, max_seconds: 600, max_tokens: 200000, max_failures: 3 } })
 })
 
-it('token上限可设0解除预算暂停，其余预算保留正数下限', async () => {
+it('token上限可设0解除预算暂停，所有预算输入均允许0', async () => {
   sessions = [{ ...makeSession('paused'), reason: 'Token 使用达到预算', usage: { ...makeSession().usage, known_tokens: 105396, has_unknown_tokens: true } }]
   const wrapper = await mountWorkspace()
   await button(wrapper, '调整运行预算').trigger('click')
   const tokenBudget = wrapper.get('[aria-label="累计 token 上限（0 表示无上限）"]')
   expect(tokenBudget.attributes('min')).toBe('0')
-  expect(wrapper.get('[aria-label="最大模型轮数"]').attributes('min')).toBe('1')
+  expect(wrapper.get('[aria-label="最大模型轮数（0 表示无上限）"]').attributes('min')).toBe('0')
   await tokenBudget.setValue(0)
   expect(button(wrapper, '继续 AI').element.disabled).toBe(false)
   await wrapper.get('[aria-label="消息"]').setValue('提高预算，继续当前任务')
@@ -344,7 +344,7 @@ it('预算输入校验拒绝不足2048的非零token与小数预算，设为0可
   expect(mocks.call.mock.calls.some(call => call[1] === 'session.message')).toBe(false)
   await tokenBudget.setValue(0)
   expect(button(wrapper, '发送并继续').element.disabled).toBe(false)
-  await wrapper.get('[aria-label="最大模型轮数"]').setValue(12.5)
+  await wrapper.get('[aria-label="最大模型轮数（0 表示无上限）"]').setValue(12.5)
   expect(button(wrapper, '发送并继续').element.disabled).toBe(true)
   expect(wrapper.get('#ai-budget').text()).toContain('运行预算超出允许范围')
 })
@@ -358,4 +358,74 @@ it('真实tool phase开始显示执行中，结果失败后更新同一张工具
   expect(wrapper.findAll('.message-tool')).toHaveLength(1)
   expect(wrapper.get('.tool-status').text()).toBe('失败')
   expect(wrapper.get('.message-tool pre').text()).toContain('stale_frame')
+})
+
+it('开始会话可将五项预算全部设为0，每项提示无上限并提交完整预算', async () => {
+  const wrapper = await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-budget"]').trigger('click')
+  const fields = wrapper.findAll('[data-budget]')
+  expect(fields).toHaveLength(5)
+  for (const field of fields) {
+    expect(field.attributes('min')).toBe('0')
+    expect(field.attributes('aria-label')).toContain('0 表示无上限')
+    await field.setValue(0)
+  }
+  await wrapper.get('[aria-label="消息"]').setValue('不限预算完成当前目标')
+  expect(button(wrapper, '发送目标').element.disabled).toBe(false)
+  await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.start', {
+    device_id: 'phone', content_package: 'default', goal: '不限预算完成当前目标', mode: 'api',
+    limits: { max_turns: 0, max_actions: 0, max_seconds: 0, max_tokens: 0, max_failures: 0 },
+  })
+  expect(wrapper.findAll('.usage-grid dd').map(item => item.text())).toEqual(['2 / 不限', '3 / 不限', '4 / 不限', '未知 / 不限', '0 / 不限'])
+  expect(wrapper.get('#ai-budget').text()).toContain('用量仍会累计')
+})
+
+it('暂停后已有用量超过各上限，五项设0可继续同一run且保留累计用量及未知token下限', async () => {
+  const usage = { turns: 101, actions: 201, active_seconds: 601, total_tokens: null, known_tokens: 105396, has_unknown_tokens: true, consecutive_failures: 5 }
+  sessions = [{ ...makeSession('paused'), reason: '使用达到预算', usage }]
+  const wrapper = await mountWorkspace()
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(true)
+  await wrapper.get('[aria-controls="ai-budget"]').trigger('click')
+  for (const field of wrapper.findAll('[data-budget]')) await field.setValue(0)
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(false)
+  expect(button(wrapper, '调整预算并继续').element.disabled).toBe(false)
+  await button(wrapper, '调整预算并继续').trigger('click'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.resume', { session_id: 's1',
+    limits: { max_turns: 0, max_actions: 0, max_seconds: 0, max_tokens: 0, max_failures: 0 } })
+  expect(mocks.call.mock.calls.some(call => call[1] === 'session.start')).toBe(false)
+  expect(sessions[0].run_id).toBe('r1')
+  expect(wrapper.findAll('.usage-grid dd').map(item => item.text())).toEqual(['101 / 不限', '201 / 不限', '601 / 不限', '至少 105,396 / 不限', '0 / 不限'])
+  expect(wrapper.get('.usage-grid').text()).toContain('部分请求用量未知')
+})
+
+it('连续失败达到非零上限仍可明确继续，只有连续失败计数重置', async () => {
+  sessions = [{ ...makeSession('paused'), usage: { ...makeSession().usage, consecutive_failures: 3 } }]
+  const wrapper = await mountWorkspace()
+  expect(button(wrapper, '继续 AI').element.disabled).toBe(false)
+  expect(wrapper.get('.usage-grid').text()).toContain('3 / 3')
+  await button(wrapper, '继续 AI').trigger('click'); await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'session.resume', { session_id: 's1' })
+  expect(wrapper.findAll('.usage-grid dd').map(item => item.text())).toEqual(['2 / 100', '3 / 200', '4 / 600', '未知 / 100,000', '0 / 3'])
+})
+
+it('无上限输入仍拒绝负数、小数、活动时长1至9秒以及超出原范围', async () => {
+  const wrapper = await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-budget"]').trigger('click')
+  await wrapper.get('[aria-label="消息"]').setValue('验证预算输入')
+  const defaults = { max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 }
+  const invalid = [
+    ...Object.keys(defaults).flatMap(key => [[key, -1], [key, defaults[key] + 0.5]]),
+    ...Array.from({ length: 9 }, (_, index) => ['max_seconds', index + 1]),
+    ['max_turns', 501], ['max_actions', 2001], ['max_seconds', 7201], ['max_tokens', 2000001], ['max_failures', 21],
+  ]
+  for (const [key, value] of invalid) {
+    const field = wrapper.get(`[data-budget="${key}"]`)
+    await field.setValue(value)
+    expect(button(wrapper, '发送目标').element.disabled, `${key}=${value}`).toBe(true)
+    await wrapper.get('#ai-play form').trigger('submit'); await flushPromises()
+    expect(mocks.call.mock.calls.some(call => call[1] === 'session.start'), `${key}=${value}`).toBe(false)
+    await field.setValue(defaults[key])
+  }
+  expect(button(wrapper, '发送目标').element.disabled).toBe(false)
 })

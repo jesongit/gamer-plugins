@@ -102,6 +102,15 @@ fn record() -> SessionRecord {
         events: vec![],
     }
 }
+fn unlimited_limits() -> Limits {
+    Limits {
+        max_turns: 0,
+        max_actions: 0,
+        max_seconds: 0,
+        max_tokens: 0,
+        max_failures: 0,
+    }
+}
 fn session_record(record: SessionRecord, lease: Option<ControlLease>) -> Arc<Session> {
     Arc::new(Session {
         record: Mutex::new(record),
@@ -133,6 +142,110 @@ async fn controlled_session(ai: &AiService) -> Arc<Session> {
     ai.state.sessions.lock().insert("s".into(), session.clone());
     session
 }
+async fn controlled_browser_session(ai: &AiService) -> Arc<Session> {
+    let target = crate::browser::BrowserTarget {
+        id: "browser-unlimited-budget".into(),
+        name: "synthetic budget target".into(),
+        url: "http://localhost/".into(),
+        profile_id: "unlimited-budget".into(),
+        width: 640,
+        height: 480,
+    };
+    ai.state
+        .runtime
+        .devices
+        .browsers
+        .db
+        .save_browser_target(target.clone())
+        .unwrap();
+    let lease = ai
+        .state
+        .runtime
+        .devices
+        .controls
+        .claim(&target.id, "s")
+        .await
+        .unwrap();
+    let mut record = record();
+    record.device_id = target.id;
+    record.generation = lease.generation;
+    let session = session_record(record, Some(lease));
+    ai.state.sessions.lock().insert("s".into(), session.clone());
+    session
+}
+
+async fn model_loop_fixture(
+    limits: Limits,
+    delay: Duration,
+    fail: bool,
+) -> (
+    tempfile::TempDir,
+    Arc<AiService>,
+    Arc<ExtensionService>,
+    Arc<Session>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{http::StatusCode, routing::post, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new().route(
+        "/responses",
+        post(move |Json(body): Json<Value>| async move {
+            assert!(body["input"].to_string().contains("input_image"));
+            tokio::time::sleep(delay).await;
+            if fail {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":{"message":"synthetic temporary failure"}})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({"status":"completed","output":[{
+                        "type":"function_call","id":"finish","call_id":"finish",
+                        "name":"session_finish","arguments":"{\"message\":\"synthetic goal completed\"}"
+                    }],"usage":{"total_tokens":4}})),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (root, ai, extensions) = fixture().await;
+    let saved = ai.state.settings.read().unwrap();
+    ai.dispatch(
+        "settings.save",
+        json!({"expected_version":saved["version"],"base_url":base,
+        "model":"synthetic","protocol":"responses","api_key":"synthetic-local-only",
+        "request_timeout_secs":5}),
+    )
+    .await
+    .unwrap();
+    let session = controlled_browser_session(&ai).await;
+    session.record.lock().limits = limits;
+    *session.active_since.lock() = Some(Instant::now());
+    // Seed a genuine synthetic image receipt so the production model loop
+    // exercises request timing and failures without starting a browser or ADB.
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let generation = session.record.lock().generation;
+    let capture = mcp::ToolResult::image(
+        png.get_ref(),
+        "image/png",
+        json!({"frame_id":"synthetic-frame","generation":generation,"width":1,"height":1}),
+    )
+    .value();
+    session.results.lock().insert(
+        format!("{generation}:capture:{generation}"),
+        json!({"fingerprint":serde_json::to_string(&json!(["screen_capture",{}])).unwrap(),"result":capture}),
+    );
+    (root, ai, extensions, session, server)
+}
 #[test]
 fn budgets_are_bounded_and_tokens_unknown_are_not_zero() {
     let mut r = record();
@@ -143,13 +256,275 @@ fn budgets_are_bounded_and_tokens_unknown_are_not_zero() {
     r.usage.total_tokens = Some(r.limits.max_tokens);
     assert!(budget_reason(&r).is_some());
     assert!(Limits {
-        max_seconds: 0,
+        max_seconds: 9,
         ..Limits::default()
     }
     .validate()
     .is_err());
     assert!(constant_eq("abc", "abc"));
     assert!(!constant_eq("abc", "abd"));
+}
+
+#[test]
+fn every_zero_budget_is_unlimited_and_nonzero_ranges_stay_bounded() {
+    let mut r = record();
+    r.limits = unlimited_limits();
+    r.limits.validate().unwrap();
+    r.usage = Usage {
+        turns: u32::MAX,
+        actions: u32::MAX,
+        active_seconds: 100_000.0,
+        total_tokens: Some(u64::MAX),
+        known_tokens: u64::MAX,
+        has_unknown_tokens: true,
+        consecutive_failures: u32::MAX,
+    };
+    ensure_budget_available(&r).unwrap();
+    assert!(activity_budget_remaining(&r).is_none());
+    for (field, invalid) in [
+        ("max_turns", 501),
+        ("max_actions", 2001),
+        ("max_seconds", 9),
+        ("max_seconds", 7201),
+        ("max_tokens", 2047),
+        ("max_tokens", 2_000_001),
+        ("max_failures", 21),
+    ] {
+        let mut value = serde_json::to_value(unlimited_limits()).unwrap();
+        value[field] = json!(invalid);
+        assert!(serde_json::from_value::<Limits>(value)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    for (field, maximum, expected) in [
+        ("max_turns", 1, "budget_turns"),
+        ("max_actions", 1, "budget_actions"),
+        ("max_seconds", 10, "budget_seconds"),
+        ("max_tokens", 2048, "budget_tokens"),
+    ] {
+        let mut value = serde_json::to_value(unlimited_limits()).unwrap();
+        value[field] = json!(maximum);
+        r.limits = serde_json::from_value(value).unwrap();
+        r.limits.validate().unwrap();
+        assert_eq!(budget_reason(&r).unwrap().code, expected);
+    }
+}
+
+#[tokio::test]
+async fn all_zero_budgets_admit_a_real_tool_and_saturate_usage() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_browser_session(&ai).await;
+    {
+        let mut r = session.record.lock();
+        r.limits = unlimited_limits();
+        r.usage.actions = u32::MAX;
+        r.usage.active_seconds = 100_000.0;
+        r.usage.known_tokens = u64::MAX;
+        r.events.push(Event {
+            seq: u64::MAX,
+            at: "now".into(),
+            kind: "test".into(),
+            message: String::new(),
+            data: json!({}),
+        });
+    }
+    let generation = session.record.lock().generation;
+    let result = ai
+        .state
+        .tool(
+            &session,
+            "wait",
+            json!({"duration_ms":1}),
+            "unlimited-wait",
+            generation,
+        )
+        .await
+        .unwrap();
+    assert_ne!(result["isError"], true);
+    assert_eq!(session.record.lock().usage.actions, u32::MAX);
+    assert_eq!(session.record.lock().usage.known_tokens, u64::MAX);
+    assert_eq!(session.record.lock().events.last().unwrap().seq, u64::MAX);
+    assert!(session
+        .record
+        .lock()
+        .events
+        .iter()
+        .any(|event| event.kind == "tool"
+            && event.data["phase"] == "result"
+            && event.data["ok"] == true));
+    session.record.lock().limits.max_actions = 1;
+    assert!(ai
+        .state
+        .tool(
+            &session,
+            "wait",
+            json!({"duration_ms":1}),
+            "finite-wait",
+            generation
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("工具调用达到预算"));
+    ai.state.stop(&session, "cancelled").await.unwrap();
+}
+
+#[tokio::test]
+async fn unlimited_failures_keep_the_model_loop_running_with_pause_and_stop_available() {
+    let (_root, ai, _extensions, session, server) =
+        model_loop_fixture(unlimited_limits(), Duration::ZERO, true).await;
+    let original = session.record.lock().generation;
+    let runner = {
+        let state = ai.state.clone();
+        let session = session.clone();
+        tokio::spawn(async move { state.run(&session, Arc::new(AtomicBool::new(false))).await })
+    };
+    let began = Instant::now();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while session.record.lock().usage.consecutive_failures < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_millis(1800),
+        "Failed requests must retain retry backoff"
+    );
+    assert_eq!(session.record.lock().state, "running");
+    assert_eq!(session.record.lock().generation, original);
+    assert!(session.record.lock().pause_reason.is_none());
+    ai.state.pause(&session, "用户暂停".into()).await.unwrap();
+    assert_eq!(session.record.lock().state, "paused");
+    assert!(
+        ai.state
+            .runtime
+            .devices
+            .controls
+            .status("browser-unlimited-budget")
+            .manual_allowed
+    );
+    ai.state.stop(&session, "cancelled").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.record.lock().state, "finished");
+    assert!(ai
+        .state
+        .runtime
+        .devices
+        .browsers
+        .session("browser-unlimited-budget")
+        .is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn unlimited_seconds_wait_for_the_model_and_execute_its_tool() {
+    let (_root, ai, _extensions, session, server) =
+        model_loop_fixture(unlimited_limits(), Duration::from_millis(150), false).await;
+    {
+        let mut r = session.record.lock();
+        r.usage.turns = u32::MAX;
+        r.usage.known_tokens = u64::MAX;
+    }
+    let began = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        ai.state.run(&session, Arc::new(AtomicBool::new(false))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(began.elapsed() >= Duration::from_millis(100));
+    let r = session.record.lock();
+    assert_eq!(r.state, "finished");
+    assert_eq!(r.usage.turns, u32::MAX);
+    assert_eq!(r.usage.known_tokens, u64::MAX);
+    assert_eq!(r.usage.actions, 1);
+    assert!(!r
+        .events
+        .iter()
+        .any(|event| event.data["code"] == "budget_seconds"));
+    assert!(ai
+        .state
+        .runtime
+        .devices
+        .browsers
+        .session("browser-unlimited-budget")
+        .is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn finite_seconds_still_interrupt_a_pending_model_request() {
+    let mut limits = unlimited_limits();
+    limits.max_seconds = 10;
+    let (_root, ai, _extensions, session, server) =
+        model_loop_fixture(limits, Duration::from_secs(2), false).await;
+    session.record.lock().usage.active_seconds = 9.0;
+    *session.active_since.lock() = Some(Instant::now());
+    let runner = {
+        let state = ai.state.clone();
+        let session = session.clone();
+        tokio::spawn(async move { state.run(&session, Arc::new(AtomicBool::new(false))).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while session.record.lock().state != "paused" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        session.record.lock().pause_reason.as_ref().unwrap().code,
+        "budget_seconds"
+    );
+    assert_eq!(session.record.lock().usage.turns, 1);
+    assert_eq!(session.record.lock().usage.actions, 0);
+    ai.state.stop(&session, "cancelled").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn finite_failures_still_pause_when_other_budgets_are_unlimited() {
+    let mut limits = unlimited_limits();
+    limits.max_failures = 2;
+    let (_root, ai, _extensions, session, server) =
+        model_loop_fixture(limits, Duration::ZERO, true).await;
+    let runner = {
+        let state = ai.state.clone();
+        let session = session.clone();
+        tokio::spawn(async move { state.run(&session, Arc::new(AtomicBool::new(false))).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while session.record.lock().state != "paused" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        session.record.lock().pause_reason.as_ref().unwrap().code,
+        "model_request_failed"
+    );
+    assert_eq!(session.record.lock().usage.consecutive_failures, 2);
+    assert_eq!(session.record.lock().usage.turns, 2);
+    ai.state.stop(&session, "cancelled").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
 }
 
 #[test]

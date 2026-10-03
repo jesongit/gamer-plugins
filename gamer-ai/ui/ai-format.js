@@ -12,6 +12,9 @@ export function usageValue(usage, names) {
   }
   return '未知'
 }
+export function budgetValue(limits, key) {
+  return limits?.[key] === 0 ? '不限' : usageValue(limits, [key])
+}
 export function safeImage(value) {
   return typeof value === 'string' && /^data:image\/(png|jpe?g|webp);base64,[a-zA-Z0-9+/=]+$/.test(value) ? value : ''
 }
@@ -48,7 +51,7 @@ export const TOOL_LABELS = {
 export function pauseGuidance(session) {
   if (session?.pause_reason?.suggestion) return session.pause_reason.suggestion
   const reason = session?.reason || ''
-  if (/预算|上限|token/i.test(reason)) return '请打开运行预算，提高已耗尽的上限，再明确继续。调整预算会保留本会话的累计用量。'
+  if (/预算|上限|token/i.test(reason)) return '请打开运行预算，提高已耗尽的上限或设为 0（无上限），再明确继续。调整预算会保留本会话的累计用量。'
   if (/租约|令牌|MCP/.test(reason)) return '请检查外部客户端连接和令牌，再由你点击“继续 AI”；重新连接不会自行恢复。'
   if (/目标|绑定|断开|重建/.test(reason)) return '请检查目标连接。目标身份改变时，先停止旧会话，再开始新会话。'
   if (/失败|模型|请求|观察/.test(reason)) return '请检查连接和当前画面，可补充指令后明确继续；重复失败时先测试模型连接。'

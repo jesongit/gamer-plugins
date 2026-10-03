@@ -126,12 +126,12 @@ impl Default for Limits {
 impl Limits {
     fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=500).contains(&self.max_turns)
-                && (1..=2000).contains(&self.max_actions)
-                && (10..=7200).contains(&self.max_seconds)
+            (self.max_turns == 0 || (1..=500).contains(&self.max_turns))
+                && (self.max_actions == 0 || (1..=2000).contains(&self.max_actions))
+                && (self.max_seconds == 0 || (10..=7200).contains(&self.max_seconds))
                 && (self.max_tokens == 0 || (2048..=2_000_000).contains(&self.max_tokens))
-                && (1..=20).contains(&self.max_failures),
-            "运行预算超出允许范围"
+                && (self.max_failures == 0 || (1..=20).contains(&self.max_failures)),
+            "运行预算超出允许范围；各项可设为 0 表示无限"
         );
         Ok(())
     }
@@ -259,7 +259,7 @@ impl Token {
 impl Session {
     fn event(&self, kind: &str, message: impl Into<String>, data: Value) {
         let mut r = self.record.lock();
-        let seq = r.events.last().map_or(1, |e| e.seq + 1);
+        let seq = r.events.last().map_or(1, |e| e.seq.saturating_add(1));
         if data.get("image_data_url").is_some() {
             let mut retained = 0;
             for event in r.events.iter_mut().rev() {
@@ -1315,23 +1315,21 @@ impl State {
             );
             let functions = tools::function_catalog(&catalog);
             retain_recent_images(&mut history, 3);
-            session.record.lock().usage.turns += 1;
-            let turn_number = session.record.lock().usage.turns;
+            let turn_number = {
+                let mut current = session.record.lock();
+                current.usage.turns = current.usage.turns.saturating_add(1);
+                current.usage.turns
+            };
             session.event(
                 "progress",
                 "正在请求模型，等待下一步决策",
                 json!({"phase":"requesting","generation":record.generation,"turn":turn_number}),
             );
             session.charge_time();
-            let remaining = {
-                let current = session.record.lock();
-                Duration::from_secs_f64(
-                    (current.limits.max_seconds as f64 - current.usage.active_seconds).max(0.0),
-                )
-            };
+            let remaining = activity_budget_remaining(&session.record.lock());
             let turn = tokio::select! {
                 turn = provider.turn(&history, &functions, &cancel) => turn,
-                _ = tokio::time::sleep(remaining) => {
+                _ = activity_budget_timeout(remaining) => {
                     record_usage(&mut session.record.lock().usage, None);
                     let reason = {
                         session.charge_time();
@@ -1370,8 +1368,9 @@ impl State {
                     let detail = provider::error_details(&e);
                     session.event("progress", "模型请求失败", json!({"phase":"error","generation":record.generation,"turn":turn_number,"error":detail}));
                     session.event("error", format!("模型请求失败：{e}"), json!({"code":"model_request_failed","error":detail,"consecutive_failures":failures,"max_failures":record.limits.max_failures}));
-                    if session.record.lock().usage.consecutive_failures
-                        >= record.limits.max_failures
+                    if record.limits.max_failures > 0
+                        && session.record.lock().usage.consecutive_failures
+                            >= record.limits.max_failures
                     {
                         self.pause_automatic(session, record.generation, PauseReason::new("model_request_failed", "model", "连续模型请求失败", format!("连续失败 {failures}/{} 次。最后一次失败：{e}", record.limits.max_failures), "检查网络、API 配置或供应商状态后继续；继续会重新计算连续失败次数。", detail["retryable"].as_bool().unwrap_or(true))).await?;
                     } else {
@@ -1402,7 +1401,8 @@ impl State {
                             continue;
                         };
                         history.push(json!({"role":"user","content":[{"type":"input_text","text":"请使用工具观察/操作；完成或无法继续请调用 session_finish。"}]}));
-                        if failures >= record.limits.max_failures {
+                        if record.limits.max_failures > 0 && failures >= record.limits.max_failures
+                        {
                             self.pause_automatic(
                                 session,
                                 record.generation,
@@ -1416,6 +1416,10 @@ impl State {
                                 ),
                             )
                             .await?;
+                        } else {
+                            // A disabled failure budget must not turn empty
+                            // model responses into an unbounded request loop.
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
                     for call in turn.calls {
@@ -1450,8 +1454,9 @@ impl State {
                             }
                         };
                         history.push(json!({"type":"function_call_output","call_id":call.id,"output":result["content"].clone()}));
-                        if session.record.lock().usage.consecutive_failures
-                            >= record.limits.max_failures
+                        if record.limits.max_failures > 0
+                            && session.record.lock().usage.consecutive_failures
+                                >= record.limits.max_failures
                         {
                             self.pause_automatic(
                                 session,
@@ -1471,6 +1476,9 @@ impl State {
                             )
                             .await?;
                             break;
+                        }
+                        if last_failure.is_some() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
                     if history.len() > 120 {
@@ -1722,12 +1730,27 @@ fn time_budget_reason(r: &SessionRecord) -> PauseReason {
             "AI 累计活动时长 {:.1} 秒，上限 {} 秒；人工暂停期间不计时。",
             r.usage.active_seconds, r.limits.max_seconds
         ),
-        "提高活动时长上限后继续；已用预算会保留。",
+        "提高活动时长上限或设为 0（无限）后继续；已用预算会保留。",
         false,
     )
 }
+fn activity_budget_remaining(record: &SessionRecord) -> Option<Duration> {
+    (record.limits.max_seconds > 0).then(|| {
+        Duration::from_secs_f64(
+            (record.limits.max_seconds as f64 - record.usage.active_seconds).max(0.0),
+        )
+    })
+}
+async fn activity_budget_timeout(remaining: Option<Duration>) {
+    match remaining {
+        Some(remaining) => tokio::time::sleep(remaining).await,
+        // Unlimited activity does not create a zero-duration deadline. The
+        // provider still enforces its per-request timeout and cancellation.
+        None => std::future::pending().await,
+    }
+}
 fn budget_reason(r: &SessionRecord) -> Option<PauseReason> {
-    if r.usage.turns >= r.limits.max_turns {
+    if r.limits.max_turns > 0 && r.usage.turns >= r.limits.max_turns {
         Some(PauseReason::new(
             "budget_turns",
             "budget",
@@ -1736,10 +1759,10 @@ fn budget_reason(r: &SessionRecord) -> Option<PauseReason> {
                 "已请求模型 {} 轮，上限 {} 轮。",
                 r.usage.turns, r.limits.max_turns
             ),
-            "提高模型轮数上限后继续；已用预算会保留。",
+            "提高模型轮数上限或设为 0（无限）后继续；已用预算会保留。",
             false,
         ))
-    } else if r.usage.actions >= r.limits.max_actions {
+    } else if r.limits.max_actions > 0 && r.usage.actions >= r.limits.max_actions {
         Some(PauseReason::new(
             "budget_actions",
             "budget",
@@ -1748,10 +1771,10 @@ fn budget_reason(r: &SessionRecord) -> Option<PauseReason> {
                 "已执行工具 {} 次，上限 {} 次。",
                 r.usage.actions, r.limits.max_actions
             ),
-            "提高工具调用上限后继续；已用预算会保留。",
+            "提高工具调用上限或设为 0（无限）后继续；已用预算会保留。",
             false,
         ))
-    } else if r.usage.active_seconds >= r.limits.max_seconds as f64 {
+    } else if r.limits.max_seconds > 0 && r.usage.active_seconds >= r.limits.max_seconds as f64 {
         Some(time_budget_reason(r))
     } else if r.limits.max_tokens > 0
         && (r.usage.known_tokens >= r.limits.max_tokens
@@ -1778,7 +1801,7 @@ fn budget_reason(r: &SessionRecord) -> Option<PauseReason> {
                     ""
                 }
             ),
-            "提高 Token 上限后继续；累计用量不会清零。",
+            "提高 Token 上限或设为 0（无限）后继续；累计用量不会清零。",
             false,
         ))
     } else {

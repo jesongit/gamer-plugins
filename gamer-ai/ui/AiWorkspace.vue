@@ -2,7 +2,7 @@
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
-import { PROTOCOLS, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
+import { PROTOCOLS, budgetValue, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
 
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const context = computed(() => workspace?.getSnapshot?.() || {})
@@ -15,11 +15,11 @@ const busy = ref(''), controlBusy = ref(''), messageBusy = ref(false), error = r
 const goal = ref(''), mode = ref('api')
 const limits = reactive({ max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 })
 const limitFields = [
-  { key: 'max_turns', label: '最大模型轮数', min: 1, max: 500 },
-  { key: 'max_actions', label: '最大工具次数', min: 1, max: 2000 },
-  { key: 'max_seconds', label: '最长活动时长（秒）', min: 10, max: 7200 },
-  { key: 'max_tokens', label: '累计 token 上限（0 表示无上限）', min: 0, max: 2000000 },
-  { key: 'max_failures', label: '连续失败上限', min: 1, max: 20 },
+  { key: 'max_turns', label: '最大模型轮数（0 表示无上限）', min: 0, nonZeroMin: 1, max: 500 },
+  { key: 'max_actions', label: '最大工具次数（0 表示无上限）', min: 0, nonZeroMin: 1, max: 2000 },
+  { key: 'max_seconds', label: '最长活动时长（秒，0 表示无上限）', min: 0, nonZeroMin: 10, max: 7200 },
+  { key: 'max_tokens', label: '累计 token 上限（0 表示无上限）', min: 0, nonZeroMin: 2048, max: 2000000 },
+  { key: 'max_failures', label: '连续失败上限（0 表示无上限）', min: 0, nonZeroMin: 1, max: 20 },
 ]
 const settings = reactive({ base_url: PROTOCOLS.responses.baseUrl, model: 'glm-5.3-flash', protocol: 'responses', request_timeout_secs: 60, api_key: '' })
 const tokenForm = reactive({ label: '', control: false, ttl_seconds: 120 })
@@ -43,12 +43,11 @@ const sendLabel = computed(() => !isActive(selectedSession.value) ? (mode.value 
   : selectedSession.value.state === 'paused' ? '发送并继续' : '发送新指令')
 const limitsChanged = computed(() => !!selectedSession.value && limitFields.some(field => limits[field.key] !== selectedSession.value.limits?.[field.key]))
 const limitsValid = computed(() => limitFields.every(field => Number.isInteger(limits[field.key])
-  && limits[field.key] >= field.min && limits[field.key] <= field.max)
-  && (limits.max_tokens === 0 || limits.max_tokens >= 2048))
+  && limits[field.key] <= field.max && (limits[field.key] === 0 || limits[field.key] >= field.nonZeroMin)))
 const hardUsage = computed(() => ({ max_turns: selectedSession.value?.usage?.turns || 0,
   max_actions: selectedSession.value?.usage?.actions || 0, max_seconds: selectedSession.value?.usage?.active_seconds || 0,
   max_tokens: selectedSession.value?.usage?.total_tokens ?? selectedSession.value?.usage?.known_tokens ?? 0 }))
-const budgetBlocked = computed(() => Object.entries(hardUsage.value).some(([key, value]) => (key !== 'max_tokens' || limits.max_tokens > 0) && value >= limits[key]))
+const budgetBlocked = computed(() => Object.entries(hardUsage.value).some(([key, value]) => limits[key] > 0 && value >= limits[key]))
 const canPause = computed(() => statusFresh.value && ['starting', 'running', 'resuming'].includes(selectedSession.value?.state))
 const canResume = computed(() => statusFresh.value && selectedSession.value?.state === 'paused' && limitsValid.value && !budgetBlocked.value)
 const timeline = computed(() => chatTimeline(selectedSession.value))
@@ -147,7 +146,7 @@ watch(() => `${selectedSession.value?.session_id}:${selectedSession.value?.state
 }, { immediate: true })
 async function control(action) {
   const session = selectedSession.value
-  if (!session || controlBusy.value) return
+  if (!session || controlBusy.value || (action === 'resume' && !canResume.value)) return
   controlBusy.value = action === 'pause' ? '正在请求暂停' : action === 'resume' ? '正在请求恢复' : '正在请求停止'
   error.value = ''; feedback.value = ''
   try {
@@ -291,16 +290,15 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
 
       <section v-show="settingsSection === 'budget'" id="ai-budget" class="section-stack" aria-label="运行预算">
         <h3>运行预算</h3>
-        <p class="hint">暂停保留运行槽与累计用量。可在暂停时提高预算，再明确继续；只有修改过的预算才会提交。</p>
+        <p class="hint">所有预算均可设为 0（无上限），用量仍会累计。暂停时可提高上限或设为 0，再明确继续；只有修改过的预算才会提交。继续时重新计算连续失败次数。</p>
         <fieldset :disabled="isActive(selectedSession) && selectedSession.state !== 'paused'">
           <label>控制方式<select v-model="mode" aria-label="控制方式" :disabled="isActive(selectedSession)"><option value="api">内置 AI · 模型 API</option><option value="mcp">外部 AI · MCP 客户端</option></select></label>
-          <div class="budget-grid"><label v-for="field in limitFields" :key="field.key">{{ field.label }}<input v-model.number="limits[field.key]" :aria-label="field.label" type="number" :min="field.min" :max="field.max" step="1" required /></label></div>
+          <div class="budget-grid"><label v-for="field in limitFields" :key="field.key">{{ field.label }}<input v-model.number="limits[field.key]" :aria-label="field.label" :data-budget="field.key" type="number" :min="field.min" :max="field.max" step="1" required /><small class="hint">0 无上限；非零范围 {{ field.nonZeroMin.toLocaleString('zh-CN') }}–{{ field.max.toLocaleString('zh-CN') }}</small></label></div>
         </fieldset>
-        <p class="hint">Token 上限可设为 0（无上限），或 2,048–2,000,000；其他预算须在输入框标注的范围内。</p>
         <p v-if="!limitsValid" class="error">运行预算超出允许范围，请修正后发送或继续。</p>
-        <dl v-if="selectedSession" class="usage-grid"><div><dt>模型轮数</dt><dd>{{ usageValue(selectedSession.usage, ['turns']) }} / {{ selectedSession.limits?.max_turns }}</dd></div><div><dt>工具调用</dt><dd>{{ usageValue(selectedSession.usage, ['actions']) }} / {{ selectedSession.limits?.max_actions }}</dd></div><div><dt>活动秒数</dt><dd>{{ usageValue(selectedSession.usage, ['active_seconds']) }} / {{ selectedSession.limits?.max_seconds }}</dd></div><div><dt>累计 token</dt><dd>{{ tokenUsage(selectedSession.usage) }} / {{ selectedSession.limits?.max_tokens === 0 ? '不限' : usageValue(selectedSession.limits, ['max_tokens']) }}</dd><small v-if="selectedSession.usage?.has_unknown_tokens">部分请求用量未知</small></div></dl>
+        <dl v-if="selectedSession" class="usage-grid"><div><dt>模型轮数</dt><dd>{{ usageValue(selectedSession.usage, ['turns']) }} / {{ budgetValue(selectedSession.limits, 'max_turns') }}</dd></div><div><dt>工具调用</dt><dd>{{ usageValue(selectedSession.usage, ['actions']) }} / {{ budgetValue(selectedSession.limits, 'max_actions') }}</dd></div><div><dt>活动秒数</dt><dd>{{ usageValue(selectedSession.usage, ['active_seconds']) }} / {{ budgetValue(selectedSession.limits, 'max_seconds') }}</dd></div><div><dt>累计 token</dt><dd>{{ tokenUsage(selectedSession.usage) }} / {{ budgetValue(selectedSession.limits, 'max_tokens') }}</dd><small v-if="selectedSession.usage?.has_unknown_tokens">部分请求用量未知</small></div><div><dt>连续失败</dt><dd>{{ usageValue(selectedSession.usage, ['consecutive_failures']) }} / {{ budgetValue(selectedSession.limits, 'max_failures') }}</dd></div></dl>
         <button v-if="selectedSession?.state === 'paused'" type="button" :disabled="!limitsChanged || !limitsValid || budgetBlocked || !!controlBusy || messageBusy" @click="control('resume')">调整预算并继续</button>
-        <p v-if="budgetBlocked && selectedSession?.state === 'paused'" class="error">当前上限已耗尽，请提高对应预算。累计用量不会重置。</p>
+        <p v-if="budgetBlocked && selectedSession?.state === 'paused'" class="error">当前上限已耗尽，请提高对应预算或设为 0（无上限）。累计用量不会重置。</p>
       </section>
     </div>
     <main id="ai-play" class="agent-chat">
@@ -311,7 +309,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
             <div class="message-heading"><b>{{ item.kind === 'user' ? '你' : item.kind === 'assistant' ? 'AI' : item.kind === 'decision' ? '公开决策说明' : item.kind === 'pause' ? item.pause?.title || 'AI 已暂停' : item.kind === 'tool' ? item.label : ['capture', 'observation'].includes(item.kind) ? '观察画面' : item.kind === 'error' ? '执行遇到问题' : '执行进度' }}</b><time>{{ displayTime(item.at) }}</time><span v-if="item.kind === 'tool'" class="tool-status" :class="item.status">{{ item.status === 'running' ? '执行中' : ['error', 'failed'].includes(item.status) ? '失败' : '完成' }}</span></div>
             <p class="message-text">{{ item.message }}</p>
             <template v-if="item.kind === 'pause'">
-              <p v-if="item.current && selectedSession.usage?.known_tokens > 0 && selectedSession.usage?.total_tokens == null" class="pause-usage">累计 token：{{ tokenUsage(selectedSession.usage) }} / {{ selectedSession.limits?.max_tokens === 0 ? '不限' : usageValue(selectedSession.limits, ['max_tokens']) }}<span v-if="selectedSession.usage?.has_unknown_tokens">（部分请求用量未知）</span></p>
+              <p v-if="item.current && selectedSession.usage?.known_tokens > 0 && selectedSession.usage?.total_tokens == null" class="pause-usage">累计 token：{{ tokenUsage(selectedSession.usage) }} / {{ budgetValue(selectedSession.limits, 'max_tokens') }}<span v-if="selectedSession.usage?.has_unknown_tokens">（部分请求用量未知）</span></p>
               <p class="pause-next">{{ pauseGuidance({ reason: item.message, pause_reason: item.pause }) }}</p>
               <button v-if="selectedSession.state === 'paused' && /预算|token|上限/i.test(item.message)" type="button" @click="settingsSection = 'budget'">调整运行预算</button>
             </template>
@@ -330,7 +328,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key =
           <div class="composer-footer"><span>{{ selectedSession?.mode === 'mcp' || (!selectedSession && mode === 'mcp') ? '外部 MCP' : 'Agent' }}<span v-if="goalBytes > 8000" class="error"> · 超过 8000 字节</span></span><div class="actions"><button v-if="selectedSession?.state === 'paused' && selectedSession.mode === 'api'" type="button" :disabled="!canSend" @click="sendMessage(false)">仅发送，保持暂停</button><button type="submit" class="primary" :disabled="!canSend || (selectedSession?.state === 'paused' && budgetBlocked)">{{ sendLabel }}</button></div></div>
         </form>
         <p v-if="selectedSession?.state === 'running' && selectedSession.mode === 'api'" class="hint">发送新指令会打断本轮，等待当前动作收尾后，按新指令继续。不会更换会话目标。</p>
-        <p v-else-if="selectedSession?.state === 'paused' && selectedSession.mode === 'api'" class="hint">发送并继续会收回人工控制；也可以仅发送，保持暂停。预算用尽时先提高上限。</p>
+        <p v-else-if="selectedSession?.state === 'paused' && selectedSession.mode === 'api'" class="hint">发送并继续会收回人工控制；也可以仅发送，保持暂停。预算用尽时先提高上限或设为 0。</p>
         <p v-if="selectedSession?.mode === 'mcp' && isActive(selectedSession)" class="hint">外部会话的后续指令由 MCP 客户端发送；这里可查看真实执行进度并暂停/停止。</p>
         <p v-if="mode === 'mcp' && !isActive(selectedSession)" class="hint">先发送目标建立会话，再打开 MCP 设置创建控制令牌。</p>
         <p class="hint persistent-note">关闭面板不会停止会话。显示公开回答和真实操作，不展示私密推理过程。</p>

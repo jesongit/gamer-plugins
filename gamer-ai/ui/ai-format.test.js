@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { chatTimeline, eventDetails, pauseGuidance, safeImage, tokenUsage, usageValue } from './ai-format'
+import { budgetValue, chatTimeline, eventDetails, pauseGuidance, safeImage, tokenUsage, usageValue } from './ai-format'
 it('token usage缺失和null不会误报零', () => {
   expect(usageValue({ total_tokens: null }, ['total_tokens'])).toBe('未知')
   expect(usageValue({}, ['total_tokens'])).toBe('未知')
@@ -19,6 +19,15 @@ it('详情对嵌套secret/token作脱敏，保留无敏感操作数据', () => {
 it('未知总token显示已知累计下限，完整报告显示准确总量', () => {
   expect(tokenUsage({ total_tokens: null, known_tokens: 105396, has_unknown_tokens: true })).toBe('至少 105,396')
   expect(tokenUsage({ total_tokens: 120000, known_tokens: 105396 })).toBe('120,000')
+})
+
+it('每项预算的0显示不限，缺少预算不会误报不限且保留实际用量格式', () => {
+  for (const key of ['max_turns', 'max_actions', 'max_seconds', 'max_tokens', 'max_failures']) {
+    expect(budgetValue({ [key]: 0 }, key)).toBe('不限')
+    expect(budgetValue({ [key]: 100000 }, key)).toBe('100,000')
+    expect(budgetValue({}, key)).toBe('未知')
+  }
+  expect(pauseGuidance({ reason: '达到预算' })).toContain('设为 0（无上限）')
 })
 
 it('用户消息按提交时间排序，不因稍后发布事件而落在回复之后', () => {

@@ -367,11 +367,12 @@ impl State {
             return Ok(ToolResult::json(json!({"device_id":record.device_id,"content_package":record.content_package,"android_package":record.android_package,"capabilities":c})).value());
         }
         ensure!(
-            record.usage.actions < record.limits.max_actions,
+            record.limits.max_actions == 0 || record.usage.actions < record.limits.max_actions,
             "工具调用达到预算，请暂停处理"
         );
         ensure!(
-            record.usage.active_seconds < record.limits.max_seconds as f64
+            (record.limits.max_seconds == 0
+                || record.usage.active_seconds < record.limits.max_seconds as f64)
                 && (record.limits.max_tokens == 0
                     || (record.usage.known_tokens < record.limits.max_tokens
                         && record
@@ -431,7 +432,10 @@ impl State {
             }
             session.frame.lock().take();Ok(ToolResult::json(json!({"ok":true,"observe_again":true})).value())
         }).await;
-        session.record.lock().usage.actions += 1;
+        {
+            let mut current = session.record.lock();
+            current.usage.actions = current.usage.actions.saturating_add(1);
+        }
         session.event("tool", if result.is_ok() { format!("已执行 {name}") } else { format!("工具 {name} 执行失败") }, json!({"phase":"result","tool":name,"call_id":call_id,"generation":generation,"arguments":public_arguments(name,&args),"ok":result.is_ok(),"result":match &result {Ok(value)=>public_result(value),Err(error)=>json!({"error":error.to_string()})}}));
         // Cache failures too: retrying a timed-out call must never inject twice.
         let cached = match &result {
@@ -439,7 +443,7 @@ impl State {
             Err(error) => ToolResult::error(error.to_string()).value(),
         };
         let mut results = session.results.lock();
-        // Keep mutation receipts for the entire bounded generation. Only the
+        // Keep mutation receipts for the entire generation. Only the
         // latest screenshot retains pixels; old captures cannot be used again.
         if name == "screen_capture" {
             for value in results.values_mut() {
