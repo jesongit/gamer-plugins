@@ -240,3 +240,55 @@ it.each([['running',true],['paused',false],['paused',true]])('游玩 %s 引导re
   await wrapper.get('[aria-label="Agent 消息"]').setValue('不应提交非法预算')
   expect(wrapper.get('.composer button[type="submit"]').element.disabled).toBe(true)
 })
+it('同一会话对话2轮与游玩17轮分别显示，活跃游玩优先真实Session且0上限不互相混用',async()=>{
+  const gameLimits={max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,actions:3,active_seconds:4,total_tokens:2000,consecutive_failures:0},game_usage:{turns:9,total_tokens:9000},game_limits:{...limits,max_tokens:50000}}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:gameLimits,usage:{turns:17,actions:18,active_seconds:19,total_tokens:17000,consecutive_failures:0}}]
+  const wrapper=await create()
+  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 不限')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 不限 轮')
+  expect(wrapper.get('[data-ledger="chat"]').text()).toContain('模型 2 / 40 轮')
+  expect(wrapper.get('[data-ledger="chat"]').text()).toContain('Token 2,000 / 100,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).not.toContain('9,000')
+  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
+  expect(wrapper.get('.usage>summary').text()).toBe('对话 · Token 2,000 / 100,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 不限 轮')
+})
+
+it('游戏已不在内存时从独立game快照回看，普通聊天0上限不会把游玩历史显示成无限',async()=>{
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'finished',limits:{...limits,max_tokens:0},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,actions:20,total_tokens:17000},game_limits:{...limits,max_turns:30,max_tokens:64000}}
+  const wrapper=await create()
+  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 64,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 30 轮')
+  expect(wrapper.get('[data-ledger="chat"]').text()).toContain('Token 2,000 / 不限')
+  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
+  expect(wrapper.get('.usage>summary').text()).toBe('对话 · Token 2,000 / 不限')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 64,000')
+})
+it('已结束游玩使用持久game快照，运行时残留的历史Session不覆盖它',async()=>{
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'finished',limits:{...limits},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:{...limits,max_tokens:64000}}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'finished',limits:{...limits,max_tokens:0},usage:{turns:99,total_tokens:99000}}]
+  const wrapper=await create()
+  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 64,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 40 轮')
+})
+
+it('普通对话设0只提交chat预算，改回游玩时按独立game预算编辑并提交',async()=>{
+  const originalGameLimits={...limits,max_turns:200,max_tokens:200000}
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:originalGameLimits}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:originalGameLimits,usage:{turns:17,total_tokens:17000}}]
+  const wrapper=await create()
+  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
+  await button(wrapper,'预算').trigger('click')
+  await wrapper.get('[aria-label="聊天累计 Token预算"]').setValue(0)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('暂停期间解释装备')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'暂停期间解释装备',attached_memory:[],limits:{...limits,max_tokens:0}})
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 200,000')
+  await wrapper.get('[aria-label="消息模式"]').setValue('game')
+  expect(wrapper.get('[aria-label="游玩累计 Token预算"]').element.value).toBe('200000')
+  for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('改为无限预算探索')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'改为无限预算探索',attached_memory:[],game_session_id:'s1',resume:false,limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+})
