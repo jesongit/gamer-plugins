@@ -22,6 +22,543 @@ pub(super) struct Checkpoint {
     pub suppressed: bool,
 }
 
+pub(super) fn draft_id(id: &str) -> String {
+    format!("experience-{:x}", Sha256::digest(id.as_bytes()))[..35].to_owned()
+}
+
+/// Applied to human text and public model output; never to raw tool arguments.
+pub(super) fn public_text(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            ![
+                "api_key",
+                "api-key",
+                "apikey",
+                "authorization",
+                "bearer ",
+                "password",
+                "secret=",
+                "token=",
+                "密码",
+                "密钥",
+                "令牌",
+                "data:image",
+                "base64,",
+            ]
+            .iter()
+            .any(|word| lower.contains(word))
+                && ![
+                    "不要记录",
+                    "不要保存",
+                    "不想记录",
+                    "别记录",
+                    "别保存",
+                    "不要记住",
+                ]
+                .iter()
+                .any(|word| line.contains(word))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(6000)
+        .collect()
+}
+
+fn receipt_text(event: &Value) -> Option<String> {
+    let data = &event["data"];
+    let message = event["message"].as_str().unwrap_or("");
+    let text = match event["kind"].as_str()? {
+        "user" => {
+            let text = public_text(message);
+            (!text.is_empty())
+                .then(|| format!("## 用户给出的指引或纠错（原文，非新授权）\n{text}\n"))?
+        }
+        "assistant_final" => {
+            let text = public_text(data["text"].as_str().unwrap_or(message));
+            (!text.is_empty()).then(|| format!("## AI 公开说明（需核对观察依据）\n{text}\n"))?
+        }
+        "tool_end" => {
+            let name = data["name"].as_str().or_else(|| data["tool"].as_str())?;
+            if name.starts_with("memory_") || matches!(name, "web_search" | "web_read") {
+                return None;
+            }
+            format!(
+                "工具：{name}；调用返回成功：{}（不代表游戏目标成功）。\n",
+                data["ok"].as_bool().unwrap_or(false)
+            )
+        }
+        "error" => {
+            let text = public_text(message);
+            (!text.is_empty()).then(|| format!("## 实际错误或失败\n{text}\n"))?
+        }
+        "state"
+            if matches!(
+                data["state"].as_str(),
+                Some("paused" | "finished" | "interrupted")
+            ) =>
+        {
+            format!(
+                "## 实际运行状态\n{}；{}\n",
+                data["state"].as_str().unwrap_or("unknown"),
+                public_text(message)
+            )
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "\n记录 #{}，时间 {}\n{text}",
+        event["seq"],
+        event["at"].as_str().unwrap_or("unknown")
+    ))
+}
+
+fn input_receipt(event: &Value) -> bool {
+    event["kind"] == "tool_end"
+        && event["data"]["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("input_") || name.starts_with("app_"))
+}
+
+fn due(record: &Record, checkpoint: &Checkpoint, events: &[Value], force: bool) -> bool {
+    if force
+        || events.iter().any(|event| event["kind"] == "user")
+        || events.iter().filter(|e| input_receipt(e)).count() >= 10
+    {
+        return true;
+    }
+    if events.iter().any(|event| {
+        event["kind"] == "state"
+            && matches!(event["data"]["state"].as_str(), Some("paused" | "finished"))
+    }) {
+        return true;
+    }
+    let since = checkpoint.saved_at.as_deref().unwrap_or(&record.created_at);
+    chrono::DateTime::parse_from_rfc3339(since)
+        .is_ok_and(|at| Utc::now().signed_duration_since(at).num_seconds() >= 60)
+        && events
+            .iter()
+            .any(|event| input_receipt(event) || event["kind"] == "error")
+}
+
+impl State {
+    pub(super) async fn checkpoint_games(self: &Arc<Self>) {
+        let records = match self.conversations.game_records() {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error,"读取游玩记忆补偿记录失败");
+                return;
+            }
+        };
+        for record in records {
+            let present = self.sessions.lock().contains_key(&record.conversation_id);
+            // A journal from a previous process never restarts device control.
+            let force =
+                !present || matches!(record.state.as_str(), "paused" | "finished" | "interrupted");
+            if let Err(error) = self.checkpoint_game(&record, force).await {
+                tracing::warn!(%error,conversation=%record.conversation_id,"保存游玩记忆检查点失败");
+                let checkpoint = self
+                    .conversations
+                    .memory_checkpoint(&record.conversation_id)
+                    .unwrap_or_default();
+                let signature = format!(
+                    "checkpoint-error:{}:{}",
+                    record.conversation_id, checkpoint.seq
+                );
+                if self.checkpoint_errors.lock().insert(signature) {
+                    let _=self.conversations.event(&record.conversation_id,"memory_job","游玩记忆保存失败；原始对话仍保留，下次会重试",json!({"state":"failed","error":public_text(&error.to_string()),"validation":"pending"}));
+                }
+            }
+        }
+    }
+
+    pub(super) async fn checkpoint_game(&self, record: &Record, force: bool) -> Result<()> {
+        // This lock serializes local archives only, never input admission/pause.
+        let _guard = self.memory_checkpoint_gate.lock().await;
+        ensure!(
+            record.game_session_id.as_deref() == Some(&record.conversation_id),
+            "memory.checkpoint_not_game"
+        );
+        if record.state == "package_deleted" {
+            return Ok(());
+        }
+        let _package = self
+            .runtime
+            .packages
+            .acquire_activity(&record.content_package)?;
+        let mut checkpoint = self
+            .conversations
+            .memory_checkpoint(&record.conversation_id)?;
+        if checkpoint.suppressed || record.latest_seq <= checkpoint.seq {
+            return Ok(());
+        }
+        // Older releases had a single terminal source and no checkpoint row.
+        // Honor its explicit deletion using the exact durable job link before
+        // rebuilding a differently chunked source from the same private log.
+        if checkpoint.seq == 0 {
+            for (id, package, job, _) in self.conversations.memory_job_links()? {
+                if id != record.conversation_id || package != record.content_package {
+                    continue;
+                }
+                let Ok(previous) = self.memory.import_job_record(&package, &job) else {
+                    continue;
+                };
+                let source = self
+                    .memory
+                    .call_cancellable(
+                        "memory_source_get",
+                        &package,
+                        json!({"id":previous.source_id}),
+                        None,
+                        false,
+                        &AtomicBool::new(false),
+                    )
+                    .await?;
+                if source["current_deleted"] == true {
+                    checkpoint.suppressed = true;
+                    self.conversations
+                        .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+                    let _=self.memory.call_cancellable("memory_import_cancel",&package,json!({"job_id":job,"operation_id":format!("experience-deleted-source:{job}")}),None,false,&AtomicBool::new(false)).await;
+                    self.conversations.event(
+                        &record.conversation_id,
+                        "memory_job",
+                        "旧游玩原稿已被删除，已停止从该会话自动补归档",
+                        json!({"state":"cancelled","job_id":job,"validation":"pending"}),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let events = self.conversations.memory_events(
+            &record.conversation_id,
+            checkpoint.seq,
+            record.latest_seq,
+        )?;
+        if !events.iter().any(|event| receipt_text(event).is_some()) {
+            checkpoint.seq = record.latest_seq;
+            self.conversations
+                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+            return Ok(());
+        }
+        if !due(record, &checkpoint, &events, force) {
+            return Ok(());
+        }
+        let mut text = format!("{HEADER}\n会话：{}\n", record.conversation_id);
+        let mut through = checkpoint.seq;
+        let mut relevant = false;
+        for event in &events {
+            if let Some(receipt) = receipt_text(event) {
+                if text.len() + receipt.len() > SOURCE_BYTES && relevant {
+                    break;
+                }
+                text.push_str(&receipt);
+                relevant = true;
+            }
+            through = event["seq"].as_u64().unwrap_or(through);
+        }
+        if !relevant {
+            checkpoint.seq = record.latest_seq;
+            self.conversations
+                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+            return Ok(());
+        }
+        let cancel = AtomicBool::new(false);
+        let memory_id = draft_id(&record.conversation_id);
+        let existing = self
+            .memory
+            .call_cancellable(
+                "memory_get",
+                &record.content_package,
+                json!({"id":memory_id}),
+                None,
+                false,
+                &cancel,
+            )
+            .await;
+        let existing = match existing {
+            Ok(value) => Some(value),
+            Err(error) if error.to_string().contains("memory.not_found") => None,
+            Err(error) if error.to_string().contains("memory.permanently_deleted") => {
+                checkpoint.suppressed = true;
+                self.conversations
+                    .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if existing.as_ref().is_some_and(|value| {
+            value["memory"]["status"] != "active"
+                || value["memory"]["validation"] != "pending"
+                || !value["memory"]["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag == DRAFT_TAG))
+                || value["memory"]["protected_fields"]
+                    .as_array()
+                    .is_some_and(|fields| {
+                        fields
+                            .iter()
+                            .any(|field| matches!(field.as_str(), Some("body" | "sources")))
+                    })
+        }) {
+            checkpoint.suppressed = true;
+            self.conversations
+                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+            return Ok(());
+        }
+        let all = self
+            .conversations
+            .memory_events(&record.conversation_id, 0, through)?;
+        let mut body = format!("{HEADER}\n会话：{}\n", record.conversation_id);
+        for event in &all {
+            if let Some(receipt) = receipt_text(event) {
+                if body.len() + receipt.len() > DRAFT_BYTES {
+                    body.push_str(
+                        "\n草稿达到展示上限；后续原稿仍按增量保留，完整记录可在本会话查询。\n",
+                    );
+                    break;
+                }
+                body.push_str(&receipt);
+            }
+        }
+        let operation = format!("experience-draft:{}:{through}", record.conversation_id);
+        let mut draft = if let Some(existing) = existing {
+            if existing["memory"]["body"] == body {
+                json!({"id":memory_id,"revision":existing["revision"],"validation":"pending"})
+            } else {
+                self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":memory_id,"expected_version":existing["version"],"patch":{"body":body},"operation_id":operation,"reason":"更新本会话真实公开回执草稿；待复核，非攻略结论"}),None,false,&cancel).await?
+            }
+        } else {
+            let result=self.memory.call_cancellable("memory_create",&record.content_package,json!({"id":memory_id,"title":format!("游玩经历 {}（待复核）",&record.conversation_id[..record.conversation_id.len().min(8)]),"body":body,"kind":"procedure","tags":[DRAFT_TAG,"自动记录","待复核"],"validation":"pending","game_version":"unknown","sources":[{"type":"conversation","id":format!("session-{}",record.conversation_id),"conversation_id":record.conversation_id,"excerpt":"本会话的真实用户指引和公开调用回执"}],"operation_id":operation,"reason":"直接保存真实公开过程；后台空闲后再提炼，可随时查询"}),None,false,&cancel).await;
+            match result {
+                Ok(result) => result,
+                Err(error) if error.to_string().contains("suppressed") => {
+                    checkpoint.suppressed = true;
+                    self.conversations
+                        .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let game_limits = record.game_limits.as_ref().unwrap_or(&record.limits);
+        let import_identity = json!({"text":text,"limits":game_limits});
+        let result=self.memory.call_cancellable("memory_import",&record.content_package,json!({"operation_id":format!("experience:{}:{}:{through}:{:x}",record.conversation_id,checkpoint.seq,Sha256::digest(import_identity.to_string().as_bytes())),"filename":"experience.md","title":"自动记录的游玩经历","text":text,"game_version":"unknown","limits":game_limits}),None,false,&cancel).await?;
+        let job = result["job_id"].as_str().unwrap_or("");
+        self.conversations.link_memory_job(
+            &record.conversation_id,
+            &record.content_package,
+            job,
+        )?;
+        let references = self.memory.source_references(
+            &record.content_package,
+            result["source_id"].as_str().unwrap_or(""),
+            result["source_revision"].as_u64().unwrap_or(1),
+        )?;
+        let original_draft = self
+            .memory
+            .call_cancellable(
+                "memory_get",
+                &record.content_package,
+                json!({"id":memory_id}),
+                None,
+                false,
+                &cancel,
+            )
+            .await?;
+        let mut draft_sources = original_draft["memory"]["sources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let before = draft_sources.len();
+        for reference in &references {
+            if draft_sources.len() < 100 && !draft_sources.contains(reference) {
+                draft_sources.push(reference.clone());
+            }
+        }
+        if draft_sources.len() != before {
+            draft=self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":memory_id,"expected_version":original_draft["version"],"patch":{"sources":draft_sources},"operation_id":format!("experience-draft-sources:{}:{through}",record.conversation_id),"reason":"关联本次增量原稿的真实来源，删除草稿后防止同源自动复建"}),None,false,&cancel).await?;
+        }
+        for (definition_id, literal) in self
+            .conversations
+            .memory_definition_links(&record.conversation_id)?
+        {
+            let literal = public_text(&literal);
+            if literal.is_empty() || !text.contains(&literal) {
+                continue;
+            }
+            let original = self
+                .memory
+                .call_cancellable(
+                    "memory_get",
+                    &record.content_package,
+                    json!({"id":definition_id}),
+                    None,
+                    false,
+                    &cancel,
+                )
+                .await;
+            if let Ok(original) = original {
+                if original["memory"]["status"] == "active" {
+                    let mut sources = original["memory"]["sources"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let before = sources.len();
+                    for reference in &references {
+                        if sources.len() < 100 && !sources.contains(reference) {
+                            sources.push(reference.clone());
+                        }
+                    }
+                    if sources.len() != before {
+                        self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":definition_id,"expected_version":original["version"],"patch":{"sources":sources},"reason":"宿主关联真实用户原稿来源，防止用户删除后同源自动复建","operation_id":format!("experience-definition-link:{}:{through}:{definition_id}",record.conversation_id)}),None,true,&cancel).await?;
+                    }
+                }
+            }
+        }
+        let _ = self
+            .memory_job_allowed(&record.content_package, job)
+            .await?;
+        let from = checkpoint.seq;
+        checkpoint.seq = through;
+        checkpoint.saved_at = Some(Utc::now().to_rfc3339());
+        self.conversations
+            .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
+        self.conversations.event(&record.conversation_id,"memory_staged","游玩记忆草稿已保存；攻略将在空闲时自动整理",json!({"memory":{"id":memory_id,"revision":draft["revision"],"validation":"pending"},"checkpoint":{"from_seq":from,"to_seq":through},"automatic":true,"job_id":job}))?;
+        self.sync_memory_job_events()?;
+        Ok(())
+    }
+
+    pub(super) fn sync_memory_job_events(&self) -> Result<()> {
+        for (id, package, job, last) in self.conversations.memory_job_links()? {
+            let Ok(record) = self.memory.import_job_record(&package, &job) else {
+                continue;
+            };
+            let summary = json!({"job_id":job,"status":record.status,"total":record.total,"processed":record.processed,"counts":record.counts,"error":record.error.as_deref().map(public_text)});
+            let fingerprint = summary.to_string();
+            if fingerprint == last {
+                continue;
+            }
+            let message = match record.status.as_str() {
+                "running" => "后台正在整理攻略",
+                "completed" => "攻略整理完成",
+                "failed" => "攻略整理失败，原始资料已保留",
+                "paused" => "攻略整理已暂停",
+                "cancelled" => "攻略整理已取消",
+                _ => "游玩经历已入队，等待空闲自动整理",
+            };
+            self.conversations.event(&id,"memory_job",message,json!({"state":record.status,"memory_id":draft_id(&id),"job_id":job,"result":summary,"validation":"pending","budget_scope":"independent_import_job"}))?;
+            self.conversations
+                .save_memory_job_summary(&id, &job, &fingerprint)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn memory_job_allowed(&self, package: &str, job: &str) -> Result<bool> {
+        for (id, linked_package, linked_job, _) in self.conversations.memory_job_links()? {
+            if linked_package != package || linked_job != job {
+                continue;
+            }
+            let checkpoint = self.conversations.memory_checkpoint(&id)?;
+            let draft = self
+                .memory
+                .call_cancellable(
+                    "memory_get",
+                    package,
+                    json!({"id":draft_id(&id)}),
+                    None,
+                    false,
+                    &AtomicBool::new(false),
+                )
+                .await;
+            let inactive = draft.as_ref().is_ok_and(|value| {
+                value["memory"]["status"] != "active"
+                    || value["memory"]["validation"] != "pending"
+                    || value["memory"]["protected_fields"]
+                        .as_array()
+                        .is_some_and(|fields| {
+                            fields
+                                .iter()
+                                .any(|field| matches!(field.as_str(), Some("body" | "sources")))
+                        })
+            }) || draft
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("permanently_deleted"));
+            let mut definition_deleted = false;
+            let source = self.memory.import_job_record(package, job)?;
+            for (memory, literal) in self.conversations.memory_definition_links(&id)? {
+                let safe = public_text(&literal);
+                if safe.is_empty() || !source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
+                {
+                    continue;
+                }
+                let original = self
+                    .memory
+                    .call_cancellable(
+                        "memory_get",
+                        package,
+                        json!({"id":memory}),
+                        None,
+                        false,
+                        &AtomicBool::new(false),
+                    )
+                    .await;
+                if original.as_ref().is_ok_and(|value| {
+                    value["memory"]["status"] != "active" || value["memory"]["body"] != literal
+                }) || original
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("permanently_deleted"))
+                {
+                    definition_deleted = true;
+                    break;
+                }
+            }
+            if checkpoint.suppressed || inactive || definition_deleted {
+                let _ = self
+                    .memory
+                    .call_cancellable(
+                        "memory_import_cancel",
+                        package,
+                        json!({"job_id":job,"operation_id":format!("experience-suppress:{job}")}),
+                        None,
+                        false,
+                        &AtomicBool::new(false),
+                    )
+                    .await;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub(super) fn memory_import_origins(
+        &self,
+        package: &str,
+        job: &str,
+    ) -> Result<Vec<super::memory::ImportOrigin>> {
+        let mut origins = Vec::new();
+        let source = self.memory.import_job_record(package, job)?;
+        for (id, linked_package, linked_job, _) in self.conversations.memory_job_links()? {
+            if linked_package != package || linked_job != job {
+                continue;
+            }
+            if self.conversations.record(&id)?.game_session_id.as_deref() == Some(&id) {
+                origins.push(super::memory::ImportOrigin::Draft(draft_id(&id)));
+            }
+            for (memory, literal) in self.conversations.memory_definition_links(&id)? {
+                let safe = public_text(&literal);
+                if !safe.is_empty() && source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
+                {
+                    origins.push(super::memory::ImportOrigin::Definition {
+                        id: memory,
+                        literal,
+                    });
+                }
+            }
+        }
+        Ok(origins)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -61,7 +598,7 @@ mod tests {
         ai.state.conversations.event(id, kind, message, data)
     }
     fn input(ai: &AiService, id: &str) {
-        game_event(&ai,id,"tool_end","",json!({"name":"input_tap","ok":true,"args":{"x":80,"y":120},"result":{"accepted":true}})).unwrap();
+        game_event(ai,id,"tool_end","",json!({"name":"input_tap","ok":true,"args":{"x":80,"y":120},"result":{"accepted":true}})).unwrap();
     }
     async fn draft(ai: &AiService, id: &str) -> Value {
         ai.state
@@ -887,542 +1424,5 @@ mod tests {
             "cancelled"
         );
         ai.state.stop_all().await;
-    }
-}
-
-pub(super) fn draft_id(id: &str) -> String {
-    format!("experience-{:x}", Sha256::digest(id.as_bytes()))[..35].to_owned()
-}
-
-/// Applied to human text and public model output; never to raw tool arguments.
-pub(super) fn public_text(text: &str) -> String {
-    text.lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            ![
-                "api_key",
-                "api-key",
-                "apikey",
-                "authorization",
-                "bearer ",
-                "password",
-                "secret=",
-                "token=",
-                "密码",
-                "密钥",
-                "令牌",
-                "data:image",
-                "base64,",
-            ]
-            .iter()
-            .any(|word| lower.contains(word))
-                && ![
-                    "不要记录",
-                    "不要保存",
-                    "不想记录",
-                    "别记录",
-                    "别保存",
-                    "不要记住",
-                ]
-                .iter()
-                .any(|word| line.contains(word))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .chars()
-        .take(6000)
-        .collect()
-}
-
-fn receipt_text(event: &Value) -> Option<String> {
-    let data = &event["data"];
-    let message = event["message"].as_str().unwrap_or("");
-    let text = match event["kind"].as_str()? {
-        "user" => {
-            let text = public_text(message);
-            (!text.is_empty())
-                .then(|| format!("## 用户给出的指引或纠错（原文，非新授权）\n{text}\n"))?
-        }
-        "assistant_final" => {
-            let text = public_text(data["text"].as_str().unwrap_or(message));
-            (!text.is_empty()).then(|| format!("## AI 公开说明（需核对观察依据）\n{text}\n"))?
-        }
-        "tool_end" => {
-            let name = data["name"].as_str().or_else(|| data["tool"].as_str())?;
-            if name.starts_with("memory_") || matches!(name, "web_search" | "web_read") {
-                return None;
-            }
-            format!(
-                "工具：{name}；调用返回成功：{}（不代表游戏目标成功）。\n",
-                data["ok"].as_bool().unwrap_or(false)
-            )
-        }
-        "error" => {
-            let text = public_text(message);
-            (!text.is_empty()).then(|| format!("## 实际错误或失败\n{text}\n"))?
-        }
-        "state"
-            if matches!(
-                data["state"].as_str(),
-                Some("paused" | "finished" | "interrupted")
-            ) =>
-        {
-            format!(
-                "## 实际运行状态\n{}；{}\n",
-                data["state"].as_str().unwrap_or("unknown"),
-                public_text(message)
-            )
-        }
-        _ => return None,
-    };
-    Some(format!(
-        "\n记录 #{}，时间 {}\n{text}",
-        event["seq"],
-        event["at"].as_str().unwrap_or("unknown")
-    ))
-}
-
-fn input_receipt(event: &Value) -> bool {
-    event["kind"] == "tool_end"
-        && event["data"]["name"]
-            .as_str()
-            .is_some_and(|name| name.starts_with("input_") || name.starts_with("app_"))
-}
-
-fn due(record: &Record, checkpoint: &Checkpoint, events: &[Value], force: bool) -> bool {
-    if force
-        || events.iter().any(|event| event["kind"] == "user")
-        || events.iter().filter(|e| input_receipt(e)).count() >= 10
-    {
-        return true;
-    }
-    if events.iter().any(|event| {
-        event["kind"] == "state"
-            && matches!(event["data"]["state"].as_str(), Some("paused" | "finished"))
-    }) {
-        return true;
-    }
-    let since = checkpoint.saved_at.as_deref().unwrap_or(&record.created_at);
-    chrono::DateTime::parse_from_rfc3339(since)
-        .is_ok_and(|at| Utc::now().signed_duration_since(at).num_seconds() >= 60)
-        && events
-            .iter()
-            .any(|event| input_receipt(event) || event["kind"] == "error")
-}
-
-impl State {
-    pub(super) async fn checkpoint_games(self: &Arc<Self>) {
-        let records = match self.conversations.game_records() {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(%error,"读取游玩记忆补偿记录失败");
-                return;
-            }
-        };
-        for record in records {
-            let present = self.sessions.lock().contains_key(&record.conversation_id);
-            // A journal from a previous process never restarts device control.
-            let force =
-                !present || matches!(record.state.as_str(), "paused" | "finished" | "interrupted");
-            if let Err(error) = self.checkpoint_game(&record, force).await {
-                tracing::warn!(%error,conversation=%record.conversation_id,"保存游玩记忆检查点失败");
-                let checkpoint = self
-                    .conversations
-                    .memory_checkpoint(&record.conversation_id)
-                    .unwrap_or_default();
-                let signature = format!(
-                    "checkpoint-error:{}:{}",
-                    record.conversation_id, checkpoint.seq
-                );
-                if self.checkpoint_errors.lock().insert(signature) {
-                    let _=self.conversations.event(&record.conversation_id,"memory_job","游玩记忆保存失败；原始对话仍保留，下次会重试",json!({"state":"failed","error":public_text(&error.to_string()),"validation":"pending"}));
-                }
-            }
-        }
-    }
-
-    pub(super) async fn checkpoint_game(&self, record: &Record, force: bool) -> Result<()> {
-        // This lock serializes local archives only, never input admission/pause.
-        let _guard = self.memory_checkpoint_gate.lock().await;
-        ensure!(
-            record.game_session_id.as_deref() == Some(&record.conversation_id),
-            "memory.checkpoint_not_game"
-        );
-        if record.state == "package_deleted" {
-            return Ok(());
-        }
-        let _package = self
-            .runtime
-            .packages
-            .acquire_activity(&record.content_package)?;
-        let mut checkpoint = self
-            .conversations
-            .memory_checkpoint(&record.conversation_id)?;
-        if checkpoint.suppressed || record.latest_seq <= checkpoint.seq {
-            return Ok(());
-        }
-        // Older releases had a single terminal source and no checkpoint row.
-        // Honor its explicit deletion using the exact durable job link before
-        // rebuilding a differently chunked source from the same private log.
-        if checkpoint.seq == 0 {
-            for (id, package, job, _) in self.conversations.memory_job_links()? {
-                if id != record.conversation_id || package != record.content_package {
-                    continue;
-                }
-                let Ok(previous) = self.memory.import_job_record(&package, &job) else {
-                    continue;
-                };
-                let source = self
-                    .memory
-                    .call_cancellable(
-                        "memory_source_get",
-                        &package,
-                        json!({"id":previous.source_id}),
-                        None,
-                        false,
-                        &AtomicBool::new(false),
-                    )
-                    .await?;
-                if source["current_deleted"] == true {
-                    checkpoint.suppressed = true;
-                    self.conversations
-                        .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-                    let _=self.memory.call_cancellable("memory_import_cancel",&package,json!({"job_id":job,"operation_id":format!("experience-deleted-source:{job}")}),None,false,&AtomicBool::new(false)).await;
-                    self.conversations.event(
-                        &record.conversation_id,
-                        "memory_job",
-                        "旧游玩原稿已被删除，已停止从该会话自动补归档",
-                        json!({"state":"cancelled","job_id":job,"validation":"pending"}),
-                    )?;
-                    return Ok(());
-                }
-            }
-        }
-        let events = self.conversations.memory_events(
-            &record.conversation_id,
-            checkpoint.seq,
-            record.latest_seq,
-        )?;
-        if !events.iter().any(|event| receipt_text(event).is_some()) {
-            checkpoint.seq = record.latest_seq;
-            self.conversations
-                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-            return Ok(());
-        }
-        if !due(record, &checkpoint, &events, force) {
-            return Ok(());
-        }
-        let mut text = format!("{HEADER}\n会话：{}\n", record.conversation_id);
-        let mut through = checkpoint.seq;
-        let mut relevant = false;
-        for event in &events {
-            if let Some(receipt) = receipt_text(event) {
-                if text.len() + receipt.len() > SOURCE_BYTES && relevant {
-                    break;
-                }
-                text.push_str(&receipt);
-                relevant = true;
-            }
-            through = event["seq"].as_u64().unwrap_or(through);
-        }
-        if !relevant {
-            checkpoint.seq = record.latest_seq;
-            self.conversations
-                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-            return Ok(());
-        }
-        let cancel = AtomicBool::new(false);
-        let memory_id = draft_id(&record.conversation_id);
-        let existing = self
-            .memory
-            .call_cancellable(
-                "memory_get",
-                &record.content_package,
-                json!({"id":memory_id}),
-                None,
-                false,
-                &cancel,
-            )
-            .await;
-        let existing = match existing {
-            Ok(value) => Some(value),
-            Err(error) if error.to_string().contains("memory.not_found") => None,
-            Err(error) if error.to_string().contains("memory.permanently_deleted") => {
-                checkpoint.suppressed = true;
-                self.conversations
-                    .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        if existing.as_ref().is_some_and(|value| {
-            value["memory"]["status"] != "active"
-                || value["memory"]["validation"] != "pending"
-                || !value["memory"]["tags"]
-                    .as_array()
-                    .is_some_and(|tags| tags.iter().any(|tag| tag == DRAFT_TAG))
-                || value["memory"]["protected_fields"]
-                    .as_array()
-                    .is_some_and(|fields| {
-                        fields
-                            .iter()
-                            .any(|field| matches!(field.as_str(), Some("body" | "sources")))
-                    })
-        }) {
-            checkpoint.suppressed = true;
-            self.conversations
-                .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-            return Ok(());
-        }
-        let all = self
-            .conversations
-            .memory_events(&record.conversation_id, 0, through)?;
-        let mut body = format!("{HEADER}\n会话：{}\n", record.conversation_id);
-        for event in &all {
-            if let Some(receipt) = receipt_text(event) {
-                if body.len() + receipt.len() > DRAFT_BYTES {
-                    body.push_str(
-                        "\n草稿达到展示上限；后续原稿仍按增量保留，完整记录可在本会话查询。\n",
-                    );
-                    break;
-                }
-                body.push_str(&receipt);
-            }
-        }
-        let operation = format!("experience-draft:{}:{through}", record.conversation_id);
-        let mut draft = if let Some(existing) = existing {
-            if existing["memory"]["body"] == body {
-                json!({"id":memory_id,"revision":existing["revision"],"validation":"pending"})
-            } else {
-                self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":memory_id,"expected_version":existing["version"],"patch":{"body":body},"operation_id":operation,"reason":"更新本会话真实公开回执草稿；待复核，非攻略结论"}),None,false,&cancel).await?
-            }
-        } else {
-            let result=self.memory.call_cancellable("memory_create",&record.content_package,json!({"id":memory_id,"title":format!("游玩经历 {}（待复核）",&record.conversation_id[..record.conversation_id.len().min(8)]),"body":body,"kind":"procedure","tags":[DRAFT_TAG,"自动记录","待复核"],"validation":"pending","game_version":"unknown","sources":[{"type":"conversation","id":format!("session-{}",record.conversation_id),"conversation_id":record.conversation_id,"excerpt":"本会话的真实用户指引和公开调用回执"}],"operation_id":operation,"reason":"直接保存真实公开过程；后台空闲后再提炼，可随时查询"}),None,false,&cancel).await;
-            match result {
-                Ok(result) => result,
-                Err(error) if error.to_string().contains("suppressed") => {
-                    checkpoint.suppressed = true;
-                    self.conversations
-                        .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let game_limits = record.game_limits.as_ref().unwrap_or(&record.limits);
-        let import_identity = json!({"text":text,"limits":game_limits});
-        let result=self.memory.call_cancellable("memory_import",&record.content_package,json!({"operation_id":format!("experience:{}:{}:{through}:{:x}",record.conversation_id,checkpoint.seq,Sha256::digest(import_identity.to_string().as_bytes())),"filename":"experience.md","title":"自动记录的游玩经历","text":text,"game_version":"unknown","limits":game_limits}),None,false,&cancel).await?;
-        let job = result["job_id"].as_str().unwrap_or("");
-        self.conversations.link_memory_job(
-            &record.conversation_id,
-            &record.content_package,
-            job,
-        )?;
-        let references = self.memory.source_references(
-            &record.content_package,
-            result["source_id"].as_str().unwrap_or(""),
-            result["source_revision"].as_u64().unwrap_or(1),
-        )?;
-        let original_draft = self
-            .memory
-            .call_cancellable(
-                "memory_get",
-                &record.content_package,
-                json!({"id":memory_id}),
-                None,
-                false,
-                &cancel,
-            )
-            .await?;
-        let mut draft_sources = original_draft["memory"]["sources"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let before = draft_sources.len();
-        for reference in &references {
-            if draft_sources.len() < 100 && !draft_sources.contains(reference) {
-                draft_sources.push(reference.clone());
-            }
-        }
-        if draft_sources.len() != before {
-            draft=self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":memory_id,"expected_version":original_draft["version"],"patch":{"sources":draft_sources},"operation_id":format!("experience-draft-sources:{}:{through}",record.conversation_id),"reason":"关联本次增量原稿的真实来源，删除草稿后防止同源自动复建"}),None,false,&cancel).await?;
-        }
-        for (definition_id, literal) in self
-            .conversations
-            .memory_definition_links(&record.conversation_id)?
-        {
-            let literal = public_text(&literal);
-            if literal.is_empty() || !text.contains(&literal) {
-                continue;
-            }
-            let original = self
-                .memory
-                .call_cancellable(
-                    "memory_get",
-                    &record.content_package,
-                    json!({"id":definition_id}),
-                    None,
-                    false,
-                    &cancel,
-                )
-                .await;
-            if let Ok(original) = original {
-                if original["memory"]["status"] == "active" {
-                    let mut sources = original["memory"]["sources"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default();
-                    let before = sources.len();
-                    for reference in &references {
-                        if sources.len() < 100 && !sources.contains(reference) {
-                            sources.push(reference.clone());
-                        }
-                    }
-                    if sources.len() != before {
-                        self.memory.call_cancellable("memory_update",&record.content_package,json!({"id":definition_id,"expected_version":original["version"],"patch":{"sources":sources},"reason":"宿主关联真实用户原稿来源，防止用户删除后同源自动复建","operation_id":format!("experience-definition-link:{}:{through}:{definition_id}",record.conversation_id)}),None,true,&cancel).await?;
-                    }
-                }
-            }
-        }
-        let _ = self
-            .memory_job_allowed(&record.content_package, job)
-            .await?;
-        let from = checkpoint.seq;
-        checkpoint.seq = through;
-        checkpoint.saved_at = Some(Utc::now().to_rfc3339());
-        self.conversations
-            .save_memory_checkpoint(&record.conversation_id, &checkpoint)?;
-        self.conversations.event(&record.conversation_id,"memory_staged","游玩记忆草稿已保存；攻略将在空闲时自动整理",json!({"memory":{"id":memory_id,"revision":draft["revision"],"validation":"pending"},"checkpoint":{"from_seq":from,"to_seq":through},"automatic":true,"job_id":job}))?;
-        self.sync_memory_job_events()?;
-        Ok(())
-    }
-
-    pub(super) fn sync_memory_job_events(&self) -> Result<()> {
-        for (id, package, job, last) in self.conversations.memory_job_links()? {
-            let Ok(record) = self.memory.import_job_record(&package, &job) else {
-                continue;
-            };
-            let summary = json!({"job_id":job,"status":record.status,"total":record.total,"processed":record.processed,"counts":record.counts,"error":record.error.as_deref().map(public_text)});
-            let fingerprint = summary.to_string();
-            if fingerprint == last {
-                continue;
-            }
-            let message = match record.status.as_str() {
-                "running" => "后台正在整理攻略",
-                "completed" => "攻略整理完成",
-                "failed" => "攻略整理失败，原始资料已保留",
-                "paused" => "攻略整理已暂停",
-                "cancelled" => "攻略整理已取消",
-                _ => "游玩经历已入队，等待空闲自动整理",
-            };
-            self.conversations.event(&id,"memory_job",message,json!({"state":record.status,"memory_id":draft_id(&id),"job_id":job,"result":summary,"validation":"pending","budget_scope":"independent_import_job"}))?;
-            self.conversations
-                .save_memory_job_summary(&id, &job, &fingerprint)?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn memory_job_allowed(&self, package: &str, job: &str) -> Result<bool> {
-        for (id, linked_package, linked_job, _) in self.conversations.memory_job_links()? {
-            if linked_package != package || linked_job != job {
-                continue;
-            }
-            let checkpoint = self.conversations.memory_checkpoint(&id)?;
-            let draft = self
-                .memory
-                .call_cancellable(
-                    "memory_get",
-                    package,
-                    json!({"id":draft_id(&id)}),
-                    None,
-                    false,
-                    &AtomicBool::new(false),
-                )
-                .await;
-            let inactive = draft.as_ref().is_ok_and(|value| {
-                value["memory"]["status"] != "active"
-                    || value["memory"]["validation"] != "pending"
-                    || value["memory"]["protected_fields"]
-                        .as_array()
-                        .is_some_and(|fields| {
-                            fields
-                                .iter()
-                                .any(|field| matches!(field.as_str(), Some("body" | "sources")))
-                        })
-            }) || draft
-                .as_ref()
-                .is_err_and(|error| error.to_string().contains("permanently_deleted"));
-            let mut definition_deleted = false;
-            let source = self.memory.import_job_record(package, job)?;
-            for (memory, literal) in self.conversations.memory_definition_links(&id)? {
-                let safe = public_text(&literal);
-                if safe.is_empty() || !source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
-                {
-                    continue;
-                }
-                let original = self
-                    .memory
-                    .call_cancellable(
-                        "memory_get",
-                        package,
-                        json!({"id":memory}),
-                        None,
-                        false,
-                        &AtomicBool::new(false),
-                    )
-                    .await;
-                if original.as_ref().is_ok_and(|value| {
-                    value["memory"]["status"] != "active" || value["memory"]["body"] != literal
-                }) || original
-                    .as_ref()
-                    .is_err_and(|error| error.to_string().contains("permanently_deleted"))
-                {
-                    definition_deleted = true;
-                    break;
-                }
-            }
-            if checkpoint.suppressed || inactive || definition_deleted {
-                let _ = self
-                    .memory
-                    .call_cancellable(
-                        "memory_import_cancel",
-                        package,
-                        json!({"job_id":job,"operation_id":format!("experience-suppress:{job}")}),
-                        None,
-                        false,
-                        &AtomicBool::new(false),
-                    )
-                    .await;
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-    pub(super) fn memory_import_origins(
-        &self,
-        package: &str,
-        job: &str,
-    ) -> Result<Vec<super::memory::ImportOrigin>> {
-        let mut origins = Vec::new();
-        let source = self.memory.import_job_record(package, job)?;
-        for (id, linked_package, linked_job, _) in self.conversations.memory_job_links()? {
-            if linked_package != package || linked_job != job {
-                continue;
-            }
-            if self.conversations.record(&id)?.game_session_id.as_deref() == Some(&id) {
-                origins.push(super::memory::ImportOrigin::Draft(draft_id(&id)));
-            }
-            for (memory, literal) in self.conversations.memory_definition_links(&id)? {
-                let safe = public_text(&literal);
-                if !safe.is_empty() && source.chunks.iter().any(|chunk| chunk.text.contains(&safe))
-                {
-                    origins.push(super::memory::ImportOrigin::Definition {
-                        id: memory,
-                        literal,
-                    });
-                }
-            }
-        }
-        Ok(origins)
     }
 }
