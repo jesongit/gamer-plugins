@@ -1,9 +1,9 @@
 manifest_version = 2
 id = "gamer-ai"
-version = "0.2.1"
+version = "0.3.0"
 name = "AI 助手"
-description = "通过持续对话引导 AI 观察和操作游戏，提供本机 MCP 接入"
-permissions = ["ui.host", "ai.connect", "device.read", "device.app", "input.tap", "input.swipe", "input.key", "input.text", "touch", "runtime.sleep", "log.write"]
+description = "Agent 对话、配置包攻略记忆与混合检索，可选联网服务和本机 MCP 游玩接入"
+permissions = ["ui.host", "ai.connect", "resource.read", "device.read", "device.app", "input.tap", "input.swipe", "input.key", "input.text", "touch", "runtime.sleep", "log.write"]
 
 [host_api]
 ui = "^1.0"
@@ -12,6 +12,7 @@ input = "^1.0"
 touch = "^1.0"
 runtime = "^1.0"
 log = "^1.0"
+resource = "^1.0"
 
 [targets.android]
 packages = ["*"]
@@ -19,7 +20,7 @@ packages = ["*"]
 [execution]
 kind = "builtin"
 builtin_id = "gamer-ai"
-host_version = ">=0.2.6"
+host_version = ">=0.2.7"
 
 [[ui.contributions]]
 panel_id = "ai"

@@ -24,7 +24,9 @@ export function eventDetails(data) {
   function redact(value) {
     if (Array.isArray(value)) return value.map(redact)
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
-      .filter(([key]) => !(value.type === 'image' && key === 'data') && !/image_data_url|image_url|api_key|authorization|token|password|secret|base64|reasoning|chain.of.thought|private.thought/i.test(key))
+      .filter(([key, child]) => !(value.type === 'image' && key === 'data')
+        && !/image_data_url|image_url|api_key|authorization|cookie|password|secret|base64|reasoning|chain.of.thought|private.thought/i.test(key)
+        && (!/token/i.test(key) || typeof child === 'number'))
       .map(([key, child]) => [key, redact(child)]))
     if (typeof value === 'string' && value.startsWith('data:image/')) return '[图片]'
     return value
@@ -47,6 +49,11 @@ export const TOOL_LABELS = {
   target_list: '查看目标', context_get: '读取上下文', session_status: '查询会话', screen_capture: '观察画面',
   input_tap: '点击', input_press: '长按', input_swipe: '滑动', input_key: '按键', input_text: '输入文字',
   app_launch: '启动应用', app_stop: '停止应用', wait: '等待', session_finish: '结束会话',
+  memory_search:'检索记忆',memory_get:'阅读记忆',memory_list:'列出记忆',memory_history:'读取修订历史',
+  memory_create:'保存新记忆',memory_update:'修订记忆',memory_disable:'停用记忆',memory_delete:'删除记忆',memory_restore:'恢复记忆',memory_merge:'合并记忆',
+  memory_import:'暂存攻略',memory_import_jobs:'查询导入进度',memory_source_get:'阅读攻略来源',
+  memory_source_update:'修订攻略来源',memory_source_delete:'删除攻略来源',memory_import_pause:'暂停合并',memory_import_resume:'继续合并',memory_import_cancel:'取消合并',
+  web_search:'联网检索',web_read:'读取网页',memory_index_status:'查询索引',memory_index_rebuild:'重建索引',
 }
 export function pauseGuidance(session) {
   if (session?.pause_reason?.suggestion) return session.pause_reason.suggestion

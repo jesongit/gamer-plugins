@@ -1,11 +1,12 @@
-//! Non-streaming, cancellable adapters with a single Responses-shaped history.
+//! Cancellable JSON/SSE adapters with a single Responses-shaped history.
 //! MCP images become real image inputs, never ordinary base64 text.
 use super::settings::{validate_config, ConnectionConfig, SettingsConfig};
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     future::Future,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -30,6 +31,19 @@ pub struct ModelTurn {
     pub summary: Vec<String>,
     pub usage: Option<Value>,
     pub request_attempts: u32,
+    pub diagnostics: Value,
+}
+
+/// Only supplier-published output. Chat reasoning_content requires an explicit
+/// model setting; Responses raw/encrypted reasoning is never emitted.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelStreamEvent {
+    TextDelta { delta: String },
+    SummaryDelta { delta: String },
+    ThinkingDelta { delta: String },
+    Usage { usage: Value },
+    Diagnostics { diagnostics: Value },
 }
 
 #[derive(Debug)]
@@ -39,6 +53,8 @@ struct ApiFailure {
     detail: String,
     retryable: bool,
     usage: Option<Value>,
+    request_id: Option<String>,
+    diagnostics: Value,
 }
 impl std::fmt::Display for ApiFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,12 +74,15 @@ fn api_failure(
         detail: detail.into(),
         retryable,
         usage: None,
+        request_id: None,
+        diagnostics: Value::Null,
     }
     .into()
 }
 pub(super) fn error_details(error: &anyhow::Error) -> Value {
     if let Some(failure) = error.downcast_ref::<ApiFailure>() {
-        json!({"code":failure.code,"http_status":failure.http_status,"detail":failure.detail,"retryable":failure.retryable})
+        json!({"code":failure.code,"http_status":failure.http_status,"detail":failure.detail,"retryable":failure.retryable,
+            "request_id":failure.request_id,"diagnostics":failure.diagnostics})
     } else {
         json!({"code":"model_response_error","detail":error.to_string(),"retryable":true})
     }
@@ -73,15 +92,42 @@ pub(super) fn error_usage(error: &anyhow::Error) -> Option<&Value> {
         .downcast_ref::<ApiFailure>()
         .and_then(|failure| failure.usage.as_ref())
 }
+pub(super) fn interrupted_error(
+    code: &'static str,
+    detail: &str,
+    usage: Option<Value>,
+    diagnostics: Value,
+) -> anyhow::Error {
+    ApiFailure {
+        code,
+        detail: detail.into(),
+        retryable: false,
+        http_status: diagnostics["http_status"].as_u64().map(|v| v as u16),
+        request_id: diagnostics["request_id"].as_str().map(str::to_owned),
+        usage,
+        diagnostics,
+    }
+    .into()
+}
 fn redact_error(error: anyhow::Error, key: &str) -> anyhow::Error {
-    let safe: String = error
-        .to_string()
-        .replace(key, "[redacted]")
-        .chars()
-        .take(1000)
-        .collect();
+    let message = if key.is_empty() {
+        error.to_string()
+    } else {
+        error.to_string().replace(key, "[redacted]")
+    };
+    let safe: String = message.chars().take(1000).collect();
     if let Some(failure) = error.downcast_ref::<ApiFailure>() {
-        api_failure(failure.code, failure.http_status, safe, failure.retryable)
+        let mut redacted = ApiFailure {
+            code: failure.code,
+            http_status: failure.http_status,
+            detail: safe,
+            retryable: failure.retryable,
+            usage: failure.usage.clone().map(|value| redact_value(value, key)),
+            request_id: failure.request_id.clone().map(|id| redact_string(&id, key)),
+            diagnostics: redact_value(failure.diagnostics.clone(), key),
+        };
+        redacted.detail = redact_string(&redacted.detail, key);
+        redacted.into()
     } else {
         api_failure("model_response_error", None, safe, true)
     }
@@ -100,6 +146,7 @@ impl Provider {
             model: config.model.clone(),
             protocol: config.protocol.clone(),
             request_timeout_secs: config.request_timeout_secs,
+            public_reasoning_content: config.public_reasoning_content,
         })?;
         ensure!(!config.api_key.is_empty(), "AI API 密钥未配置");
         let http = reqwest::Client::builder()
@@ -131,28 +178,103 @@ impl Provider {
         self.turn_with_choice(history, tools, None, cancel).await
     }
 
-    async fn turn_with_choice(
+    /// Real incremental SSE. Tool fragments are never callable: only a terminal
+    /// response, with complete JSON arguments, can produce ModelTurn::calls.
+    pub async fn turn_stream<F: FnMut(ModelStreamEvent)>(
+        &self,
+        history: &[Value],
+        tools: &[Value],
+        cancel: &AtomicBool,
+        mut on_event: F,
+    ) -> Result<ModelTurn> {
+        ensure!(!cancel.load(Ordering::Acquire), "CANCELLED: AI 请求已取消");
+        let (suffix, mut body) = self.request_body(history, tools, None, true)?;
+        // Chat usage is delivered separately after the last choice, when the
+        // configured compatible supplier implements this standard option.
+        if self.config.protocol == "chat_completions" {
+            body["stream_options"] = json!({"include_usage":true});
+        }
+        let started = std::time::Instant::now();
+        let response = cancellable(
+            self.http
+                .post(format!(
+                    "{}/{}",
+                    self.config.base_url.trim_end_matches('/'),
+                    suffix
+                ))
+                .bearer_auth(&self.config.api_key)
+                .header("Accept", "text/event-stream")
+                .json(&body)
+                .send(),
+            cancel,
+        )
+        .await?
+        .map_err(|error| transport_error(&error))?;
+        let status = response.status();
+        let request_id = response_request_id(response.headers())
+            .map(|id| redact_string(&id, &self.config.api_key));
+        let mut diagnostics = json!({"protocol":self.config.protocol,"model":self.config.model,
+            "http_status":status.as_u16(),"request_id":request_id,"streamed":true,"request_attempts":1});
+        on_event(ModelStreamEvent::Diagnostics {
+            diagnostics: diagnostics.clone(),
+        });
+        let mut state = StreamState::new(self.config.protocol == "responses", &self.config.api_key);
+        state.public_reasoning_content = self.config.public_reasoning_content;
+        let result = self
+            .consume_stream(response, cancel, &mut state, &mut on_event)
+            .await;
+        // Flush safe suffixes even on cancellation; this contains only complete
+        // public text already received, never speculative function arguments.
+        state.flush(&mut on_event);
+        diagnostics["elapsed_ms"] =
+            json!(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        diagnostics["streamed"] = json!(state.streamed);
+        if let Some(id) = &state.response_id {
+            diagnostics["response_id"] = json!(redact_string(id, &self.config.api_key));
+        }
+        if let Some(usage) = &state.usage {
+            on_event(ModelStreamEvent::Usage {
+                usage: redact_value(usage.clone(), &self.config.api_key),
+            });
+        }
+        on_event(ModelStreamEvent::Diagnostics {
+            diagnostics: diagnostics.clone(),
+        });
+        let mut turn = result.map_err(|error| {
+            failure_metadata(
+                redact_error(error, &self.config.api_key),
+                state
+                    .usage
+                    .clone()
+                    .map(|value| redact_value(value, &self.config.api_key)),
+                request_id.clone(),
+                diagnostics.clone(),
+            )
+        })?;
+        turn.diagnostics = diagnostics;
+        turn.request_attempts = 1;
+        Ok(turn)
+    }
+
+    fn request_body(
         &self,
         history: &[Value],
         tools: &[Value],
         choice: Option<Value>,
-        cancel: &AtomicBool,
-    ) -> Result<ModelTurn> {
-        ensure!(!cancel.load(Ordering::Acquire), "CANCELLED: AI 请求已取消");
+        stream: bool,
+    ) -> Result<(&'static str, Value)> {
         let (suffix, mut body) = if self.config.protocol == "responses" {
             (
                 "responses",
                 json!({"model":self.config.model,"input":responses_history(history)?,
-                "tools":tools,"stream":false,"store":false,"max_output_tokens":self.max_output_tokens,
-                "parallel_tool_calls":false}),
+                "tools":tools,"stream":stream,"store":false,"max_output_tokens":self.max_output_tokens,"parallel_tool_calls":false}),
             )
         } else {
             let converted: Result<Vec<_>> = tools.iter().map(chat_tool).collect();
             (
                 "chat/completions",
                 json!({"model":self.config.model,"messages":chat_history(history)?,
-                "tools":converted?,"stream":false,"max_tokens":self.max_output_tokens,
-                "parallel_tool_calls":false}),
+                "tools":converted?,"stream":stream,"max_tokens":self.max_output_tokens,"parallel_tool_calls":false}),
             )
         };
         if tools.is_empty() {
@@ -168,6 +290,113 @@ impl Provider {
                 choice
             };
         }
+        Ok((suffix, body))
+    }
+
+    async fn consume_stream<F: FnMut(ModelStreamEvent)>(
+        &self,
+        mut response: reqwest::Response,
+        cancel: &AtomicBool,
+        state: &mut StreamState,
+        on_event: &mut F,
+    ) -> Result<ModelTurn> {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("");
+        if !status.is_success() || !content_type.starts_with("text/event-stream") {
+            state.streamed = false;
+            let bytes = read_limited(response, cancel).await?;
+            let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                api_failure(
+                    "invalid_response",
+                    Some(status.as_u16()),
+                    format!("AI API 返回非 JSON/SSE 响应（HTTP {}）", status.as_u16()),
+                    status.is_server_error(),
+                )
+            })?;
+            state.usage = value
+                .get("usage")
+                .filter(|value| value.is_object())
+                .cloned();
+            state.response_id = value.get("id").and_then(Value::as_str).map(str::to_string);
+            if !status.is_success() {
+                let message = value
+                    .pointer("/error/message")
+                    .or_else(|| value.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("供应商拒绝请求");
+                return Err(api_failure(
+                    "http_error",
+                    Some(status.as_u16()),
+                    format!("AI API HTTP {}: {}（未自动重试）", status.as_u16(), message),
+                    status.is_server_error() || status.as_u16() == 429,
+                ));
+            }
+            // Some compatible suppliers return complete JSON despite stream.
+            // Preserve their explicitly configured protocol; do not reconnect.
+            if !state.responses && state.public_reasoning_content {
+                if let Some(thinking) = value
+                    .pointer("/choices/0/message/reasoning_content")
+                    .and_then(Value::as_str)
+                {
+                    on_event(ModelStreamEvent::ThinkingDelta {
+                        delta: redact_string(thinking, &self.config.api_key),
+                    });
+                }
+            }
+            let mut turn = if state.responses {
+                parse_responses(redact_value(value, &self.config.api_key))?
+            } else {
+                parse_chat(redact_value(value, &self.config.api_key))?
+            };
+            if !turn.text.is_empty() {
+                on_event(ModelStreamEvent::TextDelta {
+                    delta: turn.text.clone(),
+                });
+            }
+            for delta in &turn.summary {
+                on_event(ModelStreamEvent::SummaryDelta {
+                    delta: delta.clone(),
+                });
+            }
+            turn.diagnostics = json!({"streamed":false});
+            return Ok(turn);
+        }
+        let mut decoder = SseDecoder::default();
+        let mut total = 0usize;
+        while let Some(chunk) = cancellable(response.chunk(), cancel)
+            .await?
+            .map_err(|error| transport_error(&error))?
+        {
+            total = total.saturating_add(chunk.len());
+            ensure!(total <= RESPONSE_BYTES_LIMIT, "AI API 流响应超过大小限制");
+            for event in decoder.push(&chunk)? {
+                if state.event(event, on_event)? {
+                    return state.finish();
+                }
+            }
+        }
+        for event in decoder.finish()? {
+            if state.event(event, on_event)? {
+                return state.finish();
+            }
+        }
+        state.finish()
+    }
+
+    async fn turn_with_choice(
+        &self,
+        history: &[Value],
+        tools: &[Value],
+        choice: Option<Value>,
+        cancel: &AtomicBool,
+    ) -> Result<ModelTurn> {
+        ensure!(!cancel.load(Ordering::Acquire), "CANCELLED: AI 请求已取消");
+        let (suffix, body) = self.request_body(history, tools, choice, false)?;
+        let started = std::time::Instant::now();
         let endpoint = format!("{}/{}", self.config.base_url.trim_end_matches('/'), suffix);
         // No automatic retries: a timeout or lost response can already have
         // consumed tokens. The executor counts each explicit turn against its
@@ -183,6 +412,8 @@ impl Provider {
         .await?
         .map_err(|error| transport_error(&error))?;
         let status = response.status();
+        let request_id = response_request_id(response.headers())
+            .map(|id| redact_string(&id, &self.config.api_key));
         let bytes = read_limited(response, cancel).await?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
             api_failure(
@@ -203,11 +434,20 @@ impl Provider {
                 .chars()
                 .take(512)
                 .collect();
-            return Err(api_failure(
-                "http_error",
-                Some(status.as_u16()),
-                format!("AI API HTTP {}: {}（未自动重试）", status.as_u16(), safe),
-                status.is_server_error() || status.as_u16() == 429,
+            return Err(failure_metadata(
+                api_failure(
+                    "http_error",
+                    Some(status.as_u16()),
+                    format!("AI API HTTP {}: {}（未自动重试）", status.as_u16(), safe),
+                    status.is_server_error() || status.as_u16() == 429,
+                ),
+                value
+                    .get("usage")
+                    .filter(|usage| usage.is_object())
+                    .cloned()
+                    .map(|v| redact_value(v, &self.config.api_key)),
+                request_id,
+                json!({"protocol":self.config.protocol,"model":self.config.model,"http_status":status.as_u16()}),
             ));
         }
         ensure!(!cancel.load(Ordering::Acquire), "CANCELLED: AI 请求已取消");
@@ -216,21 +456,22 @@ impl Provider {
             .filter(|usage| usage.is_object())
             .cloned();
         let parsed = if self.config.protocol == "responses" {
-            parse_responses(value)
+            parse_responses(redact_value(value, &self.config.api_key))
         } else {
-            parse_chat(value)
+            parse_chat(redact_value(value, &self.config.api_key))
         };
+        let diagnostics = json!({"protocol":self.config.protocol,"model":self.config.model,"http_status":status.as_u16(),
+            "request_id":request_id,"streamed":false,"elapsed_ms":started.elapsed().as_millis().min(u64::MAX as u128) as u64});
         let mut turn = parsed.map_err(|error| {
-            let safe = redact_error(error, &self.config.api_key);
-            match safe.downcast::<ApiFailure>() {
-                Ok(mut failure) => {
-                    failure.usage = usage;
-                    failure.into()
-                }
-                Err(error) => error,
-            }
+            failure_metadata(
+                redact_error(error, &self.config.api_key),
+                usage.map(|value| redact_value(value, &self.config.api_key)),
+                request_id.clone(),
+                diagnostics.clone(),
+            )
         })?;
         turn.request_attempts = 1;
+        turn.diagnostics = diagnostics;
         Ok(turn)
     }
 
@@ -341,6 +582,480 @@ impl Provider {
         }
         checks.push(json!({"name":"tool_result_roundtrip","ok":true}));
         Ok(())
+    }
+}
+
+fn redact_string(value: &str, key: &str) -> String {
+    if key.is_empty() {
+        value.to_string()
+    } else {
+        value.replace(key, "[redacted]")
+    }
+}
+fn redact_value(value: Value, key: &str) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_string(&text, key)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_value(item, key))
+                .collect(),
+        ),
+        Value::Object(items) => Value::Object(
+            items
+                .into_iter()
+                .map(|(name, value)| (redact_string(&name, key), redact_value(value, key)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "cf-ray"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|header| header.to_str().ok())
+                .map(|id| id.chars().take(256).collect())
+        })
+}
+fn failure_metadata(
+    error: anyhow::Error,
+    usage: Option<Value>,
+    request_id: Option<String>,
+    diagnostics: Value,
+) -> anyhow::Error {
+    let mut failure = match error.downcast::<ApiFailure>() {
+        Ok(failure) => failure,
+        Err(error) => ApiFailure {
+            code: if error.to_string().contains("CANCELLED:") {
+                "cancelled"
+            } else {
+                "model_response_error"
+            },
+            http_status: None,
+            detail: error.to_string(),
+            retryable: true,
+            usage: None,
+            request_id: None,
+            diagnostics: Value::Null,
+        },
+    };
+    if usage.is_some() {
+        failure.usage = usage;
+    }
+    failure.request_id = request_id;
+    failure.diagnostics = diagnostics;
+    failure.into()
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    name: String,
+    data: Vec<String>,
+    skip_lf: bool,
+    started: bool,
+}
+struct SseEvent {
+    name: String,
+    data: String,
+}
+impl SseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>> {
+        let mut result = Vec::new();
+        for byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+            if matches!(*byte, b'\r' | b'\n') {
+                let line = std::mem::take(&mut self.buffer);
+                self.line(&line, &mut result)?;
+                self.skip_lf = *byte == b'\r';
+            } else {
+                self.buffer.push(*byte);
+            }
+        }
+        Ok(result)
+    }
+    fn line(&mut self, line: &[u8], result: &mut Vec<SseEvent>) -> Result<()> {
+        let line = if !self.started {
+            self.started = true;
+            line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(line)
+        } else {
+            line
+        };
+        let line = std::str::from_utf8(line).context("AI SSE 包含无效 UTF-8")?;
+        if line.is_empty() {
+            if !self.data.is_empty() {
+                result.push(SseEvent {
+                    name: std::mem::take(&mut self.name),
+                    data: std::mem::take(&mut self.data).join("\n"),
+                });
+            } else {
+                self.name.clear();
+            }
+        } else if !line.starts_with(':') {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => self.name = value.to_string(),
+                "data" => self.data.push(value.to_string()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<Vec<SseEvent>> {
+        let mut result = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            self.line(&line, &mut result)?;
+        }
+        self.line(b"", &mut result)?;
+        Ok(result)
+    }
+}
+
+struct DeltaRedactor {
+    key: String,
+    pending: String,
+}
+impl DeltaRedactor {
+    fn new(key: &str) -> Self {
+        Self {
+            key: key.into(),
+            pending: String::new(),
+        }
+    }
+    fn push(&mut self, delta: &str) -> String {
+        self.pending.push_str(delta);
+        self.pending = redact_string(&self.pending, &self.key);
+        if self.key.is_empty() {
+            return std::mem::take(&mut self.pending);
+        }
+        // Retain only a suffix which could be the start of a split credential.
+        let keep = self
+            .pending
+            .char_indices()
+            .filter_map(|(start, _)| {
+                let suffix = &self.pending[start..];
+                (suffix.len() < self.key.len() && self.key.starts_with(suffix)).then_some(start)
+            })
+            .next()
+            .unwrap_or(self.pending.len());
+        let tail = self.pending.split_off(keep);
+        std::mem::replace(&mut self.pending, tail)
+    }
+    fn finish(&mut self) -> String {
+        redact_string(&std::mem::take(&mut self.pending), &self.key)
+    }
+}
+#[derive(Default)]
+struct ChatCallDelta {
+    id: String,
+    name: String,
+    arguments: String,
+}
+struct StreamState {
+    responses: bool,
+    streamed: bool,
+    key: String,
+    final_response: Option<Value>,
+    response_id: Option<String>,
+    usage: Option<Value>,
+    text: String,
+    summary: String,
+    calls: BTreeMap<usize, ChatCallDelta>,
+    finish_reason: Option<String>,
+    role_seen: bool,
+    text_redactor: DeltaRedactor,
+    summary_redactor: DeltaRedactor,
+    thinking_redactor: DeltaRedactor,
+    public_reasoning_content: bool,
+}
+impl StreamState {
+    fn new(responses: bool, key: &str) -> Self {
+        Self {
+            responses,
+            streamed: true,
+            key: key.into(),
+            final_response: None,
+            response_id: None,
+            usage: None,
+            text: String::new(),
+            summary: String::new(),
+            calls: BTreeMap::new(),
+            finish_reason: None,
+            role_seen: false,
+            text_redactor: DeltaRedactor::new(key),
+            summary_redactor: DeltaRedactor::new(key),
+            thinking_redactor: DeltaRedactor::new(key),
+            public_reasoning_content: false,
+        }
+    }
+    fn delta<F: FnMut(ModelStreamEvent)>(&mut self, channel: &str, delta: &str, on_event: &mut F) {
+        let safe = match channel {
+            "summary" => self.summary_redactor.push(delta),
+            "thinking" => self.thinking_redactor.push(delta),
+            _ => self.text_redactor.push(delta),
+        };
+        if safe.is_empty() {
+            return;
+        }
+        on_event(match channel {
+            "summary" => ModelStreamEvent::SummaryDelta { delta: safe },
+            "thinking" => ModelStreamEvent::ThinkingDelta { delta: safe },
+            _ => ModelStreamEvent::TextDelta { delta: safe },
+        });
+    }
+    fn flush<F: FnMut(ModelStreamEvent)>(&mut self, on_event: &mut F) {
+        for (channel, redactor) in [
+            ("text", &mut self.text_redactor),
+            ("summary", &mut self.summary_redactor),
+            ("thinking", &mut self.thinking_redactor),
+        ] {
+            let safe = redactor.finish();
+            if safe.is_empty() {
+                continue;
+            }
+            on_event(match channel {
+                "summary" => ModelStreamEvent::SummaryDelta { delta: safe },
+                "thinking" => ModelStreamEvent::ThinkingDelta { delta: safe },
+                _ => ModelStreamEvent::TextDelta { delta: safe },
+            });
+        }
+    }
+    fn event<F: FnMut(ModelStreamEvent)>(
+        &mut self,
+        event: SseEvent,
+        on_event: &mut F,
+    ) -> Result<bool> {
+        if event.data.trim() == "[DONE]" {
+            return Ok(true);
+        }
+        if event.data.trim().is_empty() {
+            return Ok(false);
+        }
+        let value: Value =
+            serde_json::from_str(&event.data).context("AI SSE data 不是有效 JSON")?;
+        if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+            self.usage = Some(usage.clone());
+            on_event(ModelStreamEvent::Usage {
+                usage: redact_value(usage.clone(), &self.key),
+            });
+        }
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.response_id = Some(id.to_string());
+        }
+        if self.responses {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or(&event.name);
+            if let Some(response) = value.get("response") {
+                if let Some(id) = response.get("id").and_then(Value::as_str) {
+                    self.response_id = Some(id.to_string());
+                }
+                if let Some(usage) = response.get("usage").filter(|usage| usage.is_object()) {
+                    self.usage = Some(usage.clone());
+                }
+            }
+            match kind {
+                "response.output_text.delta" => self.delta(
+                    "text",
+                    value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .context("AI 文本 delta 无效")?,
+                    on_event,
+                ),
+                "response.reasoning_summary_text.delta" => self.delta(
+                    "summary",
+                    value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .context("AI 公开摘要 delta 无效")?,
+                    on_event,
+                ),
+                "response.thinking_text.delta"
+                    if value.get("visibility").and_then(Value::as_str) == Some("public") =>
+                {
+                    self.delta(
+                        "thinking",
+                        value
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .context("AI 公开 thinking delta 无效")?,
+                        on_event,
+                    )
+                }
+                "response.completed" | "response.incomplete" | "response.failed" => {
+                    let response = value.get("response").context("AI SSE 终态缺少 response")?;
+                    ensure!(
+                        response.get("status").and_then(Value::as_str)
+                            == kind.strip_prefix("response."),
+                        "AI SSE 终态与 status 不一致"
+                    );
+                    self.final_response = Some(response.clone());
+                    return Ok(true);
+                }
+                "error" => {
+                    return Err(api_failure(
+                        "stream_error",
+                        None,
+                        value
+                            .get("message")
+                            .or_else(|| value.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("AI 流式响应失败"),
+                        true,
+                    ));
+                }
+                _ => {}
+            }
+        } else {
+            if value.get("error").is_some_and(|error| !error.is_null()) {
+                return Err(api_failure(
+                    "stream_error",
+                    None,
+                    value
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("AI 流式响应失败"),
+                    true,
+                ));
+            }
+            let choices = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .context("AI Chat SSE 缺少 choices")?;
+            ensure!(choices.len() <= 1, "AI Chat SSE 必须仅返回一个 choice");
+            if let Some(choice) = choices.first() {
+                let already_finished = self.finish_reason.is_some();
+                ensure!(
+                    choice
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|index| index == 0),
+                    "AI Chat SSE choice index 无效"
+                );
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    ensure!(self.finish_reason.is_none(), "AI Chat SSE 重复终态");
+                    self.finish_reason = Some(reason.into());
+                }
+                if let Some(delta) = choice.get("delta") {
+                    ensure!(
+                        !already_finished
+                            || delta.is_null()
+                            || delta.as_object().is_some_and(|object| object.is_empty()),
+                        "AI Chat SSE 在终态后修改回答或工具调用"
+                    );
+                    if let Some(role) = delta.get("role").and_then(Value::as_str) {
+                        ensure!(role == "assistant", "AI Chat SSE 角色无效");
+                        self.role_seen = true;
+                    }
+                    if let Some(content) = delta.get("content").filter(|content| !content.is_null())
+                    {
+                        let text = message_text(content)?;
+                        self.text.push_str(&text);
+                        self.delta("text", &text, on_event);
+                    }
+                    if let Some(summary) = delta.get("summary_text").and_then(Value::as_str) {
+                        self.summary.push_str(summary);
+                        self.delta("summary", summary, on_event);
+                    }
+                    if let Some(thinking) = delta.get("public_thinking").and_then(Value::as_str) {
+                        self.delta("thinking", thinking, on_event);
+                    }
+                    if self.public_reasoning_content {
+                        if let Some(thinking) =
+                            delta.get("reasoning_content").and_then(Value::as_str)
+                        {
+                            self.delta("thinking", thinking, on_event);
+                        }
+                    }
+                    ensure!(
+                        !delta
+                            .get("refusal")
+                            .is_some_and(|value| value.is_string()
+                                && !value.as_str().unwrap_or("").is_empty()),
+                        "模型拒绝本次请求"
+                    );
+                    if let Some(calls) = delta.get("tool_calls") {
+                        for call in calls.as_array().context("AI Chat SSE tool_calls 无效")? {
+                            let index = call
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .context("AI Chat SSE tool index 缺失")?
+                                as usize;
+                            ensure!(index < 128, "AI Chat SSE 工具数量超限");
+                            ensure!(
+                                call.get("type")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|kind| kind == "function"),
+                                "AI Chat SSE 工具类型无效"
+                            );
+                            let pending = self.calls.entry(index).or_default();
+                            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                                ensure!(
+                                    pending.id.is_empty() || pending.id == id,
+                                    "AI Chat SSE tool id 改变"
+                                );
+                                pending.id = id.into();
+                            }
+                            if let Some(function) = call.get("function") {
+                                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                                    pending.name.push_str(name);
+                                }
+                                if let Some(arguments) =
+                                    function.get("arguments").and_then(Value::as_str)
+                                {
+                                    pending.arguments.push_str(arguments);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+    fn finish(&self) -> Result<ModelTurn> {
+        if self.responses {
+            let value = self.final_response.clone().ok_or_else(|| {
+                api_failure(
+                    "incomplete_response",
+                    None,
+                    "AI Responses SSE 在终态之前断开；本轮未执行未完成的操作",
+                    true,
+                )
+            })?;
+            parse_responses(redact_value(value, &self.key))
+        } else {
+            ensure!(self.role_seen, "AI Chat SSE 缺少 assistant 角色");
+            let calls: Vec<_> = self
+                .calls
+                .values()
+                .map(|call| {
+                    json!({"id":call.id,"type":"function",
+                "function":{"name":call.name,"arguments":call.arguments}})
+                })
+                .collect();
+            let mut turn = parse_chat(redact_value(
+                json!({"id":self.response_id,"choices":[{"finish_reason":self.finish_reason,
+                "message":{"role":"assistant","content":self.text,"tool_calls":calls}}],"usage":self.usage}),
+                &self.key,
+            ))?;
+            if !self.summary.trim().is_empty() {
+                turn.summary.push(redact_string(&self.summary, &self.key));
+            }
+            Ok(turn)
+        }
     }
 }
 
@@ -809,6 +1524,7 @@ fn parse_responses(value: Value) -> Result<ModelTurn> {
         summary,
         usage,
         request_attempts: 1,
+        diagnostics: Value::Null,
     })
 }
 
@@ -893,12 +1609,54 @@ fn parse_chat(value: Value) -> Result<ModelTurn> {
             .filter(|value| value.is_object())
             .cloned(),
         request_attempts: 1,
+        diagnostics: Value::Null,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn published_chat_reasoning_requires_explicit_opt_in_and_never_enters_history() {
+        for enabled in [false, true] {
+            let mut state = StreamState::new(false, "test-secret");
+            state.public_reasoning_content = enabled;
+            let mut events = Vec::new();
+            state.event(SseEvent{name:String::new(),data:json!({"id":"r","choices":[{"index":0,"delta":{"role":"assistant","content":"答案","reasoning_content":"公开过程 test-secret"},"finish_reason":"stop"}]}).to_string()},&mut |event|events.push(event)).unwrap();
+            state.flush(&mut |event| events.push(event));
+            let thinking = events
+                .iter()
+                .filter_map(|event| {
+                    if let ModelStreamEvent::ThinkingDelta { delta } = event {
+                        Some(delta.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(thinking.contains("公开过程"), enabled);
+            assert!(!thinking.contains("test-secret"));
+            let turn = state.finish().unwrap();
+            assert!(!serde_json::to_string(&turn.items)
+                .unwrap()
+                .contains("公开过程"));
+        }
+    }
+    #[test]
+    fn sse_accepts_cr_only_split_crlf_and_initial_bom() {
+        for ending in ["\r", "\r\n", "\n"] {
+            let bytes=format!("\u{feff}:comment{ending}event: done{ending}data: 中文{ending}data: tail{ending}{ending}");
+            let mut decoder = SseDecoder::default();
+            let mut events = Vec::new();
+            for byte in bytes.as_bytes() {
+                events.extend(decoder.push(&[*byte]).unwrap());
+            }
+            events.extend(decoder.finish().unwrap());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].name, "done");
+            assert_eq!(events[0].data, "中文\ntail");
+        }
+    }
 
     #[test]
     fn public_summary_is_separate_from_private_reasoning() {
@@ -917,6 +1675,202 @@ mod tests {
         assert!(!serde_json::to_string(&chat.items)
             .unwrap()
             .contains("private"));
+    }
+
+    fn fixture_provider(address: std::net::SocketAddr, protocol: &str) -> Provider {
+        Provider::new(ConnectionConfig {
+            base_url: format!("http://{address}/v1"),
+            model: "fixture".into(),
+            protocol: protocol.into(),
+            request_timeout_secs: 5,
+            api_key: "test-only".into(),
+            public_reasoning_content: false,
+        })
+        .unwrap()
+    }
+    fn event(value: Value) -> String {
+        format!("data: {}\r\n\r\n", value)
+    }
+
+    #[test]
+    fn sse_decoder_supports_split_utf8_comments_crlf_and_multiline_data() {
+        let bytes=": keepalive\r\nevent: custom\r\ndata: {\"text\":\r\ndata: \"中文\"}\r\n\r\ndata: [DONE]\r\n\r\n".as_bytes();
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        for byte in bytes {
+            events.extend(decoder.push(&[*byte]).unwrap());
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].name, "custom");
+        assert_eq!(
+            serde_json::from_str::<Value>(&events[0].data).unwrap()["text"],
+            "中文"
+        );
+        assert_eq!(events[1].data, "[DONE]");
+    }
+
+    #[test]
+    fn streamed_redaction_hides_credentials_split_across_deltas() {
+        let mut redactor = DeltaRedactor::new("secret-value");
+        let mut emitted = String::new();
+        for part in ["公开 sec", "ret-", "value 正文"] {
+            emitted.push_str(&redactor.push(part));
+        }
+        emitted.push_str(&redactor.finish());
+        assert_eq!(emitted, "公开 [redacted] 正文");
+        assert!(!emitted.contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_emits_before_completion_and_only_terminal_calls_are_executable() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let observed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fixture_observed = observed.clone();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = read_request(&mut stream).await;
+            assert_eq!(body["stream"], true);
+            let first=[event(json!({"type":"response.created","response":{"id":"resp-fixture","status":"in_progress"}})),
+                event(json!({"type":"response.reasoning_summary_text.delta","delta":"先核对画面。"})),
+                event(json!({"type":"response.reasoning_text.delta","delta":"private-raw-reasoning"})),
+                event(json!({"type":"response.output_text.delta","delta":"公开回答"})),
+                event(json!({"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{\"x\":"}))].concat();
+            let last = event(
+                json!({"type":"response.completed","response":{"id":"resp-fixture","status":"completed","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8},"output":[
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"先核对画面。"}],"encrypted_content":"private-encrypted"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"公开回答"}]},
+                {"type":"function_call","call_id":"call-one","name":"input_tap","arguments":"{\"x\":2}","status":"completed"}]}}),
+            );
+            let headers=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-ID: request-fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",first.len()+last.len());
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(first.as_bytes()).await.unwrap();
+            // A buffered implementation cannot release this barrier.
+            tokio::time::timeout(Duration::from_secs(2), fixture_observed.notified())
+                .await
+                .expect("public delta must arrive before terminal response");
+            stream.write_all(last.as_bytes()).await.unwrap();
+        });
+        let provider = fixture_provider(address, "responses");
+        let mut events = Vec::new();
+        let turn = provider
+            .turn_stream(&[], &[], &AtomicBool::new(false), |event| {
+                if matches!(event, ModelStreamEvent::TextDelta { .. }) {
+                    observed.notify_one();
+                }
+                events.push(event);
+            })
+            .await
+            .unwrap();
+        fixture.await.unwrap();
+        assert_eq!(turn.calls.len(), 1);
+        assert_eq!(turn.calls[0].arguments["x"], 2);
+        assert_eq!(turn.text, "公开回答");
+        assert_eq!(turn.summary, ["先核对画面。"]);
+        assert_eq!(turn.diagnostics["request_id"], "request-fixture");
+        assert_eq!(turn.diagnostics["response_id"], "resp-fixture");
+        let public = serde_json::to_string(&events).unwrap();
+        assert!(public.contains("summary_delta"));
+        assert!(!public.contains("private-"));
+        assert_eq!(turn.usage.unwrap()["total_tokens"], 8);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_accumulates_tool_fragments_and_preserves_trailing_usage() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = read_request(&mut stream).await;
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            let data=[event(json!({"id":"chat-fixture","choices":[{"index":0,"delta":{"role":"assistant","content":"准备","reasoning_content":"private-raw","summary_text":"公开摘要"},"finish_reason":null}]})),
+                event(json!({"id":"chat-fixture","choices":[{"index":0,"delta":{"content":"操作","tool_calls":[{"index":0,"id":"call-one","type":"function","function":{"name":"input_","arguments":"{\"x\":"}}]},"finish_reason":null}]})),
+                event(json!({"id":"chat-fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"tap","arguments":"3}"}}]},"finish_reason":"tool_calls"}]})),
+                event(json!({"id":"chat-fixture","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+                "data: [DONE]\r\n\r\n".into()].concat();
+            let headers=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",data.len());
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            for part in data.as_bytes().chunks(7) {
+                stream.write_all(part).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut events = Vec::new();
+        let turn = fixture_provider(address, "chat_completions")
+            .turn_stream(&[], &[], &AtomicBool::new(false), |event| {
+                events.push(event)
+            })
+            .await
+            .unwrap();
+        fixture.await.unwrap();
+        assert_eq!(turn.text, "准备操作");
+        assert_eq!(turn.calls[0].name, "input_tap");
+        assert_eq!(turn.calls[0].arguments["x"], 3);
+        assert_eq!(turn.usage.unwrap()["total_tokens"], 15);
+        assert_eq!(turn.summary, ["公开摘要"]);
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("private-raw"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_sse_keeps_received_usage_and_request_diagnostics_without_partial_calls() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-ID: cancelled-fixture\r\nContent-Length: 10000\r\n\r\n").await.unwrap();
+            stream.write_all(event(json!({"id":"partial","choices":[{"index":0,"delta":{"role":"assistant","content":"公开进度","tool_calls":[{"index":0,"id":"call-one","type":"function","function":{"name":"input_tap","arguments":"{\"x\":"}}]},"finish_reason":null}],"usage":{"total_tokens":3}})).as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let cancel = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let provider = fixture_provider(address, "chat_completions");
+        let request = provider.turn_stream(&[], &[], &cancel, |event| events.push(event));
+        let trigger = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.store(true, Ordering::Release);
+        };
+        let (result, _) = tokio::join!(request, trigger);
+        let error = result.unwrap_err();
+        fixture.abort();
+        assert_eq!(error_details(&error)["request_id"], "cancelled-fixture");
+        assert_eq!(error_usage(&error).unwrap()["total_tokens"], 3);
+        assert!(error.to_string().contains("CANCELLED"));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::TextDelta { .. })));
+    }
+
+    #[tokio::test]
+    async fn incomplete_sse_reports_billed_usage_and_never_returns_calls() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let data = event(
+                json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+                "usage":{"input_tokens":2,"output_tokens":4,"total_tokens":6},"output":[{"type":"function_call","call_id":"partial","name":"input_tap","arguments":"{}"}]}}),
+            );
+            let headers=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Request-ID: incomplete-fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",data.len());
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(data.as_bytes()).await.unwrap();
+        });
+        let error = fixture_provider(address, "responses")
+            .turn_stream(&[], &[], &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap_err();
+        fixture.await.unwrap();
+        assert_eq!(error_details(&error)["code"], "output_limit");
+        assert_eq!(error_details(&error)["request_id"], "incomplete-fixture");
+        assert_eq!(error_usage(&error).unwrap()["total_tokens"], 6);
     }
 
     #[test]
@@ -1036,6 +1990,7 @@ mod tests {
                 protocol: "responses".into(),
                 request_timeout_secs: 5,
                 api_key: "test-only".into(),
+                public_reasoning_content: false,
             })
             .unwrap();
             let cancelled = AtomicBool::new(false);
@@ -1232,6 +2187,7 @@ mod tests {
                 protocol: protocol.into(),
                 request_timeout_secs: 5,
                 api_key: "test-only".into(),
+                public_reasoning_content: false,
             })
             .unwrap();
             let result = provider.probe(&AtomicBool::new(false)).await.unwrap();

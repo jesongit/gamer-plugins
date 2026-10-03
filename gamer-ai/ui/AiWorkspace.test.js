@@ -4,7 +4,7 @@ import { reactive } from 'vue'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 const mocks = vi.hoisted(() => ({ call: vi.fn() }))
 vi.mock('../../../web/src/api', () => ({ api: { callExtension: mocks.call } }))
-import AiWorkspace from './AiWorkspace.vue'
+import AiWorkspace from './GameSessionPane.vue'
 
 let saved, sessions, tokens, context, wrappers
 const button = (wrapper, label) => wrapper.findAll('button').find(item => item.text() === label)
@@ -27,7 +27,7 @@ beforeEach(() => {
     if (action === 'mcp.tokens.list') return { tokens: structuredClone(tokens) }
     if (action === 'settings.save') { saved = { ...values, version: 'v2', has_key: !!values.api_key || saved.has_key }; delete saved.api_key; return { ...saved } }
     if (action === 'connection.probe') return { ok: true, protocol: saved.protocol, model: saved.model, checks: [{ name: 'image_input', ok: true }] }
-    if (action === 'session.start') { sessions = [{ ...makeSession('starting', values.mode), ...values }]; return { session_id: 's1', run_id: 'r1' } }
+    if (action === 'session.start') { sessions = [{ ...makeSession('starting', values.mode), ...values }]; return { session_id: 's1', run_id: 'r1', conversation_id: 's1' } }
     if (action === 'session.pause') { sessions[0].state = 'pausing'; return {} }
     if (action === 'session.resume') { sessions[0].state = 'resuming'; if (values.limits) sessions[0].limits = values.limits; sessions[0].usage.consecutive_failures = 0; return {} }
     if (action === 'session.message') {
@@ -63,6 +63,7 @@ it('开始会话使用宿主设备与配置包，不从Android包名推导；提
     limits: { max_turns: 40, max_actions: 120, max_seconds: 600, max_tokens: 100000, max_failures: 3 },
   })
   expect(wrapper.get('[data-testid="session-state"]').text()).toBe('准备中')
+  expect(wrapper.emitted('session-start')[0][0]).toEqual({conversation_id:'s1'})
   context.currentPackageId = ''; await flushPromises()
   expect(wrapper.get('#ai-play form button[type="submit"]').element.disabled).toBe(true)
 })
@@ -168,12 +169,30 @@ it('协议选择不偷偷换端点，显式填入后保存；成功清空密钥�
   await button(wrapper, '保存并测试连接').trigger('click'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'settings.save', {
     expected_version: 'v1', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.3-flash',
-    protocol: 'chat_completions', request_timeout_secs: 60, api_key: 'draft-test-key',
+    protocol: 'chat_completions', request_timeout_secs: 60, public_reasoning_content: false, api_key: 'draft-test-key',
   })
   expect(wrapper.get('[aria-label="API 密钥"]').element.value).toBe('')
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'connection.probe', {})
   expect(wrapper.get('[aria-label="连接测试结果"]').text()).toContain('图片识别')
   expect(wrapper.text()).toContain('图片与工具闭环测试通过')
+})
+
+it('公开思考默认关闭，只在Chat协议显式开启并保存，切回Responses关闭', async () => {
+  const wrapper = await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-settings"]').trigger('click')
+  const toggle = wrapper.get('[aria-label="显示供应商公开思考"]')
+  expect(toggle.element.checked).toBe(false)
+  expect(toggle.element.disabled).toBe(true)
+  await wrapper.get('[aria-label="API 协议"]').setValue('chat_completions')
+  await toggle.setValue(true)
+  await wrapper.get('#ai-settings form').trigger('submit'); await flushPromises()
+  expect(mocks.call.mock.calls.find(call => call[1] === 'settings.save')[2].public_reasoning_content).toBe(true)
+  expect(toggle.element.checked).toBe(true)
+  await wrapper.get('[aria-label="API 协议"]').setValue('responses')
+  expect(toggle.element.checked).toBe(false)
+  expect(toggle.element.disabled).toBe(true)
+  await wrapper.get('#ai-settings form').trigger('submit'); await flushPromises()
+  expect(mocks.call.mock.calls.filter(call => call[1] === 'settings.save').at(-1)[2].public_reasoning_content).toBe(false)
 })
 
 it('保存失败保留密钥草稿，不声称保存成功', async () => {
@@ -203,12 +222,55 @@ it('外部MCP不要求API密钥，控制令牌需已建立同目标的外部会�
   await wrapper.get('#ai-mcp form').trigger('submit'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'mcp.tokens.create', {
     label: '', device_id: 'phone', content_package: 'default', control: true, ttl_seconds: 120,
+    memory_read:false,memory_write:false,protected_write:false,web_search:false,
   })
   expect(wrapper.get('[aria-label="新连接令牌"]').element.value).toBe('temporary-test-token')
   expect(wrapper.get('#ai-mcp pre').text()).toContain('Authorization')
   await button(wrapper, '撤销').trigger('click'); await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai', 'mcp.tokens.revoke', { token_id: 't1' })
   expect(wrapper.find('[aria-label="新连接令牌"]').exists()).toBe(false)
+})
+
+it('无设备MCP可单独授权本包记忆，保护字段要求维护权限，不创建或恢复设备会话', async () => {
+  context.deviceId=''
+  const wrapper=await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-mcp"]').trigger('click')
+  await wrapper.get('[aria-label="令牌设备绑定"]').setValue('none')
+  expect(button(wrapper,'创建连接令牌').element.disabled).toBe(true)
+  const check=label=>wrapper.findAll('label').find(item=>item.text().includes(label)).get('input[type="checkbox"]')
+  expect(check('明确允许修改人工保护字段').element.disabled).toBe(true)
+  await check('允许读取本配置包记忆').setValue(true)
+  await wrapper.get('#ai-mcp form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','mcp.tokens.create',{label:'',device_id:'',content_package:'default',control:false,ttl_seconds:120,memory_read:true,memory_write:false,protected_write:false,web_search:false})
+  await check('允许 AI 维护本配置包记忆').setValue(true)
+  await check('明确允许修改人工保护字段').setValue(true)
+  await check('允许 AI 维护本配置包记忆').setValue(false)
+  expect(check('明确允许修改人工保护字段').element.checked).toBe(false)
+  expect(mocks.call.mock.calls.some(call=>['session.start','session.resume'].includes(call[1]))).toBe(false)
+})
+
+it('记忆维护只自动补齐读取，取消读取收回维护及保护权限，保留独立联网选择', async () => {
+  context.deviceId=''
+  const wrapper=await mountWorkspace()
+  await wrapper.get('[aria-controls="ai-mcp"]').trigger('click')
+  await wrapper.get('[aria-label="令牌设备绑定"]').setValue('none')
+  const check=label=>wrapper.findAll('label').find(item=>item.text().includes(label)).get('input[type="checkbox"]')
+  await check('允许 AI 维护本配置包记忆').setValue(true)
+  expect(check('允许读取本配置包记忆').element.checked).toBe(true)
+  expect(check('明确允许修改人工保护字段').element.checked).toBe(false)
+  expect(check('允许使用已配置的独立联网服务').element.checked).toBe(false)
+  await check('明确允许修改人工保护字段').setValue(true)
+  await check('允许使用已配置的独立联网服务').setValue(true)
+  await check('允许读取本配置包记忆').setValue(false)
+  expect(check('允许 AI 维护本配置包记忆').element.checked).toBe(false)
+  expect(check('明确允许修改人工保护字段').element.checked).toBe(false)
+  expect(check('明确允许修改人工保护字段').element.disabled).toBe(true)
+  expect(check('允许使用已配置的独立联网服务').element.checked).toBe(true)
+  await wrapper.get('#ai-mcp form').trigger('submit');await flushPromises()
+  expect(mocks.call.mock.calls.find(call=>call[1]==='mcp.tokens.create')[2]).toMatchObject({device_id:'',control:false,memory_read:false,memory_write:false,protected_write:false,web_search:true})
+  await check('允许 AI 维护本配置包记忆').setValue(true)
+  await wrapper.get('#ai-mcp form').trigger('submit');await flushPromises()
+  expect(mocks.call.mock.calls.filter(call=>call[1]==='mcp.tokens.create').at(-1)[2]).toMatchObject({device_id:'',control:false,memory_read:true,memory_write:true,protected_write:false,web_search:true})
 })
 
 it('观察记录只展示真实data图片，事件详情去掉秘密及大块图片数据', async () => {

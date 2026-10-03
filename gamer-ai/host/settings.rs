@@ -1,4 +1,5 @@
 //! Account-scoped model credentials. None of this storage belongs to a Package.
+use super::services::{EmbeddingConfig, SearchConfig, ServiceConnection, WebReadConfig};
 use anyhow::{ensure, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ pub struct SettingsConfig {
     pub model: String,
     pub protocol: String,
     pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub public_reasoning_content: bool,
 }
 
 impl Default for SettingsConfig {
@@ -21,6 +24,7 @@ impl Default for SettingsConfig {
             model: "glm-5.3-flash".into(),
             protocol: "responses".into(),
             request_timeout_secs: 90,
+            public_reasoning_content: false,
         }
     }
 }
@@ -36,6 +40,53 @@ pub struct PrivateSettings {
     pub api_key: String,
     #[serde(default)]
     pub probe: Option<Value>,
+    #[serde(default)]
+    pub services: PrivateServices,
+}
+
+// Separate versions prevent an unrelated services edit from invalidating an
+// in-flight model probe or a model settings form. All credentials share one gate.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateServices {
+    pub version: Option<String>,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub embedding_api_key: String,
+    #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
+    pub search_api_key: String,
+    #[serde(default)]
+    pub web_read: WebReadConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServicesSaveRequest {
+    expected_version: Option<String>,
+    embedding: EmbeddingSave,
+    search: SearchSave,
+    web_read: WebReadConfig,
+}
+#[derive(Deserialize)]
+struct EmbeddingSave {
+    #[serde(flatten)]
+    config: EmbeddingConfig,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    clear_key: bool,
+}
+#[derive(Deserialize)]
+struct SearchSave {
+    #[serde(flatten)]
+    config: SearchConfig,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    clear_key: bool,
 }
 
 #[derive(Clone)]
@@ -45,6 +96,7 @@ pub struct ConnectionConfig {
     pub protocol: String,
     pub request_timeout_secs: u64,
     pub api_key: String,
+    pub public_reasoning_content: bool,
 }
 
 pub struct Settings {
@@ -64,6 +116,8 @@ struct SaveRequest {
     api_key: String,
     #[serde(default)]
     clear_key: bool,
+    #[serde(default)]
+    public_reasoning_content: bool,
 }
 
 impl Settings {
@@ -79,6 +133,127 @@ impl Settings {
         Ok(self.load()?.public())
     }
 
+    pub fn services_read(&self) -> Result<Value> {
+        let _guard = self.gate.lock();
+        Ok(self.load()?.services.public())
+    }
+
+    pub fn services_save(&self, values: Value) -> Result<Value> {
+        // serde(flatten) cannot safely combine deny_unknown_fields with a secret
+        // sibling. Check the public field set before deserializing instead.
+        for (section, fields) in [
+            (
+                "embedding",
+                &[
+                    "enabled",
+                    "provider",
+                    "protocol",
+                    "base_url",
+                    "endpoint",
+                    "model",
+                    "account_id",
+                    "request_timeout_secs",
+                    "max_input_bytes",
+                    "query_prefix",
+                    "document_prefix",
+                    "api_key",
+                    "clear_key",
+                ][..],
+            ),
+            (
+                "search",
+                &[
+                    "enabled",
+                    "provider",
+                    "protocol",
+                    "base_url",
+                    "endpoint",
+                    "request_timeout_secs",
+                    "max_results",
+                    "api_key",
+                    "clear_key",
+                ][..],
+            ),
+        ] {
+            let object = values
+                .get(section)
+                .and_then(Value::as_object)
+                .context("AI 服务配置字段无效")?;
+            ensure!(
+                object.keys().all(|key| fields.contains(&key.as_str())),
+                "AI 服务配置包含未知字段"
+            );
+        }
+        let mut request: ServicesSaveRequest =
+            serde_json::from_value(values).map_err(|_| anyhow::anyhow!("AI 服务配置字段无效"))?;
+        request.embedding.config.normalize()?;
+        request.search.config.normalize()?;
+        request.web_read.validate()?;
+        let _guard = self.gate.lock();
+        let mut settings = self.load()?;
+        ensure!(
+            settings.services.version == request.expected_version,
+            "version_conflict: AI 服务配置已变更，请刷新后保存"
+        );
+        let embedding_key = update_key(
+            if settings.services.embedding.provider == request.embedding.config.provider
+                && settings.services.embedding.protocol == request.embedding.config.protocol
+                && settings.services.embedding.base_url == request.embedding.config.base_url
+                && settings.services.embedding.endpoint == request.embedding.config.endpoint
+                && settings.services.embedding.account_id == request.embedding.config.account_id
+            {
+                &settings.services.embedding_api_key
+            } else {
+                ""
+            },
+            &request.embedding.api_key,
+            request.embedding.clear_key,
+        )?;
+        let search_key = update_key(
+            if settings.services.search.provider == request.search.config.provider
+                && settings.services.search.protocol == request.search.config.protocol
+                && settings.services.search.base_url == request.search.config.base_url
+                && settings.services.search.endpoint == request.search.config.endpoint
+            {
+                &settings.services.search_api_key
+            } else {
+                ""
+            },
+            &request.search.api_key,
+            request.search.clear_key,
+        )?;
+        // Validate the exact frozen connection without issuing any requests.
+        ServiceConnection::new(
+            request.embedding.config.clone(),
+            embedding_key.clone(),
+            request.search.config.clone(),
+            search_key.clone(),
+            request.web_read.clone(),
+        )?;
+        settings.services = PrivateServices {
+            version: Some(uuid::Uuid::new_v4().to_string()),
+            embedding: request.embedding.config,
+            embedding_api_key: embedding_key,
+            search: request.search.config,
+            search_api_key: search_key,
+            web_read: request.web_read,
+        };
+        self.persist(&settings)?;
+        Ok(settings.services.public())
+    }
+
+    pub fn service_connection(&self) -> Result<ServiceConnection> {
+        let _guard = self.gate.lock();
+        let services = self.load()?.services;
+        ServiceConnection::new(
+            services.embedding,
+            services.embedding_api_key,
+            services.search,
+            services.search_api_key,
+            services.web_read,
+        )
+    }
+
     pub fn save(&self, values: Value) -> Result<Value> {
         let request: SaveRequest =
             serde_json::from_value(values).map_err(|_| anyhow::anyhow!("AI 配置字段无效"))?;
@@ -87,6 +262,7 @@ impl Settings {
             model: request.model.trim().to_string(),
             protocol: request.protocol,
             request_timeout_secs: request.request_timeout_secs,
+            public_reasoning_content: request.public_reasoning_content,
         };
         validate_config(&config)?;
         ensure!(request.api_key.len() <= 4096, "AI 密钥过长");
@@ -108,8 +284,10 @@ impl Settings {
             String::new()
         } else if !request.api_key.trim().is_empty() {
             request.api_key.trim().to_string()
-        } else {
+        } else if same_origin(&settings.config.base_url, &config.base_url) {
             settings.api_key.clone()
+        } else {
+            String::new()
         };
         if settings.config != config || settings.api_key != key {
             settings.probe = None;
@@ -166,6 +344,7 @@ impl Settings {
             protocol: settings.config.protocol,
             request_timeout_secs: settings.config.request_timeout_secs,
             api_key: settings.api_key,
+            public_reasoning_content: settings.config.public_reasoning_content,
         })
     }
 
@@ -185,6 +364,10 @@ impl Settings {
 
     fn write(&self, settings: &mut PrivateSettings) -> Result<()> {
         settings.version = Some(uuid::Uuid::new_v4().to_string());
+        self.persist(settings)
+    }
+
+    fn persist(&self, settings: &PrivateSettings) -> Result<()> {
         let parent = self.path.parent().context("AI 配置路径无效")?;
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -203,6 +386,35 @@ impl Settings {
     }
 }
 
+impl PrivateServices {
+    fn public(&self) -> Value {
+        let mut embedding =
+            serde_json::to_value(&self.embedding).expect("serializable embedding config");
+        embedding["has_key"] = json!(!self.embedding_api_key.is_empty());
+        let mut search = serde_json::to_value(&self.search).expect("serializable search config");
+        search["has_key"] = json!(!self.search_api_key.is_empty());
+        json!({"version":self.version,"embedding":embedding,"search":search,"web_read":self.web_read})
+    }
+}
+
+fn update_key(current: &str, incoming: &str, clear: bool) -> Result<String> {
+    ensure!(
+        incoming.len() <= 4096 && !incoming.chars().any(char::is_control),
+        "AI 服务密钥无效"
+    );
+    ensure!(
+        !clear || incoming.trim().is_empty(),
+        "清除密钥时不能同时填写新密钥"
+    );
+    Ok(if clear {
+        String::new()
+    } else if incoming.trim().is_empty() {
+        current.to_string()
+    } else {
+        incoming.trim().to_string()
+    })
+}
+
 impl PrivateSettings {
     fn public(&self) -> Value {
         json!({
@@ -211,10 +423,17 @@ impl PrivateSettings {
             "model": self.config.model,
             "protocol": self.config.protocol,
             "request_timeout_secs": self.config.request_timeout_secs,
+            "public_reasoning_content": self.config.public_reasoning_content,
             "has_key": !self.api_key.is_empty(),
             "probe": self.probe,
         })
     }
+}
+fn same_origin(left: &str, right: &str) -> bool {
+    reqwest::Url::parse(left)
+        .ok()
+        .zip(reqwest::Url::parse(right).ok())
+        .is_some_and(|(left, right)| left.origin() == right.origin())
 }
 
 fn normalize_base_url(input: &str) -> Result<String> {
@@ -274,6 +493,36 @@ mod tests {
             "model":"test-vision","protocol":"responses","request_timeout_secs":30,
             "api_key":key})
     }
+    #[test]
+    fn new_service_endpoint_clears_only_its_credential_and_model_same_origin_keeps_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings::new(directory.path().join("config.json"));
+        let model = settings
+            .save(request(Value::Null, "model-test-only"))
+            .unwrap();
+        let services = settings
+            .services_save(service_request(Value::Null))
+            .unwrap();
+        let mut changed = service_request(services["version"].clone());
+        changed["embedding"]["endpoint"] = json!("https://different.example/embeddings");
+        changed["embedding"]["api_key"] = json!("");
+        changed["search"]["api_key"] = json!("");
+        let saved = settings.services_save(changed).unwrap();
+        assert_eq!(saved["embedding"]["has_key"], false);
+        assert_eq!(saved["search"]["has_key"], true);
+        let mut model_changed = request(model["version"].clone(), "");
+        model_changed["base_url"] = json!("https://example.com/other");
+        model_changed["protocol"] = json!("chat_completions");
+        model_changed["public_reasoning_content"] = json!(true);
+        let saved = settings.save(model_changed).unwrap();
+        assert_eq!(saved["has_key"], true);
+        assert_eq!(saved["public_reasoning_content"], true);
+        let mut crossed = request(saved["version"].clone(), "");
+        crossed["base_url"] = json!("https://other.example/v1");
+        let crossed = settings.save(crossed).unwrap();
+        assert_eq!(crossed["has_key"], false);
+        assert_eq!(settings.services_read().unwrap()["search"]["has_key"], true);
+    }
 
     #[test]
     fn credentials_stay_private_and_stale_updates_are_rejected() {
@@ -328,5 +577,76 @@ mod tests {
         assert!(normalize_base_url("http://example.com/v1").is_err());
         assert!(normalize_base_url("http://127.0.0.1:1234/v1").is_ok());
         assert!(normalize_base_url("http://[::1]:1234/v1").is_ok());
+    }
+
+    fn service_request(version: Value) -> Value {
+        json!({"expected_version":version,
+            "embedding":{"enabled":true,"provider":"my-embedding","protocol":"openai_embeddings",
+                "endpoint":"https://example.com/custom-embeddings","model":"my-model","api_key":"embedding-test-only"},
+            "search":{"enabled":true,"provider":"my-search","protocol":"custom",
+                "endpoint":"https://example.com/custom-search","api_key":"search-test-only"},
+            "web_read":{"enabled":false}})
+    }
+
+    #[test]
+    fn independent_services_versions_and_keys_preserve_existing_private_model_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        // Simulate the exact previous protected file layout, without services.
+        let original = json!({"version":"legacy-model-version","config":{"base_url":"https://example.com/v1",
+            "model":"test","protocol":"responses","request_timeout_secs":30},"api_key":"model-test-only","probe":{"ok":true}});
+        std::fs::write(
+            &path,
+            crate::core::secrets::protect(&serde_json::to_vec(&original).unwrap(), true).unwrap(),
+        )
+        .unwrap();
+        let settings = Settings::new(path);
+        assert_eq!(
+            settings.services_read().unwrap()["embedding"]["enabled"],
+            false
+        );
+        let services = settings
+            .services_save(service_request(Value::Null))
+            .unwrap();
+        assert!(!services.to_string().contains("test-only"));
+        assert_eq!(services["embedding"]["has_key"], true);
+        assert_eq!(services["search"]["has_key"], true);
+        assert_eq!(settings.read().unwrap()["version"], "legacy-model-version");
+        assert_eq!(settings.read().unwrap()["probe"]["ok"], true);
+        assert_eq!(settings.connection().unwrap().api_key, "model-test-only");
+        assert!(settings
+            .services_save(service_request(Value::Null))
+            .is_err());
+        let model = settings
+            .save(request(json!("legacy-model-version"), ""))
+            .unwrap();
+        assert_eq!(
+            settings.services_read().unwrap()["version"],
+            services["version"]
+        );
+        let mut next = service_request(services["version"].clone());
+        next["embedding"]["api_key"] = json!("");
+        next["search"]["api_key"] = json!("");
+        next["search"]["clear_key"] = json!(true);
+        let saved = settings.services_save(next).unwrap();
+        assert_eq!(saved["embedding"]["has_key"], true);
+        assert_eq!(saved["search"]["has_key"], false);
+        assert_eq!(settings.read().unwrap()["version"], model["version"]);
+        assert!(settings.service_connection().unwrap().embedding_enabled());
+    }
+
+    #[test]
+    fn service_save_rejects_unknown_fields_secret_urls_and_clear_with_new_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings::new(directory.path().join("config.json"));
+        let mut request = service_request(Value::Null);
+        request["embedding"]["api_keey"] = json!("would-have-been-lost");
+        assert!(settings.services_save(request).is_err());
+        let mut request = service_request(Value::Null);
+        request["embedding"]["clear_key"] = json!(true);
+        assert!(settings.services_save(request).is_err());
+        let mut request = service_request(Value::Null);
+        request["search"]["endpoint"] = json!("https://example.com/search?api_key=hidden");
+        assert!(settings.services_save(request).is_err());
     }
 }

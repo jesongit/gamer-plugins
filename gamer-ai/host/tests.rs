@@ -5,6 +5,49 @@ use crate::{
 };
 use std::io::Write;
 
+#[tokio::test]
+async fn memory_mcp_scopes_work_without_device_and_do_not_escalate_old_tokens() {
+    let (_root, ai, _extensions) = fixture().await;
+    let read = ai
+        .state
+        .create_token(json!({"content_package":"default","memory_read":true}))
+        .unwrap();
+    let secret = read["token"].as_str().unwrap();
+    let listed = ai
+        .state
+        .mcp(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            secret,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"memory_search"));
+    assert!(!names.contains(&"memory_create"));
+    assert!(!names.contains(&"input_tap"));
+    let denied=ai.state.mcp(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_create","arguments":{"title":"攻略","body":"一步","operation_id":"bad"}}}),secret).await.unwrap().unwrap();
+    assert_eq!(denied["result"]["isError"], true);
+    let write = ai
+        .state
+        .create_token(json!({"content_package":"default","memory_read":true,"memory_write":true}))
+        .unwrap();
+    let saved=ai.state.mcp(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_create","arguments":{"title":"可靠步骤","body":"准备材料后点击合成","operation_id":"saved","validation":"verified"}}}),write["token"].as_str().unwrap()).await.unwrap().unwrap();
+    assert_ne!(saved["result"]["isError"], true);
+    let fake=ai.state.mcp(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_create","arguments":{"title":"坏","body":"步骤","operation_id":"fake","human":true}}}),write["token"].as_str().unwrap()).await.unwrap().unwrap();
+    assert_eq!(fake["result"]["isError"], true);
+    let old:Token=serde_json::from_value(json!({"token_id":"old","hash":"hash","label":"old","device_id":"phone","content_package":"default","control":true,"ttl_seconds":120,"expires_at":9_999_999_999_i64})).unwrap();
+    assert!(!old.memory_read && !old.memory_write && !old.protected_write && !old.web_search);
+    ai.state.runtime.packages.delete_package("default").unwrap();
+    assert!(ai.state.token(secret).is_err());
+    ai.state.stop_all().await;
+}
+
 struct NoExecutor;
 impl RunExecutor for NoExecutor {
     fn prepare<'a>(&'a self, _: &'a RunContext, _: &'a RunRequest) -> BoxFuture<'a, Result<()>> {
@@ -23,7 +66,7 @@ impl RunExecutor for NoExecutor {
         unreachable!()
     }
 }
-async fn fixture() -> (tempfile::TempDir, Arc<AiService>, Arc<ExtensionService>) {
+pub(super) async fn fixture() -> (tempfile::TempDir, Arc<AiService>, Arc<ExtensionService>) {
     let root = tempfile::tempdir().unwrap();
     let cfg = crate::config::Config {
         data_dir: root.path().into(),
@@ -102,6 +145,96 @@ fn record() -> SessionRecord {
         events: vec![],
     }
 }
+#[test]
+fn the_last_admitted_model_round_can_execute_tools_but_not_exceed_action_budget() {
+    let mut r = record();
+    r.limits.max_turns = 1;
+    r.usage.turns = 1;
+    assert_eq!(budget_reason(&r).unwrap().code, "budget_turns");
+    assert!(tool_budget_reason(&r).is_none());
+    r.limits.max_actions = 1;
+    r.usage.actions = 1;
+    assert_eq!(tool_budget_reason(&r).unwrap().code, "budget_actions");
+}
+#[test]
+fn automatic_experience_sources_exclude_pixels_typed_text_and_memory_recursion() {
+    let mut r = record();
+    assert!(game_experience_source(&r).is_none());
+    r.messages.push(UserMessage::new(
+        "先领取奖励\nAPI_KEY=private-key\n密码是123",
+    ));
+    r.events.push(Event{seq:1,at:String::new(),kind:"tool".into(),message:String::new(),data:json!({"phase":"result","tool":"input_text","ok":true,"arguments":{"text":"private typed text"},"image_data_url":"data:image/png;base64,AAAA"})});
+    r.events.push(Event{seq:2,at:String::new(),kind:"tool".into(),message:String::new(),data:json!({"phase":"result","tool":"memory_get","ok":true,"result":{"body":"existing-memory-content"}})});
+    let source = game_experience_source(&r).unwrap();
+    assert!(source.contains("领取奖励") && source.contains("不代表目标成功"));
+    for excluded in [
+        "private-key",
+        "123",
+        "private typed text",
+        "data:image",
+        "existing-memory-content",
+    ] {
+        assert!(!source.contains(excluded));
+    }
+}
+#[tokio::test]
+async fn automatic_experience_import_is_durable_and_idempotent() {
+    let (_root, ai, _extensions) = fixture().await;
+    let mut r = record();
+    r.state = "finished".into();
+    r.events.push(Event {
+        seq: 1,
+        at: String::new(),
+        kind: "tool".into(),
+        message: String::new(),
+        data: json!({"phase":"result","tool":"input_tap","ok":true}),
+    });
+    let session = session_record(r, None);
+    ai.state.stage_game_experience(&session).await.unwrap();
+    ai.state.stage_game_experience(&session).await.unwrap();
+    assert_eq!(ai.state.memory.pending_imports("default").unwrap().len(), 1);
+    ai.state.stop_all().await;
+}
+#[tokio::test]
+async fn plugin_stop_cancels_and_drains_external_knowledge_requests() {
+    let (_root, ai, _extensions) = fixture().await;
+    let request = ExternalRequest {
+        id: "pending-mcp".into(),
+        state: Arc::downgrade(&ai.state),
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    ai.state
+        .external_requests
+        .lock()
+        .insert(request.id.clone(), request.cancel.clone());
+    let state = ai.state.clone();
+    let stopping = tokio::spawn(async move {
+        state.stop_all().await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !request.cancel.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!stopping.is_finished());
+    drop(request);
+    tokio::time::timeout(Duration::from_secs(2), stopping)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ai.state.external_requests.lock().is_empty());
+}
+#[test]
+fn public_web_receipts_keep_source_locations_without_search_text_or_url_credentials() {
+    let result=mcp::ToolResult::json(json!({"results":[{"title":"temporary title","snippet":"temporary snippet","url":"https://user:password@example.test/guide?api_key=secret#part"}]})).value();
+    let public = web_receipt_metadata(&result);
+    assert_eq!(public["source_urls"][0], "https://example.test/guide");
+    for hidden in ["temporary", "password", "api_key", "secret", "#part"] {
+        assert!(!public.to_string().contains(hidden));
+    }
+}
 fn unlimited_limits() -> Limits {
     Limits {
         max_turns: 0,
@@ -125,6 +258,9 @@ fn session_record(record: SessionRecord, lease: Option<ControlLease>) -> Arc<Ses
         frame: Mutex::new(None),
         binding: Mutex::new(None),
         results: Mutex::new(BTreeMap::new()),
+        package_activity: Mutex::new(None),
+        journal: None,
+        web_search: false,
     })
 }
 async fn controlled_session(ai: &AiService) -> Arc<Session> {
@@ -141,6 +277,61 @@ async fn controlled_session(ai: &AiService) -> Arc<Session> {
     let session = session_record(r, Some(lease));
     ai.state.sessions.lock().insert("s".into(), session.clone());
     session
+}
+#[tokio::test]
+async fn explicit_game_messages_respect_readonly_conversations_and_keep_their_own_receipts() {
+    let (_root, ai, _extensions) = fixture().await;
+    let session = controlled_session(&ai).await;
+    ai.state.pause(&session, "test pause".into()).await.unwrap();
+    ai.state
+        .conversations
+        .register_game(&session.record.lock())
+        .unwrap();
+    ai.state
+        .conversations
+        .ensure_external("mcp:readonly", "default", "MCP")
+        .unwrap();
+    let before = session.record.lock().messages.len();
+    let denied = ai.dispatch("conversation.message", json!({"conversation_id":"mcp:readonly","game_session_id":"s","message":"should not be admitted","resume":false})).await.unwrap_err();
+    assert!(denied.to_string().contains("MCP"));
+    let archived = ai
+        .state
+        .conversations
+        .create("default", "archived")
+        .unwrap();
+    let archived_id = archived["conversation"]["conversation_id"]
+        .as_str()
+        .unwrap();
+    ai.state
+        .conversations
+        .event(
+            archived_id,
+            "state",
+            "deleted",
+            json!({"state":"package_deleted"}),
+        )
+        .unwrap();
+    assert!(ai.dispatch("conversation.message", json!({"conversation_id":archived_id,"game_session_id":"s","message":"should not be admitted","resume":false})).await.unwrap_err().to_string().contains("配置包已删除"));
+    assert_eq!(session.record.lock().messages.len(), before);
+    let chat = ai
+        .state
+        .conversations
+        .create("default", "guidance")
+        .unwrap();
+    let chat_id = chat["conversation"]["conversation_id"].as_str().unwrap();
+    let (first, second) = tokio::join!(
+        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"先领取奖励","resume":false})),
+        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"然后检查背包","resume":false}))
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first["message"]["id"], second["message"]["id"]);
+    assert_eq!(first["message"]["id"], first["game"]["message"]["id"]);
+    assert_eq!(second["message"]["id"], second["game"]["message"]["id"]);
+    assert_eq!(first["game"]["message"]["text"], "先领取奖励");
+    assert_eq!(second["game"]["message"]["text"], "然后检查背包");
+    assert_eq!(session.record.lock().state, "paused");
+    ai.state.stop_all().await;
 }
 async fn controlled_browser_session(ai: &AiService) -> Arc<Session> {
     let target = crate::browser::BrowserTarget {
@@ -933,6 +1124,9 @@ async fn lifecycle_stop_cancels_all_targets_before_waiting_for_one_release() {
             frame: Mutex::new(None),
             binding: Mutex::new(None),
             results: Mutex::new(BTreeMap::new()),
+            package_activity: Mutex::new(None),
+            journal: None,
+            web_search: false,
         });
         ai.state.sessions.lock().insert(id.into(), session.clone());
         created.push(session);

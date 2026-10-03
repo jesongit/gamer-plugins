@@ -147,7 +147,7 @@ pub fn initialize_result(requested_version: &str) -> Value {
     };
     json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},
         "serverInfo":{"name":"gamer-ai","version":plugin_version},
-        "instructions":"Observe with screen_capture before input. Input requires the user's active MCP control session. A paused session cannot be resumed by tools."})
+        "instructions":"This token scopes tools to one Package. Memory read/write and protected maintenance are separate from device control. Use expected_version and durable operation_id for memory changes; client-supplied human identity, SQL and filesystem paths are rejected. Observe with screen_capture before input. Input requires the user's active MCP control session with session_id, generation and frame_id. A paused session cannot be resumed by tools. This server records received tool calls, not the external client's private reasoning or full conversation."})
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
