@@ -1263,6 +1263,11 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
     let stall = Arc::new(AtomicBool::new(false));
     let stall_copy = stall.clone();
     let app=Router::new().route("/",get(||async {Html("<!doctype html><style>body{margin:0;background:#123456}button{position:absolute;left:20px;top:20px;width:120px;height:60px}</style><button onclick='document.body.style.background=\"#abcdef\";window.clicks=(window.clicks||0)+1'>Play</button>")})).route("/responses",post(move|Json(body):Json<Value>|{let turn=turn_copy.clone();let stall=stall_copy.clone();async move {
+        // Paused gameplay now archives receipts using the same model endpoint.
+        // That text-only request must not consume a gameplay turn or require an image.
+        if body["tools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["name"]=="memory_import_finish")) {
+            return Json(json!({"status":"completed","output":[{"type":"function_call","id":"archive-fixture","call_id":"archive-fixture","name":"memory_import_finish","arguments":json!({"disposition":"skipped","reason":"合成浏览器测试页面不提供可复用的真实游戏攻略"}).to_string()}],"usage":{"total_tokens":2}}));
+        }
         if stall.load(Ordering::Acquire) {tokio::time::sleep(Duration::from_secs(20)).await;}
         let index=turn.fetch_add(1,Ordering::SeqCst);let history=body["input"].to_string();assert!(history.contains("input_image"),"model must receive real image input");
         fn find_frame(value:&Value)->Option<String>{match value {Value::Object(object)=>{if let Some(id)=object.get("frame_id").and_then(Value::as_str){return Some(id.into());}object.values().rev().find_map(find_frame)},Value::Array(values)=>values.iter().rev().find_map(find_frame),Value::String(s)=>serde_json::from_str::<Value>(s).ok().and_then(|v|find_frame(&v)),_=>None}}
