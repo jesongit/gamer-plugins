@@ -1,7 +1,7 @@
 export const ACTIVE_STATES = new Set(['starting', 'running', 'pausing', 'paused', 'resuming', 'stopping'])
 export const STATE_LABELS = {
   starting: '准备中', running: 'AI 控制中', pausing: '正在暂停', paused: '已暂停 · 可人工操作',
-  resuming: '正在恢复', stopping: '正在停止', finished: '已结束', failed: '失败', cancelled: '已停止',
+  resuming: '正在恢复', stopping: '正在停止', finished: '已结束', failed: '失败', cancelled: '已停止', budget: '预算已用尽',
 }
 export function isActive(session) { return !!session && ACTIVE_STATES.has(session.state) }
 export function stateLabel(state) { return STATE_LABELS[state] || state || '未开始' }

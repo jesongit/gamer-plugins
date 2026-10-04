@@ -98,7 +98,7 @@ export function conversationTurns(events) {
       if (event.kind === 'tool_end') value.status = data.ok === false || data.result?.isError ? 'failed' : 'complete'
       value.image = toolImage(data);value.receipt=toolReceipt(data.result)
     } else if (event.kind === 'state') {
-      const terminal = ['idle', 'cancelled', 'error', 'finished', 'interrupted', 'stopped', 'failed'].includes(data.state) || group.game && data.state === 'paused'
+      const terminal = ['idle', 'cancelled', 'error', 'finished', 'interrupted', 'stopped', 'failed', 'budget'].includes(data.state) || group.game && data.state === 'paused'
       const settled = terminal && group.game ? turns.filter(value => value.game && value.gameSession === group.gameSession && value.generation <= group.generation) : terminal ? [group] : []
       for (const completed of settled) {
         completed.completed = true
@@ -106,7 +106,7 @@ export function conversationTurns(events) {
           if (value.status === 'streaming') value.status = ['idle','finished'].includes(data.state) && value.kind === 'thinking' ? 'complete' : 'interrupted'
         }
       }
-      if (['cancelled', 'error', 'paused'].includes(data.state)) group.notices.push({ ...event, id: `state:${event.seq}`, text: data.detail || event.message })
+      if (['cancelled', 'error', 'paused', 'budget'].includes(data.state)) group.notices.push({ ...event, id: `state:${event.seq}`, text: data.detail || event.message })
     } else if (event.kind === 'memory_job' || event.kind === 'memory_staged') {
       const id = `${event.kind}:${data.job_id || data.memory?.id || data.memory_id || event.seq}`
       const previous = memoryProgress.get(id)

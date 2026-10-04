@@ -36,6 +36,12 @@ it('取消保留已展示前缀并标记中断，不伪造最终结果', () => {
   expect(turn.answers[0]).toMatchObject({text:'已观察到',status:'interrupted'})
   expect(turn.notices[0].text).toBe('用户取消')
 })
+it('预算中断结算本轮、保留公开前缀并展示具体原因', () => {
+  const turn=conversationTurns([event(1,'user',{turn_id:'t',message_id:'u'},'继续查攻略'),event(2,'assistant_delta',{turn_id:'t',message_id:'a',channel:'thinking',delta:'先核实步骤'}),event(3,'state',{turn_id:'t',state:'budget',limits:{max_turns:2},usage:{turns:2}},'已达到模型轮次预算，可调整预算或配0后继续')])[0]
+  expect(turn.completed).toBe(true)
+  expect(turn.process[0]).toMatchObject({text:'先核实步骤',status:'interrupted'})
+  expect(turn.notices[0]).toMatchObject({text:'已达到模型轮次预算，可调整预算或配0后继续',data:{state:'budget',usage:{turns:2}}})
+})
 it('queued无turn_id时，纳入收据按message_id关联且保持原提交顺序',()=>{
  const turns=conversationTurns([event(1,'user',{message_id:'first',status:'queued'},'第一条'),event(2,'user',{message_id:'second',status:'queued'},'第二条'),event(3,'user_status',{message_id:'first',turn_id:'processing',status:'incorporated'}),event(4,'assistant_final',{message_id:'answer',turn_id:'processing',text:'第一条答复',summary:['公开摘要']})])
  expect(turns.map(turn=>turn.users[0].text)).toEqual(['第一条','第二条'])
