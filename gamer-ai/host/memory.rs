@@ -1232,5 +1232,6 @@ fn public_memory(m: &Memory) -> Value {
     v
 }
 fn summary(m: &Memory, version: &str) -> Value {
-    json!({"id":m.id,"title":m.title,"summary":m.body.chars().take(220).collect::<String>(),"kind":m.kind,"tags":m.tags,"applicability":m.applicability,"game_version":m.game_version,"validation":m.validation,"status":m.status,"revision":m.revision,"version":version,"sources":m.sources,"protected_fields":m.protected_fields,"updated_at":m.updated_at})
+    let (sources, sources_truncated) = index::source_summaries(&m.sources);
+    json!({"id":m.id,"title":m.title,"summary":m.body.chars().take(220).collect::<String>(),"kind":m.kind,"tags":m.tags,"applicability":m.applicability,"game_version":m.game_version,"validation":m.validation,"status":m.status,"revision":m.revision,"version":version,"sources":sources,"source_count":m.sources.len(),"sources_truncated":sources_truncated,"source_details_reference":{"id":m.id,"revision":m.revision},"protected_fields":m.protected_fields,"updated_at":m.updated_at})
 }

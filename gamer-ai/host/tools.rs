@@ -224,9 +224,9 @@ pub(super) fn knowledge_catalog(
     services: &super::services::ServiceConnection,
 ) -> Vec<Value> {
     let mut result = vec![
-        tool("memory_search", "按需检索当前配置包攻略，返回来源/适用版本，RRF分数仅是排序。导入查重可validation:any。", json!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":30},"game_version":{"type":"string"},"mode":{"type":"string","enum":["hybrid","keyword","vector"]},"validation":{"type":"string","enum":["verified","pending","invalid","any"]},"kind":{"type":"string","enum":["definition","pitfall","procedure"]},"protected_only":{"type":"boolean"},"include_inactive":{"type":"boolean"}}), &["query"], false),
+        tool("memory_search", "按需检索当前配置包攻略，默认只检索verified且来源无需复核的记忆；空结果不表示记忆库没有相关记录。查重、纠错或回顾未验证经历必须显式validation:any，再按effective_validation判断依据，不把pending/invalid当成功攻略。返回片段与有界出处预览，RRF分数仅是排序；完整来源使用source_details_reference调用memory_get，原稿按来源id/revision调用memory_source_get，不把截短预览复制成完整sources修改。", json!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":30},"game_version":{"type":"string"},"mode":{"type":"string","enum":["hybrid","keyword","vector"]},"validation":{"type":"string","enum":["verified","pending","invalid","any"]},"kind":{"type":"string","enum":["definition","pitfall","procedure"]},"protected_only":{"type":"boolean"},"include_inactive":{"type":"boolean"}}), &["query"], false),
         tool("memory_get", "读取完整记忆与当前version，编辑前必须读取",json!({"id":{"type":"string"},"revision":{"type":"integer"}}), &["id"],false),
-        tool("memory_list", "列出当前配置包记忆，可按状态、验证状态、种类和用户保护字段筛选",json!({"status":{"type":"string"},"validation":{"type":"string","enum":["verified","pending","invalid","any"]},"kind":{"type":"string","enum":["definition","pitfall","procedure","any"]},"protected_only":{"type":"boolean"},"limit":{"type":"integer"},"offset":{"type":"integer"}}),&[],false),
+        tool("memory_list", "列出当前配置包记忆，可按状态、验证状态、种类和用户保护字段筛选；出处仅为有界预览，完整来源使用source_details_reference调用memory_get，编辑前读取完整记忆",json!({"status":{"type":"string"},"validation":{"type":"string","enum":["verified","pending","invalid","any"]},"kind":{"type":"string","enum":["definition","pitfall","procedure","any"]},"protected_only":{"type":"boolean"},"limit":{"type":"integer"},"offset":{"type":"integer"}}),&[],false),
         tool("memory_history", "查看记忆修订、修改原因与正文差异",json!({"id":{"type":"string"},"limit":{"type":"integer"}}),&["id"],false),
         tool("memory_source_get", "读取攻略原稿与来源信息，可读取指定历史revision",json!({"id":{"type":"string"},"revision":{"type":"integer","minimum":1}}),&["id"],false),
         tool("memory_index_status", "查看关键词/语义索引状态和降级原因",json!({}),&[],false),
@@ -241,7 +241,7 @@ pub(super) fn knowledge_catalog(
         patch_fields.as_object_mut().unwrap().remove("reason");
         patch_fields["status"] =
             json!({"type":"string","enum":["active","disabled","deleted","merged"]});
-        result.push(tool("memory_update","按当前expected_version修改记忆。冲突重新读取；不能force，不得擅改用户保护字段。",json!({"id":{"type":"string"},"expected_version":{"type":"string"},"operation_id":{"type":"string"},"reason":{"type":"string"},"patch":{"type":"object","properties":patch_fields,"additionalProperties":false}}),&["id","expected_version","operation_id","reason","patch"],false));
+        result.push(tool("memory_update","按当前expected_version修改记忆。reason只放顶层，patch仅包含需修改的记忆字段，不能把reason/id/expected_version/operation_id放入patch。冲突重新读取；不能force，不得擅改用户保护字段；sources预览不完整，修改来源前必须memory_get读取原文。",json!({"id":{"type":"string"},"expected_version":{"type":"string"},"operation_id":{"type":"string"},"reason":{"type":"string"},"patch":{"type":"object","properties":patch_fields,"additionalProperties":false}}),&["id","expected_version","operation_id","reason","patch"],false));
         for (name, desc, extra) in [
             (
                 "memory_set_status",

@@ -1403,7 +1403,15 @@ fn tool_output(output: &Value, call_id: &str) -> Result<(String, Vec<Value>)> {
         );
     }
     if let Some(structured) = output.get("structuredContent") {
-        text.push(structured.to_string());
+        // MCP commonly includes the same JSON in content.text and
+        // structuredContent. Send that payload once, while preserving any
+        // distinct explanation, error notice and observation images.
+        if !text
+            .iter()
+            .any(|part| serde_json::from_str::<Value>(part).is_ok_and(|value| value == *structured))
+        {
+            text.push(structured.to_string());
+        }
     }
     if !images.is_empty() {
         images.insert(0, json!({"type":"input_text",
@@ -2383,6 +2391,30 @@ mod tests {
         assert!(details["detail"].as_str().unwrap().contains("[redacted]"));
     }
 
+    #[test]
+    fn duplicate_structured_tool_json_is_sent_once_without_losing_text_images_or_errors() {
+        let metadata =
+            json!({"frame_id":"frame-7","items":[{"id":"remembered-guide","excerpt":"短攻略"}]});
+        let output = json!({"content":[
+            {"type":"text","text":serde_json::to_string_pretty(&metadata).unwrap()},
+            {"type":"text","text":"额外说明：请核对新画面"},
+            {"type":"image","mimeType":"image/png","data":"AQID"}
+        ],"structuredContent":metadata,"isError":true});
+        let (text, images) = tool_output(&output, "call-7").unwrap();
+        assert_eq!(text.matches("remembered-guide").count(), 1);
+        assert!(text.contains("额外说明：请核对新画面"));
+        assert!(text.starts_with("Tool execution failed"));
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[1]["type"], "input_image");
+        assert_eq!(images[1]["image_url"], "data:image/png;base64,AQID");
+        let different = json!({"content":[{"type":"text","text":"{\"id\":\"first-payload\"}"}],"structuredContent":{"id":"second-payload"}});
+        let (text, images) = tool_output(&different, "different").unwrap();
+        assert!(text.contains("first-payload") && text.contains("second-payload"));
+        assert!(images.is_empty());
+        let plain = json!({"content":[{"type":"text","text":"纯文本说明"}],"structuredContent":{"id":"structured-only"}});
+        let (text, _) = tool_output(&plain, "plain").unwrap();
+        assert!(text.contains("纯文本说明") && text.contains("structured-only"));
+    }
     #[test]
     fn tool_images_are_real_visual_input_in_both_protocols() {
         let history = vec![

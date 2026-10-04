@@ -126,6 +126,71 @@ fn utf8_prefix(text: &str, max: usize) -> &str {
     }
     &text[..end]
 }
+pub(super) fn source_summaries(sources: &[Value]) -> (Vec<Value>, bool) {
+    const MAX_SOURCES: usize = 8;
+    const MAX_BYTES: usize = 4096;
+    let mut summaries = Vec::new();
+    let mut bytes = 2usize; // JSON array delimiters.
+    let mut truncated = sources.len() > MAX_SOURCES;
+    for (position, source) in sources.iter().take(MAX_SOURCES).enumerate() {
+        let mut summary = serde_json::Map::new();
+        let mut shortened = false;
+        if let Some(fields) = source.as_object() {
+            for (key, value) in fields {
+                let limit = match key.as_str() {
+                    "id" | "source_id" | "conversation_id" | "message_id" | "session_id"
+                    | "source_session_id" | "run_id" | "chunk_id" => 256,
+                    "section" | "filename" => 512,
+                    "url" | "source_url" => 1024,
+                    "type" => 128,
+                    "title" | "excerpt" => 384,
+                    "revision" | "source_revision" | "line" | "page" => {
+                        if value.as_u64().is_some() {
+                            summary.insert(key.clone(), value.clone());
+                        } else {
+                            shortened = true;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        shortened = true;
+                        continue;
+                    }
+                };
+                if let Some(text) = value.as_str() {
+                    if text.len() <= limit {
+                        summary.insert(key.clone(), value.clone());
+                    } else {
+                        shortened = true;
+                        // Identity fields must never become fabricated IDs or
+                        // URLs. Full provenance remains available via memory_get.
+                        if matches!(key.as_str(), "title" | "excerpt") {
+                            summary.insert(key.clone(), json!(utf8_prefix(text, limit)));
+                        }
+                    }
+                } else {
+                    shortened = true;
+                }
+            }
+        } else {
+            shortened = true;
+        }
+        summary.insert("source_index".into(), json!(position));
+        if shortened {
+            summary.insert("truncated".into(), json!(true));
+        }
+        let summary = Value::Object(summary);
+        let size = summary.to_string().len() + usize::from(!summaries.is_empty());
+        if bytes + size > MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        bytes += size;
+        truncated |= shortened;
+        summaries.push(summary);
+    }
+    (summaries, truncated)
+}
 fn embedding_context(m: &Memory, section: &str, max: usize) -> String {
     let full = format!(
         "标题：{}\n版本：{}\n适用条件：{}\n章节：{}\n\n",
@@ -701,8 +766,9 @@ impl MemoryStore {
                 if !seen.insert(row.0.clone()){continue}
                 // A canonical read rechecks the cache version under the same barrier.
                 let (memory,latest)=self.read_memory(pkg,&row.0)?;if latest.version()!=row.5{continue}
-                let sources:Value=serde_json::from_str(&row.9)?;
-                items.push(json!({"id":row.0,"title":row.1,"summary":row.2,"applicability":row.3,"revision":row.4,"version":row.5,"game_version":row.6,"validation":row.7,"effective_validation":if self.source_review_required(pkg,&memory)?{"pending"}else{row.7.as_str()},"source_conflicts":self.source_conflicts(pkg,&memory)?,"status":row.8,"sources":sources,"section":row.10,"excerpt":row.11.chars().take(600).collect::<String>(),"chunk_id":chunk_id,"ordinal":row.12,"score":score,"reference":{"id":row.0,"revision":row.4,"version":row.5,"chunk_id":chunk_id,"section":row.10}}));
+                let original_sources:Vec<Value>=serde_json::from_str(&row.9)?;
+                let (sources,sources_truncated)=source_summaries(&original_sources);
+                items.push(json!({"id":row.0,"title":row.1,"summary":row.2,"applicability":row.3,"revision":row.4,"version":row.5,"game_version":row.6,"validation":row.7,"effective_validation":if self.source_review_required(pkg,&memory)?{"pending"}else{row.7.as_str()},"source_conflicts":self.source_conflicts(pkg,&memory)?,"status":row.8,"sources":sources,"source_count":original_sources.len(),"sources_truncated":sources_truncated,"source_details_reference":{"id":row.0,"revision":row.4},"section":row.10,"excerpt":row.11.chars().take(600).collect::<String>(),"chunk_id":chunk_id,"ordinal":row.12,"score":score,"reference":{"id":row.0,"revision":row.4,"version":row.5,"chunk_id":chunk_id,"section":row.10}}));
                 if items.len()>=bounded_limit(args,5,20){break}
             }
             if query_vector.is_some()&&!semantic_used&&degraded.is_none(){degraded=Some(json!({"code":"semantic_index_pending_or_empty","detail":"当前过滤条件下暂无可用语义片段"}));}

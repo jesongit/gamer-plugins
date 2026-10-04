@@ -1118,6 +1118,107 @@ async fn embedding_byte_budget_rechunks_fts_and_bounds_all_context_and_prefixes(
 }
 
 #[tokio::test]
+async fn search_and_list_bound_source_previews_while_detail_reads_preserve_canonical_provenance() {
+    let (s, _temp) = store();
+    let original_text = format!(
+        "# 对局日志\n\n{}",
+        "观察副本画面并记录批量挑战结算。\n".repeat(350)
+    );
+    let imported = s.call("memory_import", "game-a", json!({"operation_id":"bounded-source-import","filename":"battle.md","text":original_text}), None, false).await.unwrap();
+    let source_id = imported["source_id"].as_str().unwrap();
+    let mut sources = s.source_references("game-a", source_id, 1).unwrap();
+    sources[0]["extra_payload"] = json!("不可进入检索预览的嵌套记录".repeat(100));
+    for index in 0..12 {
+        sources.push(json!({
+            "type":"conversation","conversation_id":format!("conversation-{index}"),"message_id":format!("message-{index}"),"source_session_id":format!("game-session-{index}"),
+            "source_url":format!("https://example.test/guide/{index}"),"source_revision":2,
+            "title":"长对局来源","section":"副本","excerpt":"逐步观察画面并记录结算。".repeat(180)
+        }));
+    }
+    let saved = s.call("memory_create", "game-a", json!({"id":"bounded-source-memory","operation_id":"bounded-source-create","title":"批量挑战步骤","body":"进入培养目标副本，然后使用批量挑战。","validation":"verified","sources":sources}), None, false).await.unwrap();
+    let search = s
+        .call(
+            "memory_search",
+            "game-a",
+            json!({"query":"培养目标 副本 批量挑战 退出关卡 结算","mode":"keyword","limit":20}),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let item = &search["items"][0];
+    assert_eq!(item["id"], "bounded-source-memory");
+    assert_eq!(
+        item["source_count"].as_u64().unwrap() as usize,
+        sources.len()
+    );
+    assert_eq!(item["sources_truncated"], true);
+    assert!(item["sources"].as_array().unwrap().len() <= 8);
+    assert!(serde_json::to_vec(&item["sources"]).unwrap().len() <= 4096);
+    assert_eq!(item["sources"][0]["id"], source_id);
+    assert_eq!(item["sources"][0]["revision"], 1);
+    assert_eq!(item["sources"][0]["section"], sources[0]["section"]);
+    assert_eq!(
+        item["source_details_reference"],
+        json!({"id":"bounded-source-memory","revision":1})
+    );
+    assert!(!item["sources"].to_string().contains("extra_payload"));
+    let conversation_source = item["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["conversation_id"] == "conversation-0")
+        .unwrap();
+    assert_eq!(
+        conversation_source["source_url"],
+        "https://example.test/guide/0"
+    );
+    assert_eq!(conversation_source["source_revision"], 2);
+    assert_eq!(conversation_source["source_session_id"], "game-session-0");
+    let listed = s
+        .call("memory_list", "game-a", json!({}), None, false)
+        .await
+        .unwrap();
+    assert_eq!(listed["items"][0]["sources"], item["sources"]);
+    assert_eq!(listed["items"][0]["sources_truncated"], true);
+    let full = s
+        .call(
+            "memory_get",
+            "game-a",
+            item["source_details_reference"].clone(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(full["memory"]["sources"], json!(sources));
+    assert_eq!(full["version"], saved["version"]);
+    let source = s
+        .call(
+            "memory_source_get",
+            "game-a",
+            json!({"id":source_id,"revision":1}),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(source["source"]["text"], original_text);
+}
+#[test]
+fn source_previews_do_not_turn_oversized_identity_fields_into_false_locations() {
+    let sources = [
+        json!({"id":"x".repeat(1000),"revision":7,"url":format!("https://example.test/{}", "x".repeat(2000)),"excerpt":"中文日志\n\"引用\"".repeat(100)}),
+    ];
+    let (summaries, truncated) = index::source_summaries(&sources);
+    assert!(truncated);
+    assert_eq!(summaries[0]["revision"], 7);
+    assert!(summaries[0].get("id").is_none() && summaries[0].get("url").is_none());
+    assert_eq!(summaries[0]["source_index"], 0);
+    assert!(summaries[0]["excerpt"].as_str().unwrap().len() <= 384);
+    assert!(serde_json::to_vec(&summaries).unwrap().len() <= 4096);
+}
+#[tokio::test]
 async fn canonical_source_references_match_jobs_and_suppress_derived_recreation() {
     let (s, _temp) = store();
     let imported=s.call("memory_import","game-a",json!({"operation_id":"human-guide","filename":"user.md","text":"# 用户定义\n\n默认先整理背包，再领取邮箱。"}),None,false).await.unwrap();
