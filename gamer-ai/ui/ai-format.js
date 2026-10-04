@@ -49,6 +49,8 @@ export const TOOL_LABELS = {
   target_list: '查看目标', context_get: '读取上下文', session_status: '查询会话', screen_capture: '观察画面',
   input_tap: '点击', input_press: '长按', input_swipe: '滑动', input_key: '按键', input_text: '输入文字',
   app_launch: '启动应用', app_stop: '停止应用', wait: '等待', session_finish: '结束会话',
+  agent_continue:'继续对话',gameplay_status:'查询游玩状态',gameplay_start:'安排游玩',gameplay_resume:'安排继续游玩',
+  gameplay_pause:'暂停游玩',gameplay_stop:'停止游玩',gameplay_handoff:'执行游玩计划',
   memory_search:'检索记忆',memory_get:'阅读记忆',memory_list:'列出记忆',memory_history:'读取修订历史',
   memory_create:'保存新记忆',memory_update:'修订记忆',memory_disable:'停用记忆',memory_delete:'删除记忆',memory_restore:'恢复记忆',memory_merge:'合并记忆',
   memory_import:'暂存攻略',memory_import_jobs:'查询导入进度',memory_source_get:'阅读攻略来源',

@@ -42,10 +42,16 @@ it('最新快照默认展开系统，早期请求可追查，不执行内容或�
   expect(wrapper.text()).not.toContain('DO_NOT_SHOW_BYTES')
   expect(wrapper.text()).not.toContain('private-credential')
   expect(wrapper.text()).not.toContain('private-reasoning-data')
-  expect(wrapper.text()).toContain('普通对话仅提供')
+  expect(wrapper.text()).toContain('本轮仅提供')
   expect(wrapper.text()).toContain('此前 1 轮请求')
   expect(wrapper.text()).toContain('reasoning')
   wrapper.unmount()
+})
+it('实际编排工具说明统一Agent决策，不要求用户手动切换模式',()=>{
+  const value={request_body:{tools:[{type:'function',name:'gameplay_start'},{type:'function',name:'agent_continue'}]}}
+  expect(toolAccess(value,'chat')).toContain('Agent 游玩编排工具')
+  expect(toolAccess(value,'chat')).toContain('查询或修改记忆不会恢复暂停')
+  expect(toolAccess(value,'chat')).not.toContain('选择游玩')
 })
 it('编辑按钮只请求打开设置，不改变快照或发起设备动作',async()=>{
   const wrapper=mount(RequestContext,{props:{contexts:[entry()],expanded:true}})

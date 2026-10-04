@@ -15,48 +15,49 @@ const emit = defineEmits(['detach', 'memory', 'settings'])
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const context = computed(() => workspace?.getSnapshot?.() || {})
 const deviceId = computed(() => context.value.deviceId || '')
-const inputMode = ref('chat'), controlMode = ref('api')
 const conversations = ref([]), selectedId = ref(''), conversation = ref(null), events = ref([]), pending = ref([])
 const latestSeq = ref(0), oldestSeq = ref(null), moreBefore = ref(false), loadingHistory = ref(false)
 const nextConversationCursor = ref(null), catchingUp = ref(false)
 const draft = ref(''), error = ref(''), feedback = ref(''), sending = ref(false), busy = ref(false)
-const sessions = ref([]), gameId = ref(''), allowResume = ref(false), webSearch = ref(false), searchAvailable = ref(false)
+const sessions = ref([]), webSearch = ref(false), searchAvailable = ref(false)
 const controlBusy = ref(false)
-const boundGame = computed(() => sessions.value.find(session=>session.session_id === (conversation.value?.game_session_id || selectedId.value)))
+const boundGame = computed(() => sessions.value.find(session=>session.session_id === conversation.value?.game_session_id))
 const detailMode = ref(false), diagnosticsOpen = ref(false), diagnostics = ref([]), diagnosticFilter = ref('all'), diagnosticError = ref(''), exportBusy = ref(false)
 const diagnosticOldest=ref(null),moreDiagnostics=ref(false)
 const scroll = ref(null), nearBottom = ref(true), saved = ref(null)
 const budgetOpen = ref(false), limits = reactive({...DEFAULT_LIMITS})
 const gameLimits = reactive({...DEFAULT_LIMITS})
-const limitsValid = computed(() => validLimits(startsGame.value || gameSession.value ? gameLimits : limits))
-const shownLimits = computed(() => inputMode.value === 'game' || gameSession.value ? gameLimits : limits)
+const limitsValid = computed(() => validLimits(limits) && validLimits(gameLimits))
 const limitsChanged = computed(() => !conversation.value || LIMIT_FIELDS.some(field => conversation.value.limits?.[field.key] !== limits[field.key]))
 const turns = computed(() => conversationTurns(events.value))
 const waiting = computed(() => pending.value.filter(message => !events.value.some(event => event.kind === 'user' && event.data?.message_id === message.id)))
-const eligibleSessions = computed(() => sessions.value.filter(session => isActive(session) && session.content_package === props.packageId && session.mode === 'api'))
-const gameSession = computed(() => eligibleSessions.value.find(session => session.session_id === gameId.value)
-  || (inputMode.value === 'game' && isActive(boundGame.value) && boundGame.value.mode === 'api' ? boundGame.value : null))
 const activeDeviceSession = computed(() => sessions.value.find(session => session.device_id === deviceId.value && isActive(session)))
+const gameBudgetBlocked = computed(() => {
+  const usage = boundGame.value?.usage || {}
+  return ['max_turns','max_actions','max_seconds','max_tokens'].some(key => {
+    const used = key==='max_turns' ? usage.turns : key==='max_actions' ? usage.actions : key==='max_seconds' ? usage.active_seconds : usage.total_tokens ?? usage.known_tokens
+    return gameLimits[key]>0 && (used || 0)>=gameLimits[key]
+  })
+})
 const usageLedgers = computed(() => {
   const ledgers = []
   if (conversation.value?.usage) ledgers.push({ key:'chat', label:'对话', usage:conversation.value.usage, limits:conversation.value.limits })
-  const game = gameSession.value || (isActive(boundGame.value) ? boundGame.value : null)
+  const game = isActive(boundGame.value) ? boundGame.value : null
   const usage = game?.usage || conversation.value?.game_usage
   if (usage) ledgers.push({ key:'game', label:'游玩', usage, limits:game?.limits || conversation.value?.game_limits })
   return ledgers
 })
-const mainLedger = computed(() => usageLedgers.value.find(ledger => ledger.key === (inputMode.value === 'game' || gameSession.value ? 'game' : 'chat')) || usageLedgers.value[0])
-const startsGame = computed(() => inputMode.value === 'game' && !gameSession.value && !isActive(boundGame.value))
 const readonlyHistory = computed(() => ['external','package_deleted'].includes(conversation.value?.state) || boundGame.value?.mode === 'mcp')
-const canSend = computed(() => !!props.packageId && (startsGame.value && controlMode.value === 'mcp' || !!saved.value?.has_key)
+const canSend = computed(() => !!props.packageId && !!saved.value?.has_key
   && draft.value.trim() && new TextEncoder().encode(draft.value.trim()).length <= 8000 && limitsValid.value
-  && !sending.value && !busy.value && !readonlyHistory.value && (!startsGame.value || deviceId.value && !activeDeviceSession.value))
+  && !sending.value && !busy.value && !readonlyHistory.value)
 const state = computed(() => conversation.value?.state || 'idle')
 const filteredDiagnostics = computed(() => diagnostics.value.filter(event => diagnosticFilter.value === 'all' || diagnosticCategory(event) === diagnosticFilter.value))
 let disposed = false, serial = 0, timer, polling = false
 const call = (action, values = {}) => api.callExtension('gamer-ai', action, values)
 function schedulePoll(delay) {clearTimeout(timer);if(!disposed) timer=setTimeout(poll,delay)}
 function applyPage(value, replace = false) {
+  const previousGameId = conversation.value?.game_session_id
   if (value.conversation) conversation.value = value.conversation
   events.value = replace ? mergeEvents([], value.events) : mergeEvents(events.value, value.events)
   const received=Math.max(0,...(value.events || []).map(event=>event.seq))
@@ -64,7 +65,8 @@ function applyPage(value, replace = false) {
   catchingUp.value=(value.latest_seq || 0)>latestSeq.value
   if (replace) { oldestSeq.value = value.oldest_seq ?? events.value[0]?.seq ?? null; moreBefore.value = !!value.has_more_before }
   if (replace && value.conversation?.limits) Object.assign(limits,value.conversation.limits)
-  if (replace && value.conversation?.game_limits) Object.assign(gameLimits,value.conversation.game_limits)
+  const requestedGameLimits=value.conversation?.requested_game_limits || value.conversation?.game_limits
+  if ((replace || previousGameId!==value.conversation?.game_session_id) && requestedGameLimits) Object.assign(gameLimits,requestedGameLimits)
 }
 async function list(more = false) {
   if (!props.packageId) { conversations.value = []; return }
@@ -78,8 +80,8 @@ async function list(more = false) {
 async function select(id) {
   const request=++serial; clearTimeout(timer); selectedId.value = id; conversation.value = null; events.value = []; pending.value = []
   diagnosticsOpen.value=false;diagnostics.value=[];diagnosticOldest.value=null;moreDiagnostics.value=false
-  latestSeq.value = 0; oldestSeq.value = null; moreBefore.value = false; gameId.value = ''; allowResume.value = false; nearBottom.value = true
-  if (id) { try { const value = await call('conversation.get', { conversation_id: id, limit: 80 }); if (!disposed && request === serial) { applyPage(value, true); inputMode.value = value.conversation?.game_session_id ? 'game' : 'chat' } } catch (e) { if (!disposed && request === serial) error.value = e.message || '无法读取对话' } }
+  latestSeq.value = 0; oldestSeq.value = null; moreBefore.value = false; nearBottom.value = true
+  if (id) { try { const value = await call('conversation.get', { conversation_id: id, limit: 80 }); if (!disposed && request === serial) applyPage(value, true) } catch (e) { if (!disposed && request === serial) error.value = e.message || '无法读取对话' } }
   if (!disposed && request===serial) schedulePoll(500)
 }
 async function newConversation() {
@@ -129,16 +131,6 @@ async function send() {
   let receipt
   const message = draft.value.trim(), packageId = props.packageId
   try {
-    if (startsGame.value) {
-      const result = await call('session.start', { device_id: deviceId.value, content_package: packageId,
-        goal: message, mode: controlMode.value, limits: { ...gameLimits } })
-      if (disposed || packageId !== props.packageId) return
-      draft.value = ''; await list()
-      await select(result.conversation_id || result.session?.session_id || result.session_id)
-      await poll(); inputMode.value = 'game'
-      feedback.value = controlMode.value === 'mcp' ? '外部游玩会话已建立，可在 MCP 设置创建令牌。' : 'AI 游玩已开始，过程与后续指令都保留在本对话。'
-      return
-    }
     if (!selectedId.value) {
       const result = await call('conversation.create', { content_package: packageId, limits: {...limits} })
       if (disposed || packageId !== props.packageId) return
@@ -147,18 +139,13 @@ async function send() {
     const id = selectedId.value, request = serial
     receipt = reactive({ id: `sending:${crypto.randomUUID()}`, text: message, status: 'sending', at: new Date().toISOString() })
     pending.value.push(receipt)
-    const result = await call('conversation.message', { conversation_id: id, message,
+    const result = await call('conversation.message', { conversation_id: id, message, device_id: deviceId.value,
       attached_memory: props.attachedMemory.filter(item => item.content_package === packageId).map(({ id, revision }) => ({ id, revision })),
-      ...(gameSession.value
-        ? gameSession.value.limits && LIMIT_FIELDS.some(field=>gameLimits[field.key]!==gameSession.value.limits[field.key]) ? {limits:{...gameLimits}} : {}
-        : limitsChanged.value ? {limits:{...limits}} : {}),
-      ...(gameSession.value ? { game_session_id: gameSession.value.session_id,
-        resume: ['starting','running','resuming'].includes(gameSession.value.state) || allowResume.value } : {}),
+      ...(limitsChanged.value ? {limits:{...limits}} : {}), game_limits: {...gameLimits},
       ...(searchAvailable.value ? { web_search: webSearch.value } : {}) })
     if (disposed || request !== serial) return
     Object.assign(receipt, { id: result.message.id, status: result.message.status || 'queued' })
-    draft.value = ''; feedback.value = '消息已接收；处理阶段会更新在时间线上。'
-    if(result.game?.resume_error) {error.value=`消息已接收，游玩恢复未完成：${typeof result.game.resume_error==='string'?result.game.resume_error:result.game.resume_error.message||'请检查设备暂停原因'}`;feedback.value='新指令已保存；游玩保持当前控制状态。'}
+    draft.value = ''; feedback.value = boundGame.value?.state==='paused' ? '消息已接收，设备保持暂停；Agent 正在判断下一步。' : isActive(boundGame.value) ? '新指令已接收；设备先暂停当前动作，Agent 正在判断下一步。' : '消息已接收，Agent 将根据内容查询记忆、回答或安排游玩。'
     if (result.conversation) conversation.value = result.conversation
     const value = await call('conversation.get', { conversation_id: id, after_seq: latestSeq.value, limit: 80 })
     if (!disposed && request === serial) applyPage(value)
@@ -176,7 +163,7 @@ async function cancel() {
 }
 async function gameControl(action) {
   const session=boundGame.value
-  if(!session || controlBusy.value || action==='resume' && !validLimits(gameLimits)) return
+  if(!session || controlBusy.value || action==='resume' && (!validLimits(gameLimits) || gameBudgetBlocked.value)) return
   controlBusy.value=true;error.value=''
   try {await call(`session.${action}`,{session_id:session.session_id,
     ...(action==='resume' && session.limits && LIMIT_FIELDS.some(field=>gameLimits[field.key]!==session.limits[field.key]) ? {limits:{...gameLimits}} : {})});await poll()}
@@ -187,10 +174,9 @@ async function refreshSettings() {
   const [model, services] = await Promise.all([call('settings.get'), call('services.get')])
   if (!disposed) { saved.value = model; searchAvailable.value = !!services.search?.enabled }
 }
-function changeMode(value) { inputMode.value = value; gameId.value = ''; allowResume.value = false }
-function setGameOptions(value) { if(value.limits) Object.assign(gameLimits,value.limits); if(value.mode) controlMode.value=value.mode }
-function getGameOptions() { return {limits:{...gameLimits},mode:controlMode.value,session_id:boundGame.value?.session_id || ''} }
-watch(() => `${gameSession.value?.session_id}:${gameSession.value?.state}`, () => { if(gameSession.value?.limits) Object.assign(gameLimits,gameSession.value.limits) })
+function setGameOptions(value) { if(value.limits) Object.assign(gameLimits,value.limits) }
+function getGameOptions() { return {limits:{...gameLimits},session_id:boundGame.value?.session_id || ''} }
+watch(() => `${boundGame.value?.session_id}:${boundGame.value?.state}`, () => { if(isActive(boundGame.value) && boundGame.value.limits) Object.assign(gameLimits,conversation.value?.requested_game_limits || boundGame.value.limits) })
 function allReasoning(turn) { return turn.process.filter(item => item.kind === 'thinking' && item.text?.trim()) }
 function reasoning(turn) { return allReasoning(turn).slice(-1) }
 function earlierReasoning(turn) { return allReasoning(turn).slice(0,-1) }
@@ -257,13 +243,13 @@ defineExpose({select,refreshList:list,refreshSettings,setGameOptions,getGameOpti
 <template>
   <section class="agent-conversation">
     <header class="agent-header"><div class="agent-identity"><span class="agent-mark" aria-hidden="true">✦</span><div><h3>Agent</h3><button class="model-button" @click="emit('settings','settings')">{{ saved?.model || '配置模型' }} <span aria-hidden="true">⌄</span></button></div></div><div class="actions"><button :disabled="!packageId || busy || !limitsValid" @click="newConversation">新对话</button><button :aria-expanded="budgetOpen" @click="budgetOpen=!budgetOpen">预算</button><button @click="emit('settings','prompts')">提示词</button><button :disabled="!selectedId" @click="loadDiagnostics()">诊断</button><button @click="emit('settings','settings')">设置</button></div></header>
-    <section v-if="budgetOpen" class="chat-budget"><p>五项均可设为 0 表示无限。累计用量保留，修改随下一条消息在安全边界生效。</p><BudgetFields :model-value="shownLimits" :prefix="inputMode==='game' || gameSession ? '游玩' : '聊天'" @update:model-value="Object.assign(shownLimits,$event)" /><p v-if="!limitsValid" class="error">非零上限须处于各项允许范围，不能输入负数或小数。</p></section>
-    <div class="conversation-bar"><select :value="selectedId" aria-label="聊天历史" @change="select($event.target.value)"><option value="">新的对话</option><option v-for="item in conversations" :key="item.conversation_id" :value="item.conversation_id">{{ item.title || '对话' }} · {{ displayTime(item.updated_at) }}</option></select><button v-if="nextConversationCursor" @click="list(true)">更多对话</button><span class="conversation-state" role="status"><i v-if="state==='running'" class="status-dot" />{{ ({ idle:'等待消息',queued:'已排队',running:boundGame ? '正在游玩' : '正在回答',starting:'正在准备',paused:'游玩已暂停',pausing:'正在暂停',resuming:'正在恢复',stopping:'正在停止',finished:'游玩已结束',interrupted:'已中断',cancelling:'正在取消',cancelled:'已中断',error:'遇到错误',external:'外部 MCP · 只读',package_deleted:'配置包已删除 · 历史' })[state] || state }}</span><button v-if="['running','queued'].includes(state) && (!boundGame || inputMode==='chat')" @click="cancel">取消本轮问答</button></div>
-    <div v-if="boundGame" class="game-controls"><div class="game-control-heading"><span class="scope-tag">游玩</span><span>{{ boundGame.device_id }} · {{ stateLabel(boundGame.state) }}</span><button @click="emit('settings','budget')">游玩设置</button></div><div class="actions"><button v-if="['starting','running','resuming'].includes(boundGame.state)" :disabled="controlBusy" @click="gameControl('pause')">暂停 AI 游玩</button><button v-if="boundGame.state==='paused'" :disabled="controlBusy" @click="gameControl('resume')">明确继续 AI 游玩</button><button v-if="isActive(boundGame)" :disabled="controlBusy" @click="gameControl('stop')">停止设备会话</button></div><p v-if="boundGame.state==='paused'">游玩暂停，可人工操作；普通聊天与记忆处理不会恢复设备。</p><p v-else-if="['pausing','stopping'].includes(boundGame.state)">设备操作正在收尾，人工仍锁定，等待已暂停或已结束。</p><p v-else-if="isActive(boundGame)">AI 持有设备控制；需要人工输入时先暂停并等待完成。</p><p v-if="boundGame.pause_reason" class="pause-reason">{{ boundGame.pause_reason.title }}：{{ boundGame.pause_reason.detail }} {{ boundGame.pause_reason.suggestion }}</p></div>
+    <section v-if="budgetOpen" class="chat-budget"><p>两组预算分别累计，所有项目均可设为 0 表示无限。对话预算随下一条消息生效；游玩预算在开始或明确继续游玩时应用，修改不会自动恢复设备。用量仍按实际运行上限显示。</p><h4>对话预算</h4><BudgetFields :model-value="limits" prefix="聊天" @update:model-value="Object.assign(limits,$event)" /><h4>游玩预算</h4><BudgetFields :model-value="gameLimits" prefix="游玩" @update:model-value="Object.assign(gameLimits,$event)" /><p v-if="!limitsValid" class="error">非零上限须处于各项允许范围，不能输入负数或小数。</p></section>
+    <div class="conversation-bar"><select :value="selectedId" aria-label="聊天历史" @change="select($event.target.value)"><option value="">新的对话</option><option v-for="item in conversations" :key="item.conversation_id" :value="item.conversation_id">{{ item.title || '对话' }} · {{ displayTime(item.updated_at) }}</option></select><button v-if="nextConversationCursor" @click="list(true)">更多对话</button><span class="conversation-state" role="status"><i v-if="state==='running'" class="status-dot" />{{ ({ idle:'等待消息',queued:'已排队',running:'Agent 正在处理',starting:'正在准备',paused:'游玩已暂停',pausing:'正在暂停',resuming:'正在恢复',stopping:'正在停止',finished:'游玩已结束',interrupted:'已中断',cancelling:'正在取消',cancelled:'已中断',error:'遇到错误',external:'外部 MCP · 只读',package_deleted:'配置包已删除 · 历史' })[state] || state }}</span><button v-if="['running','queued'].includes(state) && !readonlyHistory" @click="cancel">取消本轮问答</button></div>
+    <div v-if="boundGame" class="game-controls"><div class="game-control-heading"><span class="scope-tag">{{ boundGame.mode==='mcp' ? '外部 MCP' : '游玩' }}</span><span>{{ boundGame.device_id }} · {{ stateLabel(boundGame.state) }}</span><button @click="budgetOpen=true">游玩预算</button></div><div class="actions"><button v-if="['starting','running','resuming'].includes(boundGame.state)" :disabled="controlBusy" @click="gameControl('pause')">暂停 AI 游玩</button><button v-if="boundGame.state==='paused'" :disabled="controlBusy || !validLimits(gameLimits) || gameBudgetBlocked" @click="gameControl('resume')">明确继续 AI 游玩</button><button v-if="isActive(boundGame)" :disabled="controlBusy" @click="gameControl('stop')">停止设备会话</button></div><p v-if="boundGame.state==='paused'">游玩暂停，可人工操作；查询和修改记忆保持暂停。明确继续或新的游玩指令由 Agent 判断是否恢复。</p><p v-else-if="['pausing','stopping'].includes(boundGame.state)">{{ boundGame.pause_reason?.code==='agent_user_message' ? '已收到新指令，正在暂停当前动作，随后由 Agent 决定后续；人工仍锁定，等待暂停完成。' : '设备操作正在收尾，人工仍锁定，等待已暂停或已结束。' }}</p><p v-else-if="isActive(boundGame)">AI 持有设备控制；需要人工输入时先暂停并等待完成。</p><p v-if="boundGame.pause_reason" class="pause-reason">{{ boundGame.pause_reason.title }}：{{ boundGame.pause_reason.detail }} {{ boundGame.pause_reason.suggestion || boundGame.pause_reason.guidance }}</p><p v-if="boundGame.state==='paused' && gameBudgetBlocked" class="error">游玩预算已用尽，请提高对应上限或设为 0，再明确继续。累计用量不会重置。</p></div>
     <div ref="scroll" class="chat-scroll" @scroll="onScroll">
       <div class="transcript">
         <button v-if="moreBefore" class="history-button" :disabled="loadingHistory" @click="history">{{ loadingHistory ? '正在加载…' : '加载更早记录' }}</button>
-        <div v-if="!turns.length && !waiting.length" class="empty"><span class="empty-mark" aria-hidden="true">✦</span><h4>今天想完成什么？</h4><p>讨论攻略、整理记忆，或选择游玩让 AI 观察画面并操作。之后可以在同一对话继续引导。</p><div class="empty-actions"><button @click="emit('memory')">查看记忆库</button><button @click="changeMode('game')">开始游玩</button><button @click="emit('settings','settings')">模型设置</button></div><small>{{ packageId ? `配置包 ${packageId}` : '先选择配置包' }} · {{ deviceId || '聊天无需设备' }}</small></div>
+        <div v-if="!turns.length && !waiting.length" class="empty"><span class="empty-mark" aria-hidden="true">✦</span><h4>今天想完成什么？</h4><p>讨论攻略、整理记忆，或描述游玩目标。Agent 会根据消息安排下一步，所有过程保留在同一对话。</p><div class="empty-actions"><button @click="emit('memory')">查看记忆库</button><button @click="emit('settings','settings')">模型设置</button></div><small>{{ packageId ? `配置包 ${packageId}` : '先选择配置包' }} · {{ deviceId || '讨论攻略无需设备' }}</small></div>
         <article v-for="turn in turns" :id="`agent-turn-${turn.id}`" :key="turn.id" class="turn">
           <span v-for="anchor in turn.anchors" :id="`agent-turn-${anchor}`" :key="anchor" class="turn-anchor" aria-hidden="true" />
           <RequestContext v-if="turn.contexts.length" :contexts="turn.contexts" :expanded="turn===turns.at(-1)" @edit="emit('settings','prompts')" />
@@ -292,19 +278,15 @@ defineExpose({select,refreshList:list,refreshSettings,setGameOptions,getGameOpti
       </div>
     </div>
     <button v-if="!nearBottom" class="return-bottom" @click="bottom">↓ 回到最新</button>
-    <div class="composer"><p v-if="error" role="alert" class="error">{{ error }}</p><p v-if="feedback" role="status" class="feedback">{{ feedback }}</p><p v-if="!saved?.has_key && !(startsGame && controlMode==='mcp')" class="hint">请在模型设置保存 API 连接。<button @click="emit('settings','settings')">配置模型</button></p><p v-if="!packageId" class="hint">先选择配置包；聊天不需要设备。</p>
-      <p class="mode-guidance" v-if="!gameSession && inputMode==='chat'">当前为对话：可查询和修改记忆，未授予设备操作。<button type="button" @click="changeMode('game')">切换游玩</button>后发送目标，AI 才能观察画面并操作。</p>
-      <p class="mode-guidance" v-else-if="gameSession?.state==='paused'">设备已暂停。只有明确继续 AI 游玩，才会恢复设备操作。</p>
-      <p class="mode-guidance" v-else-if="inputMode==='game' && !gameSession">{{ controlMode==='mcp' ? '将建立外部 MCP 控制会话，需要外部 AI 客户端连接后操作。' : '将建立内置 AI 游玩会话，授权当前设备的观察与操作工具。' }}</p>
+    <div class="composer"><p v-if="error" role="alert" class="error">{{ error }}</p><p v-if="feedback" role="status" class="feedback">{{ feedback }}</p><p v-if="!saved?.has_key" class="hint">请在模型设置保存 API 连接。<button @click="emit('settings','settings')">配置模型</button></p><p v-if="!packageId" class="hint">先选择配置包；讨论攻略不需要设备。</p>
+      <p class="mode-guidance" v-if="boundGame?.state==='paused'">{{ ['running','queued'].includes(state) ? '设备保持暂停，Agent 正在处理这条消息。' : '设备已暂停。' }}查询和修改记忆不会恢复设备；需要继续时可明确告诉 Agent 或使用上方继续按钮。</p>
+      <p class="mode-guidance" v-else-if="activeDeviceSession && activeDeviceSession.session_id!==boundGame?.session_id">当前设备已有{{ activeDeviceSession.mode==='mcp' ? '外部 MCP' : '游玩' }}会话，Agent 会检查控制状态再安排操作。</p>
       <div v-if="attachedMemory.length" class="attachments"><span v-for="item in attachedMemory" :key="item.id">▧ {{ item.title }} · r{{ item.revision }}<button aria-label="移除记忆引用" @click="emit('detach',item.id)">×</button></span></div>
       <p v-if="readonlyHistory" class="hint">此记录仅供回看。需要聊天时请在当前配置包建立新对话；历史输入不会重放。</p>
-      <form class="chat-composer" @submit.prevent="send"><textarea v-model="draft" rows="3" aria-label="Agent 消息" :placeholder="inputMode==='game' ? boundGame ? '补充游玩指令，或调整下一步…' : '描述游玩目标，AI 将观察画面并操作…' : '继续讨论，或让 AI 查询和整理记忆…'" :disabled="sending || readonlyHistory" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" />
-        <div class="composer-tools"><select :value="inputMode" aria-label="消息模式" @change="changeMode($event.target.value)"><option value="chat">对话</option><option value="game">游玩</option></select><span v-if="inputMode==='game'" class="composer-device">{{ gameSession?.device_id || deviceId || '未选设备' }}</span><label v-if="searchAvailable" class="search-toggle"><input v-model="webSearch" type="checkbox" />联网</label><button v-if="inputMode==='game'" type="button" @click="emit('settings','budget')">游玩设置</button><button type="submit" class="send-button" :disabled="!canSend">{{ sending ? '发送中…' : startsGame ? controlMode==='mcp' ? '建立外部会话' : '开始游玩' : gameSession && gameSession.state==='paused' && allowResume ? '发送并继续' : '发送' }}<span aria-hidden="true"> ↑</span></button></div>
+      <form class="chat-composer" @submit.prevent="send"><textarea v-model="draft" rows="3" aria-label="Agent 消息" placeholder="讨论攻略、管理记忆，或描述游玩目标…" :disabled="sending || readonlyHistory" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" />
+        <div class="composer-tools"><span class="composer-device" :title="deviceId || '讨论攻略无需设备'">{{ deviceId || '无设备' }}</span><label v-if="searchAvailable" class="search-toggle"><input v-model="webSearch" type="checkbox" />联网</label><button type="button" @click="emit('settings','mcp')">外部 MCP</button><button type="submit" class="send-button" :disabled="!canSend">{{ sending ? '发送中…' : '发送' }}<span aria-hidden="true"> ↑</span></button></div>
       </form>
-      <div v-if="startsGame" class="start-options"><label>控制方式<select v-model="controlMode" aria-label="开始游玩控制方式"><option value="api">内置 AI</option><option value="mcp">外部 MCP</option></select></label><p v-if="activeDeviceSession" class="hint">当前设备已有活动游玩会话，请打开对应对话或先停止。</p><p v-else-if="!deviceId" class="hint">游玩需要先在工作台选择设备。</p></div>
-      <div v-if="gameSession?.state==='paused'" class="resume-choice"><label><input v-model="allowResume" type="checkbox" />明确按此指令继续 AI 游玩</label><small v-if="!allowResume">发送会保留暂停状态。</small></div>
-      <details v-if="eligibleSessions.length && (!boundGame || inputMode==='chat')" class="message-options"><summary>关联其他游玩会话</summary><label>游玩指令<select v-model="gameId" aria-label="本条消息关联游戏会话"><option value="">仅聊天与记忆</option><option v-for="session in eligibleSessions" :key="session.session_id" :value="session.session_id">{{ session.device_id }} · {{ stateLabel(session.state) }}</option></select></label><label v-if="gameSession?.state==='paused'"><input v-model="allowResume" type="checkbox" />明确按此指令继续 AI 游玩</label></details>
-      <div class="composer-status"><span>{{ packageId || '未选配置包' }}</span><details v-if="mainLedger" class="usage"><summary>{{ mainLedger.label }} · Token {{ tokenUsage(mainLedger.usage) }} / {{ budgetValue(mainLedger.limits,'max_tokens') }}</summary><div class="usage-ledgers"><section v-for="ledger in usageLedgers" :key="ledger.key" :data-ledger="ledger.key"><b>{{ ledger.label }}用量</b><p>Token {{ tokenUsage(ledger.usage) }} / {{ budgetValue(ledger.limits,'max_tokens') }}<small v-if="ledger.usage?.has_unknown_tokens"> · 部分请求用量未知</small></p><p>模型 {{ usageValue(ledger.usage,['turns']) }} / {{ budgetValue(ledger.limits,'max_turns') }} 轮 · 工具 {{ usageValue(ledger.usage,['actions']) }} / {{ budgetValue(ledger.limits,'max_actions') }} 次</p><p>活动 {{ usageValue(ledger.usage,['active_seconds']) }} / {{ budgetValue(ledger.limits,'max_seconds') }} 秒 · 连续失败 {{ usageValue(ledger.usage,['consecutive_failures']) }} / {{ budgetValue(ledger.limits,'max_failures') }}</p></section></div></details><small>Ctrl / ⌘ + Enter 发送</small></div>
+      <div class="composer-status"><span>{{ packageId || '未选配置包' }}</span><details v-if="usageLedgers.length" class="usage"><summary>Token <span v-for="ledger in usageLedgers" :key="ledger.key"> · {{ ledger.label }} {{ tokenUsage(ledger.usage) }} / {{ budgetValue(ledger.limits,'max_tokens') }}</span></summary><div class="usage-ledgers"><section v-for="ledger in usageLedgers" :key="ledger.key" :data-ledger="ledger.key"><b>{{ ledger.label }}用量</b><p>Token {{ tokenUsage(ledger.usage) }} / {{ budgetValue(ledger.limits,'max_tokens') }}<small v-if="ledger.usage?.has_unknown_tokens"> · 部分请求用量未知</small></p><p>模型 {{ usageValue(ledger.usage,['turns']) }} / {{ budgetValue(ledger.limits,'max_turns') }} 轮 · 工具 {{ usageValue(ledger.usage,['actions']) }} / {{ budgetValue(ledger.limits,'max_actions') }} 次</p><p>活动 {{ usageValue(ledger.usage,['active_seconds']) }} / {{ budgetValue(ledger.limits,'max_seconds') }} 秒 · 连续失败 {{ usageValue(ledger.usage,['consecutive_failures']) }} / {{ budgetValue(ledger.limits,'max_failures') }}</p></section></div></details><small>Ctrl / ⌘ + Enter 发送</small></div>
     </div>
     <aside v-if="diagnosticsOpen" class="diagnostic-drawer" aria-label="对话诊断"><header><h3>只读诊断</h3><button @click="diagnosticsOpen=false">关闭诊断</button></header><div class="actions"><select v-model="diagnosticFilter" aria-label="诊断类别"><option value="all">全部</option><option value="model">模型请求</option><option value="tool">工具</option><option value="memory">记忆</option><option value="state">状态</option><option value="error">错误</option></select><button @click="loadDiagnostics()">刷新诊断</button><button v-if="moreDiagnostics" @click="loadDiagnostics(true)">加载更早诊断</button><button :disabled="exportBusy" @click="exportDiagnostics">{{ exportBusy ? '正在导出…' : '导出脱敏诊断' }}</button></div><p>导出到本机，不调用模型、不上传。缺失用量、耗时或附件显示未知。</p><p v-if="diagnosticError" role="alert" class="error">{{ diagnosticError }}</p><ol><li v-for="event in filteredDiagnostics" :key="event.seq"><header><b>{{ event.kind }}</b><time>{{ displayTime(event.at) }}</time><button v-if="event.data?.turn_id" @click="locate(event)">定位对话</button></header><p>{{ event.message }}</p><pre>{{ diagnosticDetails(event) }}</pre></li></ol></aside>
   </section>

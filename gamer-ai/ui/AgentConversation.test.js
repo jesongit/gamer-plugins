@@ -25,6 +25,8 @@ beforeEach(()=>{
     }
     if(action==='conversation.message'){
       events.push(ev(events.length+1,'user',{message_id:'m1',status:'queued'},values.message));record.state='running'
+      if(values.limits)record.limits=values.limits
+      if(values.game_limits)record.requested_game_limits=values.game_limits
       return{message:{id:'m1',status:'queued'},conversation:structuredClone(record)}
     }
     if(action==='conversation.withdraw'){events.push(ev(events.length+1,'user_status',{message_id:values.message_id,status:'withdrawn'}));return{ok:true}}
@@ -35,11 +37,12 @@ beforeEach(()=>{
 })
 afterEach(()=>{wrappers.forEach(wrapper=>wrapper.unmount());vi.useRealTimers();vi.restoreAllMocks()})
 it('无设备创建持续对话，显式配置包，服务器接收回显不重复',async()=>{
+  context.deviceId=''
   const wrapper=await create()
   await wrapper.get('[aria-label="Agent 消息"]').setValue('请先整理背包经验')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.create',{content_package:'default',limits})
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'请先整理背包经验',attached_memory:[]})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'请先整理背包经验',device_id:'',attached_memory:[],game_limits:limits})
   expect(wrapper.findAll('.user-message')).toHaveLength(1)
   expect(wrapper.text()).toContain('待处理')
   expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
@@ -48,7 +51,7 @@ it('无设备创建持续对话，显式配置包，服务器接收回显不重�
 })
 it('模型请求上下文显示在用户气泡之前，提示词入口打开设置且不改变设备状态',async()=>{
   record={conversation_id:'c1',content_package:'default',state:'idle',limits}
-  events=[ev(1,'user',{message_id:'m1'},'替我操作'),ev(2,'prompt_snapshot',{scope:'chat',snapshot:{protocol:'responses',model:'test',request_body:{input:[{role:'system',content:'本轮系统指令'}],tools:[{type:'function',name:'memory_search'}]}}}),ev(3,'assistant_final',{message_id:'a1',text:'请先切换游玩'})]
+  events=[ev(1,'user',{message_id:'m1'},'替我操作'),ev(2,'prompt_snapshot',{scope:'chat',snapshot:{protocol:'responses',model:'test',request_body:{input:[{role:'system',content:'本轮系统指令'}],tools:[{type:'function',name:'memory_search'}]}}}),ev(3,'assistant_final',{message_id:'a1',text:'先检查设备状态'})]
   const wrapper=await create(),turn=wrapper.get('.turn').element
   expect(turn.querySelector('.request-context').compareDocumentPosition(turn.querySelector('.user-message')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   expect(wrapper.get('.request-context').attributes('open')).toBeDefined()
@@ -56,8 +59,8 @@ it('模型请求上下文显示在用户气泡之前，提示词入口打开设�
   expect(wrapper.text()).toContain('未授予设备操作')
   await button(wrapper,'提示词').trigger('click')
   expect(wrapper.emitted('settings').at(-1)).toEqual(['prompts'])
-  await button(wrapper,'切换游玩').trigger('click')
-  expect(wrapper.get('[aria-label="消息模式"]').element.value).toBe('game')
+  expect(wrapper.find('[aria-label="消息模式"]').exists()).toBe(false)
+  expect(button(wrapper,'切换游玩')).toBeUndefined()
   expect(mocks.call.mock.calls.some(call=>['session.start','session.resume','conversation.message'].includes(call[1]))).toBe(false)
 })
 it.each(['external','package_deleted'])('只读历史 %s 禁止新消息，显示建立新对话提示',async state=>{
@@ -110,17 +113,18 @@ it('历史使用before_seq分页并保留离开底部的阅读位置',async()=>{
   expect(wrapper.text()).toContain('超过截断范围的旧记录')
   expect(el.scrollTop).toBe(520)
 })
-it('取消问答只发conversation.cancel，记忆引用固定revision且游戏恢复需要勾选',async()=>{
-  record={conversation_id:'c1',content_package:'default',state:'running',limits}
+it('取消问答只发conversation.cancel，暂停中统一发送记忆引用而不传恢复参数',async()=>{
+  record={conversation_id:'c1',content_package:'default',game_session_id:'s1',state:'running',limits}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused'}]
   const wrapper=await create({attachedMemory:[{id:'m',revision:3,title:'攻略',content_package:'default'},{id:'foreign',revision:1,content_package:'other'}]})
   await button(wrapper,'取消本轮问答').trigger('click');await flushPromises()
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.cancel',{conversation_id:'c1'})
   expect(mocks.call.mock.calls.some(call=>call[1]==='session.stop'||call[1]==='session.pause')).toBe(false)
-  await wrapper.get('[aria-label="本条消息关联游戏会话"]').setValue('s1')
-  await wrapper.get('[aria-label="Agent 消息"]').setValue('请按攻略继续')
+  expect(wrapper.find('[aria-label="本条消息关联游戏会话"]').exists()).toBe(false)
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('查询背包攻略')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'请按攻略继续',attached_memory:[{id:'m',revision:3}],game_session_id:'s1',resume:false})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'查询背包攻略',device_id:'phone',attached_memory:[{id:'m',revision:3}],game_limits:limits})
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.resume'||call[1]==='session.start')).toBe(false)
 })
 it('聊天记忆工具结果展示有效验证状态与旧来源复核警告',async()=>{
   record={conversation_id:'c1',content_package:'default',state:'idle',limits}
@@ -187,38 +191,46 @@ it('下载的诊断保留请求快照完整工具参数与公开reasoning配置'
   expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
 })
 
-it('同一输入框启动游玩，使用独立游玩预算与显式宿主设备，不先建普通聊天',async()=>{
+it('目标统一交给Agent，后端原地关联游玩时保留原对话历史与独立预算',async()=>{
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout']})
+  record={conversation_id:'c1',content_package:'default',state:'idle',limits}
+  events=[ev(1,'user',{message_id:'old',turn_id:'old-turn'},'先讨论新手攻略'),ev(2,'assistant_final',{message_id:'old-answer',turn_id:'old-turn',text:'已有攻略建议'})]
   const implementation=mocks.call.getMockImplementation()
   mocks.call.mockImplementation(async(id,action,values)=>{
-    if(action==='session.start') {
-      session=[{session_id:'s1',device_id:values.device_id,content_package:values.content_package,mode:values.mode,state:'starting',limits:values.limits}]
-      record={conversation_id:'s1',game_session_id:'s1',content_package:values.content_package,state:'idle',limits:values.limits}
-      events=[ev(1,'user',{message_id:'goal'},values.goal)]
-      return{session_id:'s1',conversation_id:'s1'}
+    if(action==='conversation.message') {
+      const reply=await implementation(id,action,values)
+      session=[{session_id:'s1',device_id:values.device_id,content_package:'default',mode:'api',state:'starting',limits:values.game_limits}]
+      record.game_session_id='s1'
+      reply.conversation=structuredClone(record)
+      return reply
     }
     return implementation(id,action,values)
   })
   const wrapper=await create()
-  await wrapper.get('[aria-label="消息模式"]').setValue('game')
   await button(wrapper,'预算').trigger('click')
   for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('  完成新手教程  ')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.start',{device_id:'phone',content_package:'default',goal:'完成新手教程',mode:'api',limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  await vi.advanceTimersByTimeAsync(500);await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',device_id:'phone',message:'完成新手教程',attached_memory:[],game_limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
   expect(mocks.call.mock.calls.some(call=>call[1]==='conversation.create')).toBe(false)
-  expect(wrapper.get('[aria-label="聊天历史"]').element.value).toBe('s1')
-  expect(wrapper.get('.user-message').text()).toContain('完成新手教程')
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
+  expect(wrapper.get('[aria-label="聊天历史"]').element.value).toBe('c1')
+  expect(wrapper.text()).toContain('先讨论新手攻略')
+  expect(wrapper.text()).toContain('已有攻略建议')
+  expect(wrapper.text()).toContain('完成新手教程')
+  expect(wrapper.get('.game-controls').text()).toContain('phone')
   expect(wrapper.get('[aria-label="Agent 消息"]').element.value).toBe('')
 })
 
-it.each([['running',true],['paused',false]])('游戏对话 %s 的后续引导自动绑定自身会话，暂停不会隐式恢复',async(state,resume)=>{
+it.each(['running','paused'])('游戏对话 %s 的后续引导统一发送，UI不代替Agent恢复设备',async(state)=>{
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state,limits}]
   const wrapper=await create()
-  expect(wrapper.get('[aria-label="消息模式"]').element.value).toBe('game')
+  expect(wrapper.find('[aria-label="消息模式"]').exists()).toBe(false)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('先检查背包，再去右边')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'先检查背包，再去右边',attached_memory:[],game_session_id:'s1',resume})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'先检查背包，再去右边',device_id:'phone',attached_memory:[],game_limits:limits})
   expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
 })
 
@@ -253,16 +265,16 @@ it('缺少推理明确显示供应商未返回，记忆草稿与整理失败直�
   await button(wrapper,'查看记忆').trigger('click')
   expect(wrapper.emitted('memory')).toHaveLength(1)
 })
-it.each([['running',true],['paused',false],['paused',true]])('游玩 %s 引导resume=%s时提交编辑后的游玩预算，避免发送仍用旧预算',async(state,resume)=>{
+it.each(['running','paused'])('游玩 %s 引导提交独立game_limits，预算不会覆盖对话预算',async(state)=>{
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state,limits:{...limits},usage:{turns:40,known_tokens:100000,total_tokens:null}}]
   const wrapper=await create()
   await button(wrapper,'预算').trigger('click')
   for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
-  if(state==='paused'&&resume)await wrapper.get('.resume-choice input[type="checkbox"]').setValue(true)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('继续按新预算探索')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'继续按新预算探索',attached_memory:[],game_session_id:'s1',resume,limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'继续按新预算探索',device_id:'phone',attached_memory:[],game_limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  expect(record.limits).toEqual(limits)
   await wrapper.get('[aria-label="游玩活动秒数预算"]').setValue(9)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('不应提交非法预算')
   expect(wrapper.get('.composer button[type="submit"]').element.disabled).toBe(true)
@@ -272,50 +284,101 @@ it('同一会话对话2轮与游玩17轮分别显示，活跃游玩优先真实S
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,actions:3,active_seconds:4,total_tokens:2000,consecutive_failures:0},game_usage:{turns:9,total_tokens:9000},game_limits:{...limits,max_tokens:50000}}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:gameLimits,usage:{turns:17,actions:18,active_seconds:19,total_tokens:17000,consecutive_failures:0}}]
   const wrapper=await create()
-  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 不限')
+  expect(wrapper.get('.usage>summary').text()).toContain('游玩 17,000 / 不限')
+  expect(wrapper.get('.usage>summary').text()).toContain('对话 2,000 / 100,000')
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 不限 轮')
   expect(wrapper.get('[data-ledger="chat"]').text()).toContain('模型 2 / 40 轮')
   expect(wrapper.get('[data-ledger="chat"]').text()).toContain('Token 2,000 / 100,000')
   expect(wrapper.get('[data-ledger="game"]').text()).not.toContain('9,000')
-  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
-  expect(wrapper.get('.usage>summary').text()).toBe('对话 · Token 2,000 / 100,000')
+  expect(wrapper.find('[aria-label="消息模式"]').exists()).toBe(false)
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 不限 轮')
 })
 
 it('游戏已不在内存时从独立game快照回看，普通聊天0上限不会把游玩历史显示成无限',async()=>{
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'finished',limits:{...limits,max_tokens:0},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,actions:20,total_tokens:17000},game_limits:{...limits,max_turns:30,max_tokens:64000}}
   const wrapper=await create()
-  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 64,000')
+  expect(wrapper.get('.usage>summary').text()).toContain('游玩 17,000 / 64,000')
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 30 轮')
   expect(wrapper.get('[data-ledger="chat"]').text()).toContain('Token 2,000 / 不限')
-  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
-  expect(wrapper.get('.usage>summary').text()).toBe('对话 · Token 2,000 / 不限')
+  expect(wrapper.get('.usage>summary').text()).toContain('对话 2,000 / 不限')
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 64,000')
 })
 it('已结束游玩使用持久game快照，运行时残留的历史Session不覆盖它',async()=>{
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'finished',limits:{...limits},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:{...limits,max_tokens:64000}}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'finished',limits:{...limits,max_tokens:0},usage:{turns:99,total_tokens:99000}}]
   const wrapper=await create()
-  expect(wrapper.get('.usage>summary').text()).toBe('游玩 · Token 17,000 / 64,000')
+  expect(wrapper.get('.usage>summary').text()).toContain('游玩 17,000 / 64,000')
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 40 轮')
 })
 
-it('普通对话设0只提交chat预算，改回游玩时按独立game预算编辑并提交',async()=>{
+it('对话与游玩预算同时可编辑且分别提交，无需切换消息模式',async()=>{
   const originalGameLimits={...limits,max_turns:200,max_tokens:200000}
   record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:originalGameLimits}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:originalGameLimits,usage:{turns:17,total_tokens:17000}}]
   const wrapper=await create()
-  await wrapper.get('[aria-label="消息模式"]').setValue('chat')
   await button(wrapper,'预算').trigger('click')
   await wrapper.get('[aria-label="聊天累计 Token预算"]').setValue(0)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('暂停期间解释装备')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'暂停期间解释装备',attached_memory:[],limits:{...limits,max_tokens:0}})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'暂停期间解释装备',device_id:'phone',attached_memory:[],limits:{...limits,max_tokens:0},game_limits:originalGameLimits})
   expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 200,000')
-  await wrapper.get('[aria-label="消息模式"]').setValue('game')
   expect(wrapper.get('[aria-label="游玩累计 Token预算"]').element.value).toBe('200000')
   for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="游玩${field}预算"]`).setValue(0)
   await wrapper.get('[aria-label="Agent 消息"]').setValue('改为无限预算探索')
   await wrapper.get('.composer form').trigger('submit');await flushPromises()
-  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'改为无限预算探索',attached_memory:[],game_session_id:'s1',resume:false,limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'s1',message:'改为无限预算探索',device_id:'phone',attached_memory:[],game_limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+})
+
+it('重新打开对话时待用0预算优先填编辑框，实际游戏有限预算仍显示在账本',async()=>{
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout']})
+  const requested={max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}
+  const applied={...limits,max_turns:30,max_tokens:64000}
+  record={conversation_id:'c1',game_session_id:'s1',content_package:'default',state:'idle',limits,requested_game_limits:requested,game_limits:applied,game_usage:{turns:17,total_tokens:17000}}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:applied,usage:{turns:17,total_tokens:17000}}]
+  const wrapper=await create()
+  await button(wrapper,'预算').trigger('click')
+  expect(wrapper.get('[aria-label="游玩累计 Token预算"]').element.value).toBe('0')
+  expect(wrapper.get('[aria-label="游玩模型轮数预算"]').element.value).toBe('0')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 64,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 30 轮')
+  expect(wrapper.get('.chat-budget').text()).toContain('修改不会自动恢复设备')
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('查询装备攻略，保持暂停')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'查询装备攻略，保持暂停',device_id:'phone',attached_memory:[],game_limits:requested})
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.resume')).toBe(false)
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 64,000')
+  session=[];record.state='finished'
+  await vi.advanceTimersByTimeAsync(500);await flushPromises()
+  expect(wrapper.get('[aria-label="游玩累计 Token预算"]').element.value).toBe('0')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('Token 17,000 / 64,000')
+  expect(wrapper.get('[data-ledger="game"]').text()).toContain('模型 17 / 30 轮')
+})
+
+it('新消息触发的安全暂停解释Agent接收指令，记忆查询保持暂停，继续按钮仍显式',async()=>{
+  record={conversation_id:'c1',content_package:'default',game_session_id:'s1',state:'running',limits}
+  session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits,pause_reason:{code:'agent_user_message',title:'收到新消息，Agent 正在决定后续',detail:'当前动作已完成暂停屏障，暂不执行',guidance:'查询或修改记忆保持暂停'}}]
+  const implementation=mocks.call.getMockImplementation()
+  mocks.call.mockImplementation(async(id,action,values)=>{if(action==='session.resume'){session[0].state='resuming';return{}};return implementation(id,action,values)})
+  const wrapper=await create()
+  expect(wrapper.get('.game-controls').text()).toContain('收到新消息，Agent 正在决定后续')
+  expect(wrapper.get('.mode-guidance').text()).toContain('Agent 正在处理这条消息')
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('查一下以前的装备经验')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.resume')).toBe(false)
+  await button(wrapper,'明确继续 AI 游玩').trigger('click');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.resume',{session_id:'s1'})
+})
+
+it('当前设备变化仅更新消息上下文，攻略不被其他设备或外部会话阻断',async()=>{
+  record={conversation_id:'c1',content_package:'default',state:'idle',limits}
+  session=[{session_id:'external',device_id:'browser',content_package:'default',mode:'mcp',state:'running'}]
+  const wrapper=await create()
+  context.deviceId='browser';await flushPromises()
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('解释一下攻略术语')
+  expect(wrapper.get('.composer button[type="submit"]').element.disabled).toBe(false)
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',{conversation_id:'c1',message:'解释一下攻略术语',device_id:'browser',attached_memory:[],game_limits:limits})
+  await button(wrapper,'外部 MCP').trigger('click')
+  expect(wrapper.emitted('settings').at(-1)).toEqual(['mcp'])
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
 })

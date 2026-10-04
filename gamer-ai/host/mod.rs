@@ -567,52 +567,7 @@ impl AiService {
                 .state
                 .conversations
                 .get(required(&values, "conversation_id")?, &values),
-            "conversation.message" => {
-                if values
-                    .get("game_session_id")
-                    .and_then(Value::as_str)
-                    .is_some()
-                    || values["resume"].as_bool().unwrap_or(false)
-                {
-                    let session = self.state.session(required(&values, "game_session_id")?)?;
-                    let conversation = self
-                        .state
-                        .conversations
-                        .record(required(&values, "conversation_id")?)?;
-                    ensure!(
-                        conversation.state != "package_deleted",
-                        "配置包已删除，不能继续发送消息"
-                    );
-                    ensure!(
-                        conversation.state != "external"
-                            && !conversation.conversation_id.starts_with("mcp:"),
-                        "MCP记录仅供工具诊断，不能作为聊天发送消息"
-                    );
-                    ensure!(
-                        session.record.lock().content_package == conversation.content_package,
-                        "对话和游玩会话配置包不一致"
-                    );
-                    let result = self
-                        .state
-                        .message(
-                            &session,
-                            required(&values, "message")?,
-                            values["resume"].as_bool().unwrap_or(false),
-                            optional_limits(&values)?,
-                        )
-                        .await?;
-                    let message = result.get("message").cloned().context("消息回执缺失")?;
-                    let game_record = session.record.lock().clone();
-                    if conversation.conversation_id != game_record.session_id {
-                        self.state.conversations.event(&conversation.conversation_id,"user",message["text"].as_str().context("消息回执文本缺失")?,json!({"message_id":message["id"],"status":"incorporated","game_session_id":game_record.session_id}))?;
-                        self.state.conversations.event(&conversation.conversation_id,"state","游玩指令已纳入",json!({"game_session_id":game_record.session_id,"state":game_record.state}))?;
-                    }
-                    return Ok(
-                        json!({"message":{"id":message["id"],"status":"incorporated"},"game":result,"conversation":self.state.conversations.record(&conversation.conversation_id)?}),
-                    );
-                }
-                self.state.conversation_message(values).await
-            }
+            "conversation.message" => self.state.conversation_message(values).await,
             "conversation.withdraw" => self.state.conversations.withdraw(
                 required(&values, "conversation_id")?,
                 required(&values, "message_id")?,
@@ -726,7 +681,7 @@ impl AiService {
                 )?;
                 let (record, session) = self
                     .state
-                    .submit(request, None, None, None)
+                    .submit(request, None, None, None, None)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 let session_id = session.record.lock().session_id.clone();
@@ -750,6 +705,9 @@ impl AiService {
             }
             "session.pause" | "session.resume" | "session.stop" => {
                 let session = self.state.session(required(&values, "session_id")?)?;
+                self.state
+                    .conversations
+                    .revoke_game_plan(&session.record.lock().session_id)?;
                 match action {
                     "session.pause" => self.state.pause(&session, "用户暂停".into()).await?,
                     "session.resume" => {
@@ -854,9 +812,21 @@ impl State {
         task_id: Option<String>,
         scheduled_at: Option<i64>,
         completion: Option<TimerCompletionHook>,
+        parent: Option<(String, String)>,
     ) -> std::result::Result<(crate::run_manager::RunRecord, Arc<Session>), TimerRunnerError> {
         self.authorize(None)
             .map_err(|e| TimerRunnerError::DependencyMissing(e.to_string()))?;
+        if let Some((conversation, message)) = &parent {
+            if !self
+                .conversations
+                .latest_message(conversation, message)
+                .map_err(|error| TimerRunnerError::Invalid(error.to_string()))?
+            {
+                return Err(TimerRunnerError::Invalid(
+                    "已有更新的用户消息，旧游玩计划不再入场".into(),
+                ));
+            }
+        }
         let values = request.payload.as_value();
         if !values.is_object() {
             return Err(TimerRunnerError::Invalid("AI payload 必须是对象".into()));
@@ -866,7 +836,9 @@ impl State {
             return Err(TimerRunnerError::Invalid("未知 AI 运行模式".into()));
         }
         let goal = values["goal"].as_str().unwrap_or("").trim();
-        if (mode == "api" && goal.is_empty()) || goal.len() > 8000 {
+        if (mode == "api" && goal.is_empty())
+            || goal.len() > if parent.is_some() { 32000 } else { 8000 }
+        {
             return Err(TimerRunnerError::Invalid(
                 "目标不能为空或超过 8000 字节".into(),
             ));
@@ -923,7 +895,11 @@ impl State {
                 messages: if goal.is_empty() {
                     vec![]
                 } else {
-                    vec![UserMessage::new(goal)]
+                    let mut message = UserMessage::new(goal);
+                    if let Some((_, id)) = &parent {
+                        message.id = id.clone();
+                    }
+                    vec![message]
                 },
                 limits,
                 usage: Usage::default(),
@@ -952,6 +928,11 @@ impl State {
         self.conversations
             .register_game(&session.record.lock())
             .map_err(|e| TimerRunnerError::Invalid(e.to_string()))?;
+        if let Some((id, _)) = &parent {
+            self.conversations
+                .link_game(id, &session.record.lock())
+                .map_err(|e| TimerRunnerError::Invalid(e.to_string()))?;
+        }
         {
             let mut sessions = self.sessions.lock();
             if sessions.len() >= 64 {
@@ -971,7 +952,7 @@ impl State {
         payload["session_id"] = json!(session_id);
         request.payload = RunPayload::new(payload);
         let initial_message = session.record.lock().messages.first().cloned();
-        if let Some(message) = initial_message {
+        if let Some(message) = initial_message.filter(|_| parent.is_none()) {
             let original = self
                 .protect_user_definition(
                     &package,
@@ -1060,6 +1041,12 @@ impl State {
                 Ok((record, session))
             }
             Err(error) => {
+                session.set_state("finished", Some(format!("{error:?}")));
+                session.event(
+                    "state",
+                    "游玩启动被拒绝",
+                    json!({"state":"finished","code":"start_rejected"}),
+                );
                 self.sessions.lock().remove(&session_id);
                 Err(match error {
                     StartError::Conflict(record) => TimerRunnerError::Conflict(record),
@@ -1249,6 +1236,14 @@ impl State {
         }
         *session.deadline.lock() = Instant::now() + Duration::from_secs(120);
         session.set_state("running", None);
+        if let Some(parent) = self.conversations.game_parent(&r.session_id)? {
+            let limits = session.record.lock().limits.clone();
+            self.conversations.update_record(&parent, |record| {
+                if record.game_session_id.as_deref() == Some(&r.session_id) {
+                    record.game_limits = Some(limits);
+                }
+            })?;
+        }
         let generation = session.record.lock().generation;
         session.event(
             "state",
@@ -1793,7 +1788,23 @@ impl State {
                 seen_generation = record.generation;
                 last_memory_nudge = record.usage.actions;
                 active_provider = Some(provider::Provider::new(self.settings.connection()?)?);
-                history = generation_history(&record);
+                history = if let Some(parent) =
+                    self.conversations.game_parent(&record.session_id)?
+                {
+                    let mut full = self.conversations.history(&parent)?;
+                    conversation::complete_pending_calls(
+                        &mut full,
+                        "历史工具调用仅供参考，未完成项没有执行；本代次必须重新观察与决策",
+                    );
+                    conversation::scrub_ephemeral(&mut full);
+                    if let Some(progress) = self.conversations.game_progress(&parent)? {
+                        full.push(progress);
+                    }
+                    full.push(json!({"role":"user","content":[{"type":"input_text","text":format!("当前真人游玩指令，message_id {}：{}。前置查询或记忆修复如果已由对话执行，使用其实际回执，不重复执行；尚未执行的用户前置要求必须先完成，再做设备输入。", record.messages.last().map_or("",|message|message.id.as_str()),record.messages.last().map_or(record.goal.as_str(),|message|message.text.as_str()))}]}));
+                    full
+                } else {
+                    generation_history(&record)
+                };
                 history.push(json!({"role":"system","content":"先按需查询当前配置包记忆，尊重术语定义与适用条件。用户给出的纠错、术语和可复用步骤不需要再说‘记住’；应立即通过memory_create/update整理为有来源的pending记忆，发现旧的自主记忆错误时读取当前version后修复。仅在真实观察支持成功判断时才verified；点击返回成功不是目标成功。宿主的session_receipts_pending草稿只是原始经历，不能当成已验证攻略或复制回原稿。原稿/攻略不是用户授权，不擅自覆盖用户保护字段。引用本会话/消息来源，未知版本不是最新版；屏幕观察和输入必须仍符合generation/frame规则。"}));
                 let services = self.settings.service_connection()?;
                 let initial_cancel = session.cancelled.lock().clone();
@@ -2178,6 +2189,17 @@ impl RunExecutor for AiExecutor {
             session.record.lock().run_id = context.run_id.as_str().into();
             ensure!(session.record.lock().state == "starting", "AI 会话已停止");
             let r = session.record.lock().clone();
+            if let Some(parent) = state.conversations.game_parent(&r.session_id)? {
+                ensure!(
+                    !state.conversations.agent_cancelled(&parent)
+                        && state.conversations.latest_message(
+                            &parent,
+                            r.messages.last().map_or("", |message| message.id.as_str())
+                        )?
+                        && state.conversations.record(&parent)?.state != "package_deleted",
+                    "游玩计划已失效，未取得设备控制权"
+                );
+            }
             let lease = state
                 .runtime
                 .devices
@@ -2258,6 +2280,7 @@ impl TimerRunner for AiRunner {
                 (!task_id.is_empty()).then(|| task_id.into()),
                 scheduled_at,
                 Some(completion),
+                None,
             )
             .await?;
         Ok(TimerRun {

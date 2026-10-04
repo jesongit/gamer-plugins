@@ -2,6 +2,8 @@
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
 import PromptSettings from './PromptSettings.vue'
+import BudgetFields from './BudgetFields.vue'
+import { DEFAULT_LIMITS, LIMIT_FIELDS, validLimits } from './budget-format'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 import { PROTOCOLS, budgetValue, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
 
@@ -28,13 +30,24 @@ const settings = reactive({ base_url: PROTOCOLS.responses.baseUrl, model: 'glm-5
 const tokenForm = reactive({ label: '', control: false, ttl_seconds: 120, device_scope: 'selected', memory_read: false, memory_write: false, protected_write: false, web_search: false })
 const createdToken = ref(null), copied = ref('')
 const mcpEndpoint = `${globalThis.location?.origin || 'http://127.0.0.1:8443'}/api/extensions/gamer-ai/mcp`
-const selectedSession = computed(() => props.settingsOnly && props.initialGameOptions?.session_id ? sessions.value.find(s => s.session_id === props.initialGameOptions.session_id)
+const selectedSession = computed(() => props.settingsOnly ? sessions.value.find(s => s.session_id === props.initialGameOptions?.session_id) || null
   : newConversation.value ? null : sessions.value.find(s => s.session_id === selectedId.value)
   || sessions.value.find(s => s.device_id === deviceId.value && isActive(s))
   || sessions.value.find(s => s.device_id === deviceId.value) || null)
 const currentActive = computed(() => sessions.value.find(s => s.device_id === deviceId.value && isActive(s)))
 const controlSession = computed(() => sessions.value.find(s => s.device_id === deviceId.value
   && s.content_package === packageId.value && s.mode === 'mcp' && isActive(s)))
+const externalGoal = ref(''), externalLimits = reactive({...DEFAULT_LIMITS})
+const canStartExternal = computed(() => !!deviceId.value && !!packageId.value && !!externalGoal.value.trim()
+  && new TextEncoder().encode(externalGoal.value.trim()).length<=8000 && validLimits(externalLimits)
+  && statusFresh.value && !currentActive.value && !busy.value && !controlBusy.value)
+const externalBudgetBlocked = computed(() => {
+  const usage=controlSession.value?.usage || {}
+  return ['max_turns','max_actions','max_seconds','max_tokens'].some(key=>{
+    const used=key==='max_turns'?usage.turns:key==='max_actions'?usage.actions:key==='max_seconds'?usage.active_seconds:usage.total_tokens??usage.known_tokens
+    return externalLimits[key]>0 && (used || 0)>=externalLimits[key]
+  })
+})
 const goalBytes = computed(() => new TextEncoder().encode(goal.value.trim()).length)
 const canStart = computed(() => !!deviceId.value && !!packageId.value && !!goal.value.trim() && goalBytes.value <= 8000
   && statusFresh.value && !currentActive.value && (mode.value === 'mcp' || !!saved.value?.has_key))
@@ -116,6 +129,28 @@ async function start() {
     feedback.value = mode.value === 'mcp' ? '外部控制会话已建立；客户端可使用匹配目标的控制令牌调用工具。' : 'AI 会话已提交。'
   })
 }
+async function startExternal() {
+  if(!canStartExternal.value) return
+  await operate('建立外部控制会话',async()=>{
+    const result=await call('session.start',{device_id:deviceId.value,content_package:packageId.value,
+      goal:externalGoal.value.trim(),mode:'mcp',limits:{...externalLimits}})
+    externalGoal.value=''
+    await refresh()
+    feedback.value='外部 MCP 会话已建立；创建观察与操作令牌后连接外部客户端。'
+    if(result?.conversation_id)emit('session-start',{conversation_id:result.conversation_id})
+  })
+}
+async function externalControl(action) {
+  const session=controlSession.value
+  if(!session || controlBusy.value || !statusFresh.value || action==='resume' && (session.state!=='paused' || !validLimits(externalLimits) || externalBudgetBlocked.value))return
+  controlBusy.value=action;error.value=''
+  try {
+    await call(`session.${action}`,{session_id:session.session_id,
+      ...(action==='resume' && LIMIT_FIELDS.some(field=>externalLimits[field.key]!==session.limits?.[field.key]) ? {limits:{...externalLimits}} : {})})
+    await refresh()
+  } catch(e) {if(!disposed)error.value=e.message || '外部会话控制失败'}
+  finally {if(!disposed)controlBusy.value=''}
+}
 async function sendMessage(resume = true) {
   if (!canSend.value) return
   if (resume && (!limitsValid.value || (selectedSession.value?.state === 'paused' && budgetBlocked.value))) return
@@ -150,6 +185,9 @@ watch(() => `${selectedSession.value?.session_id}:${selectedSession.value?.state
   if (!selectedSession.value) return
   for (const field of limitFields) if (selectedSession.value.limits?.[field.key] != null) limits[field.key] = selectedSession.value.limits[field.key]
 }, { immediate: true })
+watch(() => `${deviceId.value}:${packageId.value}:${controlSession.value?.session_id}:${controlSession.value?.state}`,()=>{
+  Object.assign(externalLimits,controlSession.value?.limits || DEFAULT_LIMITS)
+})
 async function control(action) {
   const session = selectedSession.value
   if (!session || controlBusy.value || (action === 'resume' && !canResume.value)) return
@@ -222,7 +260,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settings.api_key = ''; createdToken.value = null })
 watch(() => props.initialSection, section => { if (props.settingsOnly) settingsSection.value = section })
-watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-options',{limits:{...limits},mode:mode.value}) })
+watch(() => ({...limits}), () => { if (props.settingsOnly) emit('game-options',{limits:{...limits}}) })
 </script>
 
 <template>
@@ -280,6 +318,13 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
         </section>
       </div>
       <div v-show="settingsSection === 'mcp'" id="ai-mcp" class="section-stack">
+        <section v-if="settingsOnly" aria-label="外部 MCP 控制会话">
+          <h3>外部 MCP 控制会话</h3>
+          <p class="hint">由你显式建立，供外部 AI 客户端控制；内置 Agent 不会自动建立或接管外部会话。</p>
+          <template v-if="controlSession"><p>{{ deviceName }} · {{ stateLabel(controlSession.state) }}</p><p class="hint">{{ controlHint(controlSession) }}</p><p v-if="controlSession.pause_reason" class="hint">{{ controlSession.pause_reason.title }}：{{ controlSession.pause_reason.detail }}</p><div class="actions"><button v-if="['starting','running','resuming'].includes(controlSession.state)" type="button" :disabled="!!controlBusy" @click="externalControl('pause')">暂停外部会话</button><button v-if="controlSession.state==='paused'" type="button" :disabled="!!controlBusy || !validLimits(externalLimits) || externalBudgetBlocked" @click="externalControl('resume')">明确继续外部会话</button><button type="button" :disabled="!!controlBusy" @click="externalControl('stop')">停止外部会话</button><button type="button" @click="emit('session-start',{conversation_id:controlSession.session_id})">查看外部会话记录</button></div></template>
+          <form v-else aria-label="建立外部 MCP 控制会话" @submit.prevent="startExternal"><label>外部会话目标<textarea v-model="externalGoal" aria-label="外部 MCP 会话目标" rows="2" placeholder="提供给外部客户端的游玩目标…" /></label><p v-if="currentActive" class="hint">当前设备已有活动会话，请先停止该会话再建立外部控制。</p><p v-else-if="!deviceId || !packageId" class="hint">建立外部控制会话需要选择设备和配置包。</p><button type="submit" :disabled="!canStartExternal">建立外部 MCP 控制会话</button></form>
+          <details><summary>外部会话预算 · 每项 0 表示无限</summary><BudgetFields :model-value="externalLimits" prefix="外部 MCP" @update:model-value="Object.assign(externalLimits,$event)" /><p v-if="!validLimits(externalLimits)" class="error">请修正预算，非零数值须在允许范围内。</p><p v-if="externalBudgetBlocked" class="error">当前预算已用尽；提高对应上限或设为 0，再明确继续。</p></details>
+        </section>
         <section aria-label="MCP 接入">
           <h3>本机 MCP</h3>
           <p class="hint">使用 Streamable HTTP，仅接受运行 Gamer 服务端电脑上的客户端连接。独立 Bearer 令牌不使用管理登录 Cookie；可撤销，并有有效期。</p>
@@ -287,7 +332,7 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
           <button type="button" @click="copy(mcpEndpoint, '地址')">{{ copied === '地址' ? '已复制地址' : '复制地址' }}</button>
           <p class="hint">若当前页面通过其他电脑或非回环地址打开，请在服务端电脑上改用相同端口的 localhost 地址连接。</p>
           <div class="context-line"><span>授权设备：{{ deviceName }}</span><span>配置包：{{ packageId || '未选择' }}</span></div>
-          <form @submit.prevent="createToken"><fieldset :disabled="!!busy">
+          <form aria-label="创建 MCP 令牌" @submit.prevent="createToken"><fieldset :disabled="!!busy">
             <label>令牌备注<input v-model="tokenForm.label" aria-label="令牌备注" maxlength="80" placeholder="例如：本机 AI 客户端" /></label>
             <label>授权范围<select v-model="tokenForm.control" aria-label="授权范围"><option :value="false">只读观察 · 上下文与截图</option><option :value="true">观察与操作 · 仅已建立的外部会话</option></select></label>
             <label>设备绑定<select v-model="tokenForm.device_scope" aria-label="令牌设备绑定" @change="tokenForm.device_scope === 'none' && (tokenForm.control = false)"><option value="selected">当前设备</option><option value="none">不绑定设备 · 仅记忆与已授权联网</option></select></label>
@@ -299,7 +344,7 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
             <label>控制租约超时（秒）<input v-model.number="tokenForm.ttl_seconds" aria-label="控制租约超时（秒）" type="number" min="30" max="3600" step="1" required /></label>
             <button type="submit" :disabled="!packageId || (tokenForm.device_scope === 'selected' && !deviceId) || (tokenForm.device_scope === 'none' && !(tokenForm.memory_read || tokenForm.memory_write || tokenForm.web_search)) || (tokenForm.control && (tokenForm.device_scope === 'none' || !controlSession))">创建连接令牌</button>
           </fieldset></form>
-          <p v-if="tokenForm.control && !controlSession" class="hint">请先在新会话的“预算”中选择“外部 AI”，并建立当前设备与配置包的控制会话。</p>
+          <p v-if="tokenForm.control && !controlSession" class="hint">请先显式建立当前设备与配置包的外部 MCP 控制会话，再创建操作令牌。</p>
           <p v-if="controlSession" class="hint">外部控制会话：{{ stateLabel(controlSession.state) }}。控制客户端仍须遵守暂停状态，不能自行恢复或更换目标。</p>
           <template v-if="createdToken"><label>新连接令牌<input :value="createdToken.token" type="password" readonly aria-label="新连接令牌" @focus="$event.target.select()" /></label><div class="actions"><button type="button" @click="copy(createdToken.token, '令牌')">{{ copied === '令牌' ? '已复制令牌' : '复制令牌' }}</button><button type="button" @click="createdToken = null">收起令牌</button></div><p class="hint">令牌有效期 24 小时；控制租约 {{ createdToken.ttl_seconds }} 秒。客户端须在租约期限内发送有效工具请求或 ping 续租；失联、令牌到期或撤销会暂停，需要用户恢复。</p></template>
           <details :open="!!createdToken"><summary>客户端配置示例</summary><pre>{{ clientConfig }}</pre><button type="button" @click="copy(clientConfig, '配置')">{{ copied === '配置' ? '已复制配置' : '复制配置' }}</button><p class="hint">示例适用于支持 URL 与 headers 的 MCP 客户端，请按客户端要求填写。完整令牌只在创建时提供，不会写入配置包或浏览器存储。</p></details>
@@ -315,7 +360,7 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
         <h3>运行预算</h3>
         <p class="hint">所有预算均可设为 0（无上限），用量仍会累计。暂停时可提高上限或设为 0，再明确继续；只有修改过的预算才会提交。继续时重新计算连续失败次数。</p>
         <fieldset :disabled="isActive(selectedSession) && selectedSession.state !== 'paused'">
-          <label>控制方式<select v-model="mode" aria-label="控制方式" :disabled="isActive(selectedSession)"><option value="api">内置 AI · 模型 API</option><option value="mcp">外部 AI · MCP 客户端</option></select></label>
+          <label v-if="!settingsOnly">控制方式<select v-model="mode" aria-label="控制方式" :disabled="isActive(selectedSession)"><option value="api">内置 AI · 模型 API</option><option value="mcp">外部 AI · MCP 客户端</option></select></label>
           <div class="budget-grid"><label v-for="field in limitFields" :key="field.key">{{ field.label }}<input v-model.number="limits[field.key]" :aria-label="field.label" :data-budget="field.key" type="number" :min="field.min" :max="field.max" step="1" required /><small class="hint">0 无上限；非零范围 {{ field.nonZeroMin.toLocaleString('zh-CN') }}–{{ field.max.toLocaleString('zh-CN') }}</small></label></div>
         </fieldset>
         <p v-if="!limitsValid" class="error">运行预算超出允许范围，请修正后发送或继续。</p>

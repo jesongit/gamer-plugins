@@ -27,8 +27,9 @@ export function requestTools(snapshot) {
 export const SCOPE_LABELS = { chat: '对话', game: '游玩', import: '记忆整理' }
 export function toolAccess(snapshot, scope) {
   const tools = requestTools(snapshot)
+  if (tools.some(tool => /^(gameplay_(start|status|pause|stop|resume|handoff)|agent_continue)$/.test(tool.name))) return '本轮提供 Agent 游玩编排工具，可根据消息查询记忆、检查设备状态并安排游玩。设备操作仍须通过真实会话和暂停屏障；查询或修改记忆不会恢复暂停。'
   if (tools.some(tool => /^(screen_capture|input_|app_|session_finish)/.test(tool.name))) return '本轮已提供设备观察与操作工具，实际调用仍由设备会话权限和暂停屏障校验。'
-  if (scope === 'chat') return '普通对话仅提供攻略与记忆等工具，未授予设备操作；需要选择游玩并发送目标，或明确继续已暂停的游玩。'
+  if (scope === 'chat') return '本轮仅提供攻略与记忆等工具，未授予设备操作。是否安排游玩由 Agent 根据消息与设备状态判断；请查看实际工具目录。'
   if (scope === 'import') return '后台记忆整理不提供设备操作工具。'
   return '本轮未提供设备操作工具；请查看实际工具目录和设备会话状态。'
 }

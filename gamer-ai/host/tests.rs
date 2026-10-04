@@ -279,8 +279,10 @@ async fn controlled_session(ai: &AiService) -> Arc<Session> {
     session
 }
 #[tokio::test]
-async fn explicit_game_messages_respect_readonly_conversations_and_keep_their_own_receipts() {
+async fn unified_game_messages_reject_readonly_history_and_client_resume_flags() {
     let (_root, ai, _extensions) = fixture().await;
+    let saved = ai.state.settings.read().unwrap();
+    ai.dispatch("settings.save",json!({"expected_version":saved["version"],"base_url":"http://127.0.0.1:9","model":"synthetic","protocol":"responses","api_key":"synthetic-local-key","request_timeout_secs":5})).await.unwrap();
     let session = controlled_session(&ai).await;
     ai.state.pause(&session, "test pause".into()).await.unwrap();
     ai.state
@@ -320,16 +322,22 @@ async fn explicit_game_messages_respect_readonly_conversations_and_keep_their_ow
         .unwrap();
     let chat_id = chat["conversation"]["conversation_id"].as_str().unwrap();
     let (first, second) = tokio::join!(
-        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"先领取奖励","resume":false})),
-        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"然后检查背包","resume":false}))
+        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"先领取奖励","resume":true})),
+        ai.dispatch("conversation.message", json!({"conversation_id":chat_id,"game_session_id":"s","message":"然后检查背包","resume":true}))
     );
     let first = first.unwrap();
     let second = second.unwrap();
     assert_ne!(first["message"]["id"], second["message"]["id"]);
-    assert_eq!(first["message"]["id"], first["game"]["message"]["id"]);
-    assert_eq!(second["message"]["id"], second["game"]["message"]["id"]);
-    assert_eq!(first["game"]["message"]["text"], "先领取奖励");
-    assert_eq!(second["game"]["message"]["text"], "然后检查背包");
+    assert!(first.get("game").is_none());
+    assert!(second.get("game").is_none());
+    assert!(ai
+        .state
+        .conversations
+        .record(chat_id)
+        .unwrap()
+        .game_session_id
+        .is_none());
+    assert_eq!(session.record.lock().messages.len(), before);
     assert_eq!(session.record.lock().state, "paused");
     ai.state.stop_all().await;
 }
@@ -1262,16 +1270,31 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
     let turn_copy = turn.clone();
     let stall = Arc::new(AtomicBool::new(false));
     let stall_copy = stall.clone();
-    let app=Router::new().route("/",get(||async {Html("<!doctype html><style>body{margin:0;background:#123456}button{position:absolute;left:20px;top:20px;width:120px;height:60px}</style><button onclick='document.body.style.background=\"#abcdef\";window.clicks=(window.clicks||0)+1'>Play</button>")})).route("/responses",post(move|Json(body):Json<Value>|{let turn=turn_copy.clone();let stall=stall_copy.clone();async move {
+    let unified_hold = Arc::new(AtomicBool::new(false));
+    let hold_copy = unified_hold.clone();
+    let app=Router::new().route("/",get(||async {Html("<!doctype html><style>body{margin:0;background:#123456}button{position:absolute;left:20px;top:20px;width:120px;height:60px}</style><button onclick='document.body.style.background=\"#abcdef\";window.clicks=(window.clicks||0)+1'>Play</button>")})).route("/responses",post(move|Json(body):Json<Value>|{let turn=turn_copy.clone();let stall=stall_copy.clone();let hold=hold_copy.clone();async move {
         // Paused gameplay now archives receipts using the same model endpoint.
         // That text-only request must not consume a gameplay turn or require an image.
         if body["tools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["name"]=="memory_import_finish")) {
             return Json(json!({"status":"completed","output":[{"type":"function_call","id":"archive-fixture","call_id":"archive-fixture","name":"memory_import_finish","arguments":json!({"disposition":"skipped","reason":"合成浏览器测试页面不提供可复用的真实游戏攻略"}).to_string()}],"usage":{"total_tokens":2}}));
         }
+        let available = |name: &str| body["tools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["name"]==name));
+        if available("agent_continue") || available("gameplay_handoff") {
+            let current = body["input"].as_array().unwrap().iter().rev().find(|item|item["role"]=="user").unwrap().to_string();
+            let name = if available("gameplay_handoff") { "gameplay_handoff" }
+                else if current.contains("仅查询") { "agent_continue" }
+                else if current.contains("继续刚才") { "gameplay_resume" }
+                else { "gameplay_start" };
+            assert!(available(name), "expected orchestration tool {name}");
+            return Json(json!({"status":"completed","output":[{"type":"function_call","id":name,"call_id":name,"name":name,"arguments":"{}"}],"usage":{"total_tokens":3}}));
+        }
+        if !available("screen_capture") {
+            return Json(json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"仅说明攻略，保持设备暂停。"}]}],"usage":{"total_tokens":4}}));
+        }
         if stall.load(Ordering::Acquire) {tokio::time::sleep(Duration::from_secs(20)).await;}
         let index=turn.fetch_add(1,Ordering::SeqCst);let history=body["input"].to_string();assert!(history.contains("input_image"),"model must receive real image input");
         fn find_frame(value:&Value)->Option<String>{match value {Value::Object(object)=>{if let Some(id)=object.get("frame_id").and_then(Value::as_str){return Some(id.into());}object.values().rev().find_map(find_frame)},Value::Array(values)=>values.iter().rev().find_map(find_frame),Value::String(s)=>serde_json::from_str::<Value>(s).ok().and_then(|v|find_frame(&v)),_=>None}}
-        let (name,args)=match index {0=>("screen_capture",json!({})),1=>("input_tap",json!({"frame_id":find_frame(&body).expect("frame metadata"),"x":70,"y":45})),2=>("screen_capture",json!({})),_=>("session_finish",json!({"message":"测试目标已完成"}))};
+        let (name,args)=match index {0=>("screen_capture",json!({})),1=>("input_tap",json!({"frame_id":find_frame(&body).expect("frame metadata"),"x":70,"y":45})),2=>("screen_capture",json!({})),_ if hold.load(Ordering::Acquire)=>("wait",json!({"duration_ms":500})),_=>("session_finish",json!({"message":"测试目标已完成"}))};
         Json(json!({"status":"completed","output":[{"type":"function_call","id":format!("fc{index}"),"call_id":format!("c{index}"),"name":name,"arguments":args.to_string()}],"usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}))
     }}));
     let server = tokio::spawn(async move {
@@ -1504,12 +1527,103 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
             .manual_allowed
     );
     extensions.enable_and_start(&id, None, None).await.unwrap();
-    let started=ai.dispatch("session.start",json!({"device_id":target.id,"content_package":"default","mode":"api","goal":"点击 Play，然后检查背景颜色"})).await.unwrap();
-    let session = ai
-        .state
-        .session(started["session_id"].as_str().unwrap())
+    let chat = ai
+        .dispatch(
+            "conversation.create",
+            json!({"content_package":"default","title":"统一入口浏览器闭环"}),
+        )
+        .await
         .unwrap();
+    let chat_id = chat["conversation"]["conversation_id"].as_str().unwrap();
+    ai.state
+        .conversations
+        .save_history(
+            chat_id,
+            &[json!({"role":"user","content":"之前讨论的限制：只点击 Play，不访问其他页面。"})],
+        )
+        .unwrap();
+    unified_hold.store(true, Ordering::Release);
+    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"点击 Play，然后检查背景颜色","limits":unlimited_limits(),"game_limits":unlimited_limits()})).await.unwrap();
+    let game_id = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(id) = ai
+                .state
+                .conversations
+                .record(chat_id)
+                .unwrap()
+                .game_session_id
+            {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let session = ai.state.session(&game_id).unwrap();
+    wait_state(&session, "running").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while turn.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let first_generation = session.record.lock().generation;
+    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"仅查询攻略，说明当前步骤，暂时不要操作设备。","limits":unlimited_limits(),"game_limits":unlimited_limits()})).await.unwrap();
+    wait_state(&session, "paused").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ai
+            .state
+            .conversations
+            .get(chat_id, &json!({"limit":200}))
+            .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["kind"] == "assistant_final"
+                    && event["message"] == "仅说明攻略，保持设备暂停。"
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        ai.state
+            .runtime
+            .devices
+            .controls
+            .status(&target.id)
+            .manual_allowed
+    );
+    assert_eq!(session.record.lock().state, "paused");
+    unified_hold.store(false, Ordering::Release);
+    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"继续刚才的游玩，观察颜色后结束。","limits":unlimited_limits(),"game_limits":unlimited_limits()})).await.unwrap();
     wait_state(&session, "finished").await;
+    assert!(session.record.lock().generation > first_generation);
+    let page = ai
+        .state
+        .conversations
+        .get(chat_id, &json!({"limit":200}))
+        .unwrap();
+    assert!(page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "prompt_snapshot" && event["data"]["scope"] == "game"));
+    assert!(page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "tool_end" && event["data"]["name"] == "input_tap"));
+    assert!(
+        serde_json::to_string(&ai.state.conversations.history(chat_id).unwrap())
+            .unwrap()
+            .contains("之前讨论的限制")
+    );
     assert_eq!(session.record.lock().reason.as_deref(), Some("completed"));
     assert!(turn.load(Ordering::SeqCst) >= 4);
     assert!(session

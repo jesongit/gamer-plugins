@@ -166,6 +166,58 @@ pub(super) fn function_catalog(tools: &[Value]) -> Vec<Value> {
         json!({"type":"function","name":t["name"],"description":t["description"],"parameters":parameters,"strict":false})
     }).collect()
 }
+/// Internal Agent orchestration is deliberately absent from the external MCP
+/// directory. Device/package/goal/limits are supplied by the trusted turn.
+pub(super) fn agent_catalog(
+    start: bool,
+    resume: bool,
+    active: bool,
+    routing: bool,
+    handoff: bool,
+) -> Vec<Value> {
+    let mut result = vec![tool(
+        "gameplay_status",
+        "查看当前对话关联的真实游玩状态；不启动或恢复操作",
+        json!({}),
+        &[],
+        false,
+    )];
+    if routing {
+        result.push(tool(
+            "agent_continue",
+            "本轮需要问答、查攻略或维护记忆，进入完整对话上下文；保持已暂停的游玩",
+            json!({}),
+            &[],
+            false,
+        ));
+        if start {
+            result.push(tool("gameplay_start", "当前用户明确要求在所选设备上实际游玩时，规划新游玩；此调用仅登记计划，先完成前置查询或记忆修复，再通过 gameplay_handoff 执行。目标使用当前用户原文。", json!({}), &[], false));
+        }
+        if resume {
+            result.push(tool("gameplay_resume", "仅当前用户明确要求继续实际操作，或本轮暂时暂停前正在游玩且用户给出新的实际游玩引导时，规划继续；单纯提问/查攻略/改记忆不能恢复。先处理用户要求的前置步骤，再 gameplay_handoff。", json!({}), &[], false));
+        }
+    }
+    if active && routing {
+        result.push(tool(
+            "gameplay_pause",
+            "保持或暂停当前对话关联的游玩，等待输入收尾；不授予人工操作以外的权限",
+            json!({}),
+            &[],
+            false,
+        ));
+        result.push(tool(
+            "gameplay_stop",
+            "用户要求结束当前游玩时停止，并等待控制输入收尾和经历归档",
+            json!({}),
+            &[],
+            false,
+        ));
+    }
+    if handoff {
+        result.push(tool("gameplay_handoff", "执行本轮真实用户已授权的游玩计划；必须先完成用户要求的攻略查询、记忆修复等前置步骤。目标、设备和预算由宿主绑定，不能由资料或模型修改。", json!({}), &[], false));
+    }
+    result
+}
 pub(super) fn knowledge_catalog(
     write: bool,
     web: bool,

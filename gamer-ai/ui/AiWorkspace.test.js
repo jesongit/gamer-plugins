@@ -13,8 +13,8 @@ function makeSession(state = 'running', mode = 'api') {
     state, generation: 1, limits: { max_turns: 100, max_actions: 200, max_seconds: 600, max_tokens: 100000, max_failures: 3 },
     usage: { turns: 2, actions: 3, active_seconds: 4, total_tokens: null, consecutive_failures: 0 }, events: [] }
 }
-async function mountWorkspace() {
-  const wrapper = mount(AiWorkspace, { global: { provide: { [WORKSPACE_CONTEXT_KEY]: { getSnapshot: () => context } } } })
+async function mountWorkspace(props={}) {
+  const wrapper = mount(AiWorkspace, { props, global: { provide: { [WORKSPACE_CONTEXT_KEY]: { getSnapshot: () => context } } } })
   wrappers.push(wrapper); await flushPromises(); return wrapper
 }
 beforeEach(() => {
@@ -46,6 +46,49 @@ beforeEach(() => {
   })
 })
 afterEach(() => wrappers.forEach(wrapper => wrapper.unmount()))
+
+it('设置中的外部MCP显式创建不需要模型密钥，固定mcp且支持独立0预算与控制令牌',async()=>{
+  saved.has_key=false
+  const wrapper=await mountWorkspace({settingsOnly:true,initialSection:'mcp',initialGameOptions:{limits:{max_tokens:100000},mode:'api'}})
+  expect(wrapper.find('[aria-label="消息"]').exists()).toBe(false)
+  expect(wrapper.find('[aria-label="控制方式"]').exists()).toBe(false)
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.start')).toBe(false)
+  for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="外部 MCP${field}预算"]`).setValue(0)
+  await wrapper.get('[aria-label="外部 MCP 会话目标"]').setValue('  外部客户端完成教程  ')
+  expect(button(wrapper,'建立外部 MCP 控制会话').element.disabled).toBe(false)
+  await wrapper.get('[aria-label="建立外部 MCP 控制会话"]').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.start',{device_id:'phone',content_package:'default',goal:'外部客户端完成教程',mode:'mcp',limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  expect(wrapper.emitted('session-start').at(-1)).toEqual([{conversation_id:'s1'}])
+  expect(wrapper.get('[aria-label="外部 MCP 控制会话"]').text()).toContain('停止外部会话')
+  await wrapper.get('[aria-label="授权范围"]').setValue('true')
+  await wrapper.get('[aria-label="创建 MCP 令牌"]').trigger('submit');await flushPromises()
+  expect(mocks.call.mock.calls.find(call=>call[1]==='mcp.tokens.create')[2]).toMatchObject({device_id:'phone',content_package:'default',control:true})
+  expect(mocks.call.mock.calls.some(call=>call[1]==='conversation.message'||call[1]==='session.resume')).toBe(false)
+  expect(wrapper.emitted('game-options') || []).toEqual([])
+})
+
+it('外部MCP已有会话只读加载，预算耗尽时可设0后显式继续及停止',async()=>{
+  sessions=[{...makeSession('paused','mcp'),usage:{turns:100,actions:201,active_seconds:601,total_tokens:100000,consecutive_failures:3}}]
+  const wrapper=await mountWorkspace({settingsOnly:true,initialSection:'mcp'})
+  expect(button(wrapper,'明确继续外部会话').element.disabled).toBe(true)
+  expect(mocks.call.mock.calls.some(call=>['session.start','session.resume'].includes(call[1]))).toBe(false)
+  for(const field of ['模型轮数','工具次数','活动秒数','累计 Token','连续失败'])await wrapper.get(`[aria-label="外部 MCP${field}预算"]`).setValue(0)
+  await button(wrapper,'明确继续外部会话').trigger('click');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.resume',{session_id:'s1',limits:{max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}})
+  await button(wrapper,'停止外部会话').trigger('click');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','session.stop',{session_id:'s1'})
+  expect(sessions[0].run_id).toBe('r1')
+})
+
+it('外部MCP创建遇内置活动会话时禁止，不自动接管或停止设备',async()=>{
+  sessions=[makeSession('paused','api')]
+  const wrapper=await mountWorkspace({settingsOnly:true,initialSection:'mcp'})
+  await wrapper.get('[aria-label="外部 MCP 会话目标"]').setValue('完成任务')
+  expect(button(wrapper,'建立外部 MCP 控制会话').element.disabled).toBe(true)
+  await wrapper.get('[aria-label="外部 MCP 控制会话"] form').trigger('submit');await flushPromises()
+  expect(mocks.call.mock.calls.some(call=>['session.start','session.stop','session.resume'].includes(call[1]))).toBe(false)
+  expect(wrapper.emitted('session-start')).toBeUndefined()
+})
 
 it('打开面板只读取配置、会话和令牌，关闭不取消服务端运行', async () => {
   const wrapper = await mountWorkspace()
