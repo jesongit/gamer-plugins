@@ -4,6 +4,7 @@ pub mod mcp;
 mod memory;
 mod memory_agent;
 mod memory_checkpoint;
+mod memory_context;
 mod prompts;
 mod provider;
 mod services;
@@ -1810,33 +1811,13 @@ impl State {
                 let initial_cancel = session.cancelled.lock().clone();
                 let load_memory = async {
                     self.authorize(Some(crate::extensions::Permission::ResourceRead))?;
-                    let definitions = self.memory.call_cancellable("memory_list",&record.content_package,json!({"status":"active","kind":"definition","validation":"any","protected_only":true,"limit":30}),None,false,&initial_cancel).await?;
-                    let mut originals = Vec::new();
-                    let mut context_bytes = 0;
-                    for (position, entry) in definitions["items"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .enumerate()
-                    {
-                        if position >= 8 {
-                            originals.push(json!({"reference":entry,"full_text":"需要时使用memory_get读取原文"}));
-                            continue;
-                        }
-                        let original = self
-                            .memory
-                            .call_cancellable(
-                                "memory_get",
-                                &record.content_package,
-                                json!({"id":entry["id"]}),
-                                None,
-                                false,
-                                &initial_cancel,
-                            )
-                            .await?;
-                        context_bytes += original.to_string().len();
-                        originals.push(if context_bytes<=48_000 {original}else{json!({"reference":entry,"full_text":"原文过长，需要时使用memory_get读取"})});
-                    }
+                    let originals = self
+                        .protected_memory_context(
+                            &record.content_package,
+                            Some("definition"),
+                            &initial_cancel,
+                        )
+                        .await?;
                     let guide=self.memory.call_cancellable("memory_search",&record.content_package,json!({"query":record.messages.last().map_or(record.goal.as_str(),|m|m.text.as_str()),"limit":5}),Some(&services),false,&initial_cancel).await?;
                     Ok::<_, anyhow::Error>(json!({"user_definitions":originals,"guide":guide}))
                 };

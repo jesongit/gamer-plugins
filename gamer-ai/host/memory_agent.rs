@@ -481,27 +481,27 @@ impl State {
         package: &str,
         cancel: &AtomicBool,
     ) -> Result<Value> {
-        let listed = self.memory.call_cancellable("memory_list",package,json!({"status":"active","validation":"any","kind":"definition","protected_only":true,"limit":8}),None,false,cancel).await?;
-        let mut definitions = Vec::new();
-        let mut bytes = 0;
-        for item in listed["items"].as_array().into_iter().flatten() {
-            let Some(id) = item["id"].as_str() else {
-                continue;
-            };
-            let current = self
-                .memory
-                .call_cancellable("memory_get", package, json!({"id":id}), None, false, cancel)
-                .await?;
-            let body = super::memory_checkpoint::public_text(
-                current["memory"]["body"].as_str().unwrap_or(""),
-            );
-            if body.is_empty() || bytes + body.len() > 24000 {
-                continue;
+        let mut definitions = self
+            .protected_memory_context(package, Some("definition"), cancel)
+            .await?;
+        // Preserve the import worker's existing public-text policy; sanitized
+        // or overlong bodies retain a reference instead of an incomplete rule.
+        let mut filtered = false;
+        for definition in definitions.as_array_mut().into_iter().flatten() {
+            if let Some(body) = definition["body"].as_str() {
+                let public = super::memory_checkpoint::public_text(body);
+                if public != body {
+                    definition.as_object_mut().unwrap().remove("body");
+                    definition["summary"] = json!(public.chars().take(120).collect::<String>());
+                    definition["body_requires_memory_get"] = json!(true);
+                    filtered = true;
+                }
             }
-            bytes += body.len();
-            definitions.push(json!({"id":id,"body":body,"validation":current["memory"]["validation"],"version":current["version"],"protected_fields":current["memory"]["protected_fields"]}));
         }
-        Ok(json!(definitions))
+        if filtered {
+            definitions.as_array_mut().unwrap().push(json!({"context_notice":"部分保护定义只提供引用；不能将正文未展示视为没有约束，需要时先memory_get读取并遵守原文。","details_required":true}));
+        }
+        Ok(definitions)
     }
     async fn background_interrupt(
         &self,

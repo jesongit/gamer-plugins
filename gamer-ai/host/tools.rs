@@ -234,14 +234,14 @@ pub(super) fn knowledge_catalog(
         tool("memory_import_jobs", "查看攻略导入、AI合并进度和错误",json!({}),&[],false),
     ];
     if write {
-        let fields = json!({"title":{"type":"string"},"body":{"type":"string"},"kind":{"type":"string","enum":["definition","pitfall","procedure"]},"tags":{"type":"array","items":{"type":"string"}},"applicability":{"type":"string"},"game_version":{"type":"string"},"validation":{"type":"string","enum":["pending","verified","invalid"]},"sources":{"type":"array","items":{"type":"object"}},"reason":{"type":"string"},"operation_id":{"type":"string"}});
-        result.push(tool("memory_create","保存用户定义/已验证步骤/踩坑。未验证信息标pending，未知版本标unknown，保留适用条件与来源。",fields.clone(),&["title","body","operation_id"],false));
+        let fields = json!({"title":{"type":"string","description":"简短的攻略主题，不放运行时间线或修订说明"},"body":{"type":"string","description":"先整理为简洁、语义准确的Markdown攻略，按需写条件、可复用步骤、成功判断和注意事项；保留否定限制，旧错误与改动原因不堆正文"},"kind":{"type":"string","enum":["definition","pitfall","procedure"]},"tags":{"type":"array","items":{"type":"string"}},"applicability":{"type":"string"},"game_version":{"type":"string"},"validation":{"type":"string","enum":["pending","verified","invalid"]},"sources":{"type":"array","items":{"type":"object"}},"reason":{"type":"string","description":"记录写入/纠错原因与旧错误，改动沿革由history保留，不加入攻略正文"},"operation_id":{"type":"string"}});
+        result.push(tool("memory_create","先memory_search(validation:any)查重，整理标题和正文后保存可复用攻略，重复信息合并。未确认标pending、未知版本unknown，保留条件/限制/来源；不能自动改写保护原文或session_receipts_pending草稿。",fields.clone(),&["title","body","operation_id"],false));
         let mut patch_fields = fields.clone();
         patch_fields.as_object_mut().unwrap().remove("operation_id");
         patch_fields.as_object_mut().unwrap().remove("reason");
         patch_fields["status"] =
             json!({"type":"string","enum":["active","disabled","deleted","merged"]});
-        result.push(tool("memory_update","按当前expected_version修改记忆。reason只放顶层，patch仅包含需修改的记忆字段，不能把reason/id/expected_version/operation_id放入patch。冲突重新读取；不能force，不得擅改用户保护字段；sources预览不完整，修改来源前必须memory_get读取原文。",json!({"id":{"type":"string"},"expected_version":{"type":"string"},"operation_id":{"type":"string"},"reason":{"type":"string"},"patch":{"type":"object","properties":patch_fields,"additionalProperties":false}}),&["id","expected_version","operation_id","reason","patch"],false));
+        result.push(tool("memory_update","先查重并memory_get当前version，整理后按expected_version修改。reason只放顶层，patch仅包含需修改的记忆字段，不能把reason/id/expected_version/operation_id放入patch。冲突重新读取；不能force，不得擅改用户保护字段或session_receipts_pending原稿；sources预览不完整，修改来源前必须memory_get读取原文。",json!({"id":{"type":"string"},"expected_version":{"type":"string"},"operation_id":{"type":"string"},"reason":fields["reason"].clone(),"patch":{"type":"object","properties":patch_fields,"additionalProperties":false}}),&["id","expected_version","operation_id","reason","patch"],false));
         for (name, desc, extra) in [
             (
                 "memory_set_status",
@@ -700,5 +700,60 @@ mod tests {
         for f in function_catalog(&browser) {
             assert!(f["parameters"]["properties"].get("generation").is_none());
         }
+    }
+    #[test]
+    fn memory_write_schemas_keep_edit_reasons_outside_the_patch() {
+        let services = super::super::services::ServiceConnection::new(
+            Default::default(),
+            String::new(),
+            Default::default(),
+            String::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let catalog = knowledge_catalog(true, false, &services);
+        let write_tools = function_catalog(&catalog)
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool["name"].as_str(),
+                    Some("memory_create" | "memory_update")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(write_tools.len(), 2);
+        for tool in write_tools {
+            let properties = &tool["parameters"]["properties"];
+            assert_eq!(properties["reason"]["type"], "string");
+            assert!(properties["reason"]["description"].is_string());
+            let fields = if tool["name"] == "memory_update" {
+                assert_eq!(properties["patch"]["additionalProperties"], false);
+                let patch = &properties["patch"]["properties"];
+                for key in ["reason", "id", "expected_version", "operation_id"] {
+                    assert!(patch.get(key).is_none(), "{key} must stay outside patch");
+                }
+                assert!(tool["parameters"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("expected_version")));
+                patch
+            } else {
+                properties
+            };
+            assert_eq!(fields["title"]["type"], "string");
+            assert_eq!(fields["body"]["type"], "string");
+            assert!(fields["title"]["description"].is_string());
+            assert!(fields["body"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Markdown"));
+            assert_eq!(fields["sources"]["items"]["type"], "object");
+        }
+        assert!(knowledge_catalog(false, false, &services)
+            .iter()
+            .all(|tool| !matches!(
+                tool["name"].as_str(),
+                Some("memory_create" | "memory_update")
+            )));
     }
 }
