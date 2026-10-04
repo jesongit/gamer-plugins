@@ -2,20 +2,22 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
 import { budgetValue, eventDetails, displayTime, tokenUsage, usageValue } from './ai-format'
-import { lineDiff } from './conversation-format'
+import { lineDiff, mergeEvents } from './conversation-format'
 import BudgetFields from './BudgetFields.vue'
 import MemoryEvidence from './MemoryEvidence.vue'
+import RequestContext from './RequestContext.vue'
 import {DEFAULT_LIMITS,validLimits} from './budget-format'
 const props = defineProps({ packageId: { type: String, default: '' } })
-const emit = defineEmits(['attach'])
+const emit = defineEmits(['attach', 'settings'])
 const query = ref(''), items = ref([]), selected = ref(null), revisions = ref([]), older = ref(null), sources = ref(null)
 const total = ref(0), page = ref(0), jobs = ref([]), index = ref(null), retrieval = ref(null), diagnostics = ref([])
 const historyTotal=ref(0)
+const promptJob=ref(null),jobPrompts=ref([]),promptNext=ref(null),promptTotal=ref(0),promptLoading=ref(false),promptError=ref('')
 const busy = ref(''), error = ref(''), feedback = ref(''), files = ref([]), fileInput = ref(null)
 const includeInactive = ref(false), compareRevision = ref('')
 const importLimits=reactive({...DEFAULT_LIMITS}),resumeLimits=reactive({...DEFAULT_LIMITS}),editingJob=ref('')
 const diff = computed(() => older.value && selected.value ? lineDiff(older.value.body, selected.value.body) : [])
-let serial = 0, timer, disposed = false
+let serial = 0, promptSerial=0, timer, disposed = false
 const call = (action, values = {}, packageId = props.packageId) => api.callExtension('gamer-ai', action, { content_package: packageId, ...values })
 const statusLabel = value => ({ active: '启用', disabled: '停用', deleted: '已删除', merged: '已合并', pending: '待处理', running: '处理中', paused: '已暂停', completed: '已完成', cancelled: '已取消', failed: '失败' })[value] || value
 async function list(reset = false) {
@@ -71,6 +73,19 @@ async function refreshJobs() {
     if (!disposed && props.packageId === packageId) { jobs.value = result.items || []; index.value = status }
   } catch (e) { if (!disposed && props.packageId === packageId) error.value = e.message || '无法读取作业进度' }
 }
+async function readJobPrompts(job, more=false) {
+  const request=++promptSerial,packageId=props.packageId
+  if (!more) { promptJob.value=job;jobPrompts.value=[];promptNext.value=null;promptTotal.value=0 }
+  promptLoading.value=true;promptError.value=''
+  try {
+    const value=await call('memory.job.prompts',{job_id:job.id,after_seq:more?promptNext.value:0,limit:80})
+    if (disposed || request!==promptSerial || packageId!==props.packageId) return
+    jobPrompts.value=mergeEvents(more?jobPrompts.value:[],value.events).map(event=>({...event,id:`job-prompt:${event.seq}`}))
+    promptNext.value=value.next_after_seq ?? null;promptTotal.value=value.total ?? jobPrompts.value.length
+  } catch(e) { if (!disposed && request===promptSerial) promptError.value=e.message || '无法读取作业模型请求上下文' }
+  finally { if (!disposed && request===promptSerial) promptLoading.value=false }
+}
+function closeJobPrompts() { ++promptSerial;promptJob.value=null;jobPrompts.value=[];promptNext.value=null;promptTotal.value=0;promptLoading.value=false;promptError.value='' }
 async function poll() { await refreshJobs(); if (!disposed) timer = setTimeout(poll, 1800) }
 async function selectFiles(event) {
   files.value = [...(event.target.files || [])].map(file => ({ file, operation_id: crypto.randomUUID(), status: 'selected' }))
@@ -114,10 +129,11 @@ async function rebuild() {
 }
 function attach() { if (selected.value) emit('attach', { id: selected.value.id, revision: selected.value.revision, title: selected.value.title, content_package: props.packageId }) }
 watch(() => props.packageId, async () => {
+  closeJobPrompts()
   ++serial; selected.value = null; revisions.value = []; older.value = null; items.value = []; jobs.value = []; index.value = null; files.value=[]; sources.value=null; error.value=''; feedback.value=''
   clearTimeout(timer); await list(true); await refreshJobs(); if (!disposed) timer = setTimeout(poll, 1800)
 }, { immediate: true })
-onBeforeUnmount(() => { disposed = true; ++serial; clearTimeout(timer) })
+onBeforeUnmount(() => { disposed = true; ++serial; ++promptSerial; clearTimeout(timer) })
 </script>
 
 <template>
@@ -152,9 +168,10 @@ onBeforeUnmount(() => { disposed = true; ++serial; clearTimeout(timer) })
         <small>新增 {{ job.counts?.created || 0 }} · 修订 {{ job.counts?.updated || 0 }} · 合并 {{ job.counts?.merged || 0 }} · 保留 {{ job.counts?.retained || 0 }} · 跳过 {{ job.counts?.skipped || 0 }} · 失败 {{ job.counts?.failed || 0 }}</small>
         <p v-if="job.usage">模型 {{ usageValue(job.usage,['turns']) }} / {{ budgetValue(job.limits,'max_turns') }} 轮 · 工具 {{ usageValue(job.usage,['actions']) }} / {{ budgetValue(job.limits,'max_actions') }} 次 · 活动 {{ usageValue(job.usage,['active_seconds']) }} / {{ budgetValue(job.limits,'max_seconds') }} 秒 · Token {{ tokenUsage(job.usage) }} / {{ budgetValue(job.limits,'max_tokens') }}</p>
         <p v-else>模型用量尚未返回。</p><p v-if="job.error" class="error">{{ job.error }}</p>
-        <div><button v-if="['pending','running'].includes(job.status)" :disabled="!!busy" @click="jobAction(job,'pause')">暂停合并</button><button v-if="['paused','failed'].includes(job.status)" :disabled="!!busy" @click="editingJob=job.id;Object.assign(resumeLimits,job.limits || DEFAULT_LIMITS)">继续合并</button><button v-if="['pending','running','paused','failed'].includes(job.status)" :disabled="!!busy" @click="jobAction(job,'cancel')">取消作业</button></div>
+        <div><button @click="readJobPrompts(job)">查看请求上下文</button><button v-if="['pending','running'].includes(job.status)" :disabled="!!busy" @click="jobAction(job,'pause')">暂停合并</button><button v-if="['paused','failed'].includes(job.status)" :disabled="!!busy" @click="editingJob=job.id;Object.assign(resumeLimits,job.limits || DEFAULT_LIMITS)">继续合并</button><button v-if="['pending','running','paused','failed'].includes(job.status)" :disabled="!!busy" @click="jobAction(job,'cancel')">取消作业</button></div>
         <form v-if="editingJob===job.id" @submit.prevent="jobAction(job,'resume')"><p>修改上限或设为 0 后明确继续，累计用量不会清零。</p><BudgetFields :model-value="resumeLimits" prefix="恢复合并" @update:model-value="Object.assign(resumeLimits,$event)" /><button type="submit" :disabled="!!busy || !validLimits(resumeLimits)">按预算继续合并</button></form>
       </li></ul>
+      <section v-if="promptJob" class="job-prompts" aria-label="记忆整理请求上下文"><header><h4>{{ promptJob.title }} · 请求上下文</h4><button @click="closeJobPrompts">关闭</button></header><p>只读记录 {{ jobPrompts.length }} / {{ promptTotal }} 轮；读取不会调用模型或恢复作业。</p><p v-if="promptError" role="alert" class="error">{{ promptError }}</p><p v-if="!jobPrompts.length && !promptLoading && !promptError">此作业尚未记录模型请求上下文；旧请求无法补回。</p><RequestContext v-if="jobPrompts.length" :contexts="jobPrompts" expanded @edit="emit('settings','prompts')" /><div class="prompt-actions"><button :disabled="promptLoading" @click="readJobPrompts(promptJob)">刷新请求记录</button><button v-if="promptNext!==null" :disabled="promptLoading" @click="readJobPrompts(promptJob,true)">加载后续请求</button><span v-if="promptLoading" role="status">正在读取…</span></div></section>
     </section>
     <section v-if="index" class="index-status"><h4>检索索引</h4><p>关键词 {{ index.keyword_ready ? '就绪' : '待修复' }} · 语义 {{ index.semantic_ready ? '就绪' : '未就绪' }} · {{ index.total_memories }} 条记忆 · {{ index.total_chunks }} 个片段 · {{ index.pending_vectors }} 个向量待补齐</p><button :disabled="!!busy" @click="rebuild">重建索引</button><small>正文是权威来源，索引为本机派生缓存。重建不会删除正文。</small></section>
   </section>

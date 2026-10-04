@@ -1,6 +1,7 @@
 <script setup>
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
+import PromptSettings from './PromptSettings.vue'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 import { PROTOCOLS, budgetValue, chatTimeline, displayTime, eventDetails, eventImage, isActive, pauseGuidance, stateLabel, tokenUsage, usageValue } from './ai-format'
 
@@ -233,6 +234,7 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
         <button type="button" aria-controls="ai-settings" :aria-expanded="settingsSection === 'settings'" @click="toggleSettings('settings')">模型</button>
         <button type="button" aria-controls="ai-mcp" :aria-expanded="settingsSection === 'mcp'" @click="toggleSettings('mcp')">MCP</button>
         <button type="button" aria-controls="ai-budget" :aria-expanded="settingsSection === 'budget'" @click="toggleSettings('budget')">预算</button>
+        <button type="button" aria-controls="ai-prompts" :aria-expanded="settingsSection === 'prompts'" @click="toggleSettings('prompts')">提示词</button>
       </div>
     </header>
     <div class="scope-line"><span>{{ deviceName }}</span><span>{{ packageId || '未选配置包' }}</span><span v-if="context.androidPackageName">{{ context.androidPackageName }}</span></div>
@@ -250,6 +252,7 @@ watch([() => ({...limits}), mode], () => { if (props.settingsOnly) emit('game-op
     </div>
     <p v-if="boundElsewhere" class="scope-warning">此会话绑定设备 {{ selectedSession.device_id }} / 配置包 {{ selectedSession.content_package }}。切换工作台不会改写会话；请返回对应上下文发送消息，或新建当前目标的会话。</p>
     <div v-show="!!settingsSection" class="settings-drawer">
+      <PromptSettings v-if="settingsSection==='prompts'" id="ai-prompts" @saved="emit('settings-changed')" />
       <div v-show="settingsSection === 'settings'" id="ai-settings" class="section-stack">
         <section aria-label="模型连接设置">
           <h3>模型连接</h3>

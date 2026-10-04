@@ -1,4 +1,5 @@
 //! Account-scoped model credentials. None of this storage belongs to a Package.
+use super::prompts::{self, PromptConfig};
 use super::services::{EmbeddingConfig, SearchConfig, ServiceConnection, WebReadConfig};
 use anyhow::{ensure, Context, Result};
 use parking_lot::Mutex;
@@ -53,6 +54,8 @@ pub struct PrivateSettings {
     pub probe: Option<Value>,
     #[serde(default)]
     pub services: PrivateServices,
+    #[serde(default)]
+    pub(super) prompts: PromptConfig,
 }
 
 // Separate versions prevent an unrelated services edit from invalidating an
@@ -134,6 +137,21 @@ struct SaveRequest {
     max_output_tokens: u32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptsSaveRequest {
+    expected_version: Option<String>,
+    chat_system_prompt: String,
+    game_system_prompt: String,
+    import_system_prompt: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptsResetRequest {
+    expected_version: Option<String>,
+    scope: String,
+}
+
 impl Settings {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -150,6 +168,80 @@ impl Settings {
     pub fn services_read(&self) -> Result<Value> {
         let _guard = self.gate.lock();
         Ok(self.load()?.services.public())
+    }
+
+    pub fn prompts_read(&self) -> Result<Value> {
+        Ok(self.prompts()?.public())
+    }
+    pub fn prompts(&self) -> Result<PromptConfig> {
+        let _guard = self.gate.lock();
+        Ok(self.load()?.prompts)
+    }
+    pub fn prompts_save(&self, values: Value) -> Result<Value> {
+        let request: PromptsSaveRequest = serde_json::from_value(values)
+            .map_err(|_| anyhow::anyhow!("系统提示词配置字段无效"))?;
+        for text in [
+            &request.chat_system_prompt,
+            &request.game_system_prompt,
+            &request.import_system_prompt,
+        ] {
+            prompts::validate_prompt(text)?;
+        }
+        let _guard = self.gate.lock();
+        let mut settings = self.load()?;
+        ensure!(
+            settings.prompts.version == request.expected_version,
+            "version_conflict: 系统提示词已变更，请刷新后保存"
+        );
+        settings.prompts = PromptConfig {
+            version: Some(uuid::Uuid::new_v4().to_string()),
+            chat_system_prompt: (request.chat_system_prompt != prompts::CHAT_DEFAULT)
+                .then_some(request.chat_system_prompt),
+            game_system_prompt: (request.game_system_prompt != prompts::GAME_DEFAULT)
+                .then_some(request.game_system_prompt),
+            import_system_prompt: (request.import_system_prompt != prompts::IMPORT_DEFAULT)
+                .then_some(request.import_system_prompt),
+        };
+        self.persist(&settings)?;
+        Ok(settings.prompts.public())
+    }
+    pub fn prompts_reset(&self, values: Value) -> Result<Value> {
+        let request: PromptsResetRequest = serde_json::from_value(values)
+            .map_err(|_| anyhow::anyhow!("系统提示词重置字段无效"))?;
+        ensure!(
+            matches!(request.scope.as_str(), "chat" | "game" | "import" | "all"),
+            "系统提示词重置范围无效"
+        );
+        let _guard = self.gate.lock();
+        let mut settings = self.load()?;
+        ensure!(
+            settings.prompts.version == request.expected_version,
+            "version_conflict: 系统提示词已变更，请刷新后重置"
+        );
+        if matches!(request.scope.as_str(), "chat" | "all") {
+            settings.prompts.chat_system_prompt = None;
+        }
+        if matches!(request.scope.as_str(), "game" | "all") {
+            settings.prompts.game_system_prompt = None;
+        }
+        if matches!(request.scope.as_str(), "import" | "all") {
+            settings.prompts.import_system_prompt = None;
+        }
+        settings.prompts.version = Some(uuid::Uuid::new_v4().to_string());
+        self.persist(&settings)?;
+        Ok(settings.prompts.public())
+    }
+    pub fn redact_snapshot(&self, snapshot: &Value) -> Result<Value> {
+        let _guard = self.gate.lock();
+        let settings = self.load()?;
+        Ok(prompts::sanitize(
+            snapshot,
+            &[
+                &settings.api_key,
+                &settings.services.embedding_api_key,
+                &settings.services.search_api_key,
+            ],
+        ))
     }
 
     pub fn services_save(&self, values: Value) -> Result<Value> {
@@ -508,6 +600,42 @@ pub(super) fn validate_config(config: &SettingsConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompts_have_independent_versions_and_preserve_credentials_and_connection_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings::new(directory.path().join("config.json"));
+        let model = settings
+            .save(request(Value::Null, "model-test-only"))
+            .unwrap();
+        let services = settings.services_read().unwrap();
+        let original = settings.prompts_read().unwrap();
+        assert_eq!(original["custom"]["chat"], false);
+        let changed = settings.prompts_save(json!({"expected_version":original["version"],"chat_system_prompt":"用简洁中文回答","game_system_prompt":"先截图再行动","import_system_prompt":"按来源整理攻略"})).unwrap();
+        assert_eq!(changed["custom"]["chat"], true);
+        assert_eq!(settings.connection().unwrap().api_key, "model-test-only");
+        assert_eq!(settings.read().unwrap(), model);
+        assert_eq!(settings.services_read().unwrap(), services);
+        assert!(settings.prompts_save(json!({"expected_version":original["version"],"chat_system_prompt":"旧表单","game_system_prompt":"先截图","import_system_prompt":"整理"})).unwrap_err().to_string().contains("version_conflict"));
+        let reloaded = Settings::new(directory.path().join("config.json"));
+        assert_eq!(reloaded.prompts_read().unwrap(), changed);
+        let reset = settings
+            .prompts_reset(json!({"expected_version":changed["version"],"scope":"chat"}))
+            .unwrap();
+        assert_eq!(
+            reset["chat_system_prompt"],
+            reset["defaults"]["chat_system_prompt"]
+        );
+        assert_eq!(reset["custom"]["chat"], false);
+        assert_eq!(reset["game_system_prompt"], "先截图再行动");
+        assert_eq!(settings.read().unwrap(), model);
+        let defaults = settings.prompts_save(json!({"expected_version":reset["version"],"chat_system_prompt":reset["defaults"]["chat_system_prompt"],"game_system_prompt":reset["defaults"]["game_system_prompt"],"import_system_prompt":reset["defaults"]["import_system_prompt"]})).unwrap();
+        assert_eq!(
+            defaults["custom"],
+            json!({"chat":false,"game":false,"import":false})
+        );
+        assert!(settings.prompts_save(json!({"expected_version":reset["version"],"chat_system_prompt":"x".repeat(32*1024+1),"game_system_prompt":"先截图","import_system_prompt":"整理"})).is_err());
+    }
 
     #[test]
     fn public_thinking_defaults_on_and_per_request_output_limit_remains_optional() {

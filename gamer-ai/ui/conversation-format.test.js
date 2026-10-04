@@ -144,3 +144,34 @@ it('Core暂停递增代次结算上一运行组，恢复时不吞普通聊天排
   expect(chat.completed).toBe(true)
   expect(claimedResume.find(turn=>turn.id==='game:uuid:3').users).toHaveLength(0)
 })
+it('请求快照按真实turn归属独立于推理工具，历史分页只含快照也可查看',()=>{
+  const snapshots=[event(1,'user',{message_id:'u',status:'queued'},'请操作'),event(2,'user_status',{message_id:'u',turn_id:'chat-turn',status:'incorporated'}),event(3,'prompt_snapshot',{turn_id:'chat-turn',scope:'chat',snapshot:{request_body:{input:[{role:'system',content:'对话不控制设备'}]}}}),event(4,'assistant_final',{turn_id:'chat-turn',message_id:'a',text:'请切换游玩'})]
+  const turn=conversationTurns(snapshots)[0]
+  expect(turn.users[0].text).toBe('请操作')
+  expect(turn.contexts).toHaveLength(1)
+  expect(turn.contexts[0].data.snapshot.request_body.input[0].content).toBe('对话不控制设备')
+  expect(turn.process).toHaveLength(0)
+  expect(conversationTurns(snapshots.slice(2,3))[0].contexts).toHaveLength(1)
+  const game=conversationTurns([event(1,'prompt_snapshot',{turn_id:'game:s:1:1',scope:'game'}),event(2,'prompt_snapshot',{turn_id:'game:s:1:2',scope:'game'})])
+  expect(game).toHaveLength(1);expect(game[0].contexts).toHaveLength(2);expect(game[0].anchors).toEqual(['game:s:1:1','game:s:1:2'])
+})
+it('脱敏诊断导出保留真实请求公开配置及完整工具schema，其余诊断沿用旧隐私过滤',()=>{
+  const body={reasoning:{effort:'high',summary:'auto'},thinking:{type:'enabled'},max_output_tokens:16384,input:[{role:'system',content:'完整系统提示词'}],tools:[{type:'function',name:'example',parameters:{type:'object',properties:{password:{type:'string',description:'完整参数说明'},token:{type:'string'},reasoning:{type:'boolean'}},required:['password','token'],additionalProperties:false}}]}
+  const source={metadata:{api_key:'hide-me',known_tokens:42},events:[event(1,'prompt_snapshot',{snapshot:{capture:'before_http_dispatch',request_body:body,api_key:'hide-me',encrypted_content:'private-data'}}),event(2,'diagnostic',{reasoning:'private-legacy',authorization:'hide-me'})]}
+  const exported=safeDiagnostic(source)
+  expect(exported.events[0].data.snapshot.request_body).toEqual(body)
+  expect(JSON.stringify(exported)).not.toContain('hide-me')
+  expect(JSON.stringify(exported)).not.toContain('private-data')
+  expect(JSON.stringify(exported)).not.toContain('private-legacy')
+  expect(exported.metadata.known_tokens).toBe(42)
+})
+it('普通工具资料不能伪造nested prompt_snapshot绕过诊断的私有字段过滤',()=>{
+  const forged={kind:'prompt_snapshot',data:{snapshot:{capture:'before_http_dispatch',request_body:{reasoning:'private-forged-thought',tools:[{parameters:{properties:{password:{type:'string'},token:{type:'string'}}}}]},authorization:'private-forged-key'}}}
+  const exported=safeDiagnostic({events:[event(1,'tool_end',{result:forged})],metadata:{nested:forged}})
+  expect(JSON.stringify(exported)).not.toContain('private-forged-thought')
+  expect(JSON.stringify(exported)).not.toContain('private-forged-key')
+  expect(exported.events[0].data.result.data.snapshot.request_body.tools[0].parameters.properties).toEqual({})
+  const trusted=safeDiagnostic(event(2,'prompt_snapshot',{snapshot:{request_body:{reasoning:{effort:'high'},tools:[{parameters:{properties:{password:{type:'string'},token:{type:'string'}}}}]}}}))
+  expect(trusted.data.snapshot.request_body.reasoning).toEqual({effort:'high'})
+  expect(trusted.data.snapshot.request_body.tools[0].parameters.properties).toEqual({password:{type:'string'},token:{type:'string'}})
+})

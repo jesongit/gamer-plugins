@@ -13,6 +13,10 @@ use std::{
 };
 
 const RESPONSE_BYTES_LIMIT: usize = 2 * 1024 * 1024;
+// SSE has an envelope around each delta; wire bytes are not decoded text bytes.
+// Keep ordinary JSON and any individual SSE line/event bounded separately.
+const STREAM_BYTES_LIMIT: usize = 32 * 1024 * 1024;
+const SSE_EVENT_BYTES_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {
@@ -38,6 +42,7 @@ pub struct ModelTurn {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelStreamEvent {
+    RequestSnapshot { snapshot: Value },
     TextDelta { delta: String },
     SummaryDelta { delta: String },
     ThinkingDelta { delta: String },
@@ -190,6 +195,20 @@ impl Provider {
         if self.config.protocol == "chat_completions" {
             body["stream_options"] = json!({"include_usage":true});
         }
+        // The request has now been fully converted to the chosen wire protocol.
+        // Emit a sanitized display copy before dispatch, including requests that
+        // fail before the supplier returns any diagnostics or output.
+        on_event(ModelStreamEvent::RequestSnapshot {
+            snapshot: super::prompts::sanitize(
+                &json!({
+                    "protocol":self.config.protocol,"model":self.config.model,
+                    "endpoint":format!("{}/{}",self.config.base_url.trim_end_matches('/'),suffix),
+                    "request_body":body,"redactions":["credentials","image_payloads","typed_text","encrypted_reasoning"],
+                    "capture":"before_http_dispatch","headers_included":false
+                }),
+                &[&self.config.api_key],
+            ),
+        });
         let started = std::time::Instant::now();
         let response = cancellable(
             self.http
@@ -400,7 +419,10 @@ impl Provider {
             .map_err(|error| transport_error(&error))?
         {
             total = total.saturating_add(chunk.len());
-            ensure!(total <= RESPONSE_BYTES_LIMIT, "AI API 流响应超过大小限制");
+            ensure!(
+                total <= STREAM_BYTES_LIMIT,
+                "AI API 流响应超过 32 MiB 大小限制"
+            );
             for event in decoder.push(&chunk)? {
                 if state.event(event, on_event)? {
                     return state.finish();
@@ -685,6 +707,7 @@ struct SseDecoder {
     data: Vec<String>,
     skip_lf: bool,
     started: bool,
+    event_bytes: usize,
 }
 struct SseEvent {
     name: String,
@@ -705,12 +728,21 @@ impl SseDecoder {
                 self.line(&line, &mut result)?;
                 self.skip_lf = *byte == b'\r';
             } else {
+                ensure!(
+                    self.buffer.len() < SSE_EVENT_BYTES_LIMIT,
+                    "AI SSE 单行超过 2 MiB 大小限制"
+                );
                 self.buffer.push(*byte);
             }
         }
         Ok(result)
     }
     fn line(&mut self, line: &[u8], result: &mut Vec<SseEvent>) -> Result<()> {
+        self.event_bytes = self.event_bytes.saturating_add(line.len());
+        ensure!(
+            self.event_bytes <= SSE_EVENT_BYTES_LIMIT,
+            "AI SSE 单事件超过 2 MiB 大小限制"
+        );
         let line = if !self.started {
             self.started = true;
             line.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(line)
@@ -719,6 +751,7 @@ impl SseDecoder {
         };
         let line = std::str::from_utf8(line).context("AI SSE 包含无效 UTF-8")?;
         if line.is_empty() {
+            self.event_bytes = 0;
             if !self.data.is_empty() {
                 result.push(SseEvent {
                     name: std::mem::take(&mut self.name),
@@ -2041,6 +2074,101 @@ mod tests {
             max_output_tokens: super::super::settings::DEFAULT_MAX_OUTPUT_TOKENS,
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_snapshot_is_the_actual_wire_body_before_any_supplier_output() {
+        use tokio::io::AsyncWriteExt;
+        for protocol in ["responses", "chat_completions"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let responses = protocol == "responses";
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                sender.send(request).unwrap();
+                let body = if responses { json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}) } else { json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}]}) }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            });
+            let history = [
+                json!({"role":"system","content":"base"}),
+                json!({"role":"developer","content":"application context"}),
+                json!({"role":"user","content":"current user"}),
+                json!({"role":"user","content":"reference injected afterwards"}),
+            ];
+            let tools = [
+                json!({"type":"function","name":"memory_get","description":"full tool schema","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false},"strict":false}),
+            ];
+            let mut events = Vec::new();
+            fixture_provider(address, protocol)
+                .turn_stream(&history, &tools, &AtomicBool::new(false), |event| {
+                    events.push(event)
+                })
+                .await
+                .unwrap();
+            let ModelStreamEvent::RequestSnapshot { snapshot } = &events[0] else {
+                panic!("snapshot must precede diagnostics and supplier output")
+            };
+            let wire = receiver.await.unwrap();
+            assert_eq!(snapshot["request_body"], wire);
+            assert!(wire.to_string().contains("reference injected afterwards"));
+            assert!(wire.to_string().contains("full tool schema"));
+            assert_eq!(snapshot["headers_included"], false);
+            assert!(!snapshot.to_string().contains("test-only"));
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn frequent_sse_envelopes_can_exceed_json_limit_and_keep_terminal_usage() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let padding = "p".repeat(8 * 1024);
+            let mut wire = String::new();
+            for _ in 0..400 {
+                wire.push_str(&event(
+                    json!({"type":"response.output_text.delta","delta":"x","metadata":padding}),
+                ));
+            }
+            wire.push_str(&event(json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(400)}]}],"usage":{"input_tokens":20,"output_tokens":25,"total_tokens":45}}})));
+            assert!(wire.len() > RESPONSE_BYTES_LIMIT && wire.len() < STREAM_BYTES_LIMIT);
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",wire.len()).as_bytes()).await.unwrap();
+            stream.write_all(wire.as_bytes()).await.unwrap();
+        });
+        let mut emitted = String::new();
+        let turn = fixture_provider(address, "responses")
+            .turn_stream(&[], &[], &AtomicBool::new(false), |event| {
+                if let ModelStreamEvent::TextDelta { delta } = event {
+                    emitted.push_str(&delta)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(emitted, "x".repeat(400));
+        assert_eq!(turn.text, emitted);
+        assert_eq!(turn.usage.unwrap()["total_tokens"], 45);
+        server.await.unwrap();
+    }
+    #[test]
+    fn sse_line_and_multiline_event_have_independent_bounded_buffers() {
+        let mut line = SseDecoder::default();
+        assert!(line.push(&vec![b'x'; SSE_EVENT_BYTES_LIMIT]).is_ok());
+        assert!(line.push(b"x").err().unwrap().to_string().contains("单行"));
+        let mut event = SseDecoder::default();
+        let payload = "x".repeat(SSE_EVENT_BYTES_LIMIT / 2);
+        event.push(format!("data: {payload}\n").as_bytes()).unwrap();
+        assert!(event
+            .push(format!("data: {payload}\n").as_bytes())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("单事件"));
+        assert_eq!(RESPONSE_BYTES_LIMIT, 2 * 1024 * 1024);
+        assert_eq!(STREAM_BYTES_LIMIT, 32 * 1024 * 1024);
     }
     fn event(value: Value) -> String {
         format!("data: {}\r\n\r\n", value)

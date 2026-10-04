@@ -23,7 +23,7 @@ watch(packageId, () => { attached.value = [] })
     <nav aria-label="AI 工作台"><button v-for="(label,key) in {chat:'对话',memory:'记忆库',services:'可选服务'}" :key="key" :aria-current="page === key ? 'page' : undefined" @click="page=key">{{ label }}</button></nav>
     <AgentConversation ref="chat" v-show="page === 'chat'" :active="page === 'chat'" :package-id="packageId" :attached-memory="attached" @detach="attached = attached.filter(item => item.id !== $event)" @memory="page='memory'" @settings="openSettings" />
     <aside v-if="settingsSection" class="agent-settings-drawer" aria-label="Agent 设置"><div class="drawer-heading"><b>Agent 设置</b><button @click="settingsSection=''">关闭设置</button></div><GameSessionPane settings-only :initial-section="settingsSection" :initial-game-options="gameOptions" @settings-changed="settingsChanged" @game-options="chat?.setGameOptions($event)" /></aside>
-    <MemoryLibrary v-if="page === 'memory'" :package-id="packageId" @attach="attach" />
+    <MemoryLibrary v-if="page === 'memory'" :package-id="packageId" @attach="attach" @settings="openSettings" />
     <ServiceSettings v-if="page === 'services'" />
   </div>
 </template>

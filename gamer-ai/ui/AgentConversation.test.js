@@ -46,6 +46,20 @@ it('无设备创建持续对话，显式配置包，服务器接收回显不重�
   await button(wrapper,'撤回').trigger('click');await flushPromises()
   expect(wrapper.text()).toContain('已撤回')
 })
+it('模型请求上下文显示在用户气泡之前，提示词入口打开设置且不改变设备状态',async()=>{
+  record={conversation_id:'c1',content_package:'default',state:'idle',limits}
+  events=[ev(1,'user',{message_id:'m1'},'替我操作'),ev(2,'prompt_snapshot',{scope:'chat',snapshot:{protocol:'responses',model:'test',request_body:{input:[{role:'system',content:'本轮系统指令'}],tools:[{type:'function',name:'memory_search'}]}}}),ev(3,'assistant_final',{message_id:'a1',text:'请先切换游玩'})]
+  const wrapper=await create(),turn=wrapper.get('.turn').element
+  expect(turn.querySelector('.request-context').compareDocumentPosition(turn.querySelector('.user-message')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  expect(wrapper.get('.request-context').attributes('open')).toBeDefined()
+  expect(wrapper.text()).toContain('本轮系统指令')
+  expect(wrapper.text()).toContain('未授予设备操作')
+  await button(wrapper,'提示词').trigger('click')
+  expect(wrapper.emitted('settings').at(-1)).toEqual(['prompts'])
+  await button(wrapper,'切换游玩').trigger('click')
+  expect(wrapper.get('[aria-label="消息模式"]').element.value).toBe('game')
+  expect(mocks.call.mock.calls.some(call=>['session.start','session.resume','conversation.message'].includes(call[1]))).toBe(false)
+})
 it.each(['external','package_deleted'])('只读历史 %s 禁止新消息，显示建立新对话提示',async state=>{
   record={conversation_id:'c1',content_package:'default',state,limits}
   const wrapper=await create()
@@ -158,6 +172,19 @@ it('诊断分类、定位与导出只读脱敏快照，保留预算计数',async
   const text=await captured[0].text()
   expect(text).toContain('known_tokens');expect(text).toContain('42');expect(text).not.toContain('redact-me')
   expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.diagnostics',{conversation_id:'c1',export:true})
+})
+it('下载的诊断保留请求快照完整工具参数与公开reasoning配置',async()=>{
+  record={conversation_id:'c1',content_package:'default',state:'idle',limits}
+  const body={reasoning:{effort:'high',summary:'auto'},tools:[{type:'function',name:'custom',parameters:{type:'object',properties:{password:{type:'string'},token:{type:'string'},reasoning:{type:'boolean'}},required:['password','token']}}],input:[{role:'system',content:'未经截断的基础提示词'}]}
+  diagnostics=[ev(1,'prompt_snapshot',{snapshot:{capture:'before_http_dispatch',request_body:body,api_key:'redact-me'}})]
+  const wrapper=await create()
+  await button(wrapper,'诊断').trigger('click');await flushPromises()
+  const captured=[];vi.spyOn(URL,'createObjectURL').mockImplementation(blob=>{captured.push(blob);return'blob:fixture'});vi.spyOn(URL,'revokeObjectURL').mockImplementation(()=>{});vi.spyOn(HTMLAnchorElement.prototype,'click').mockImplementation(()=>{})
+  await button(wrapper,'导出脱敏诊断').trigger('click');await flushPromises()
+  const text=await captured[0].text(),exported=JSON.parse(text)
+  expect(exported.events[0].data.snapshot.request_body).toEqual(body)
+  expect(text).not.toContain('redact-me')
+  expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
 })
 
 it('同一输入框启动游玩，使用独立游玩预算与显式宿主设备，不先建普通聊天',async()=>{

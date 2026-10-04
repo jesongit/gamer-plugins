@@ -1,4 +1,5 @@
 import { TOOL_LABELS, eventDetails, safeImage } from './ai-format'
+import { publicRequest } from './request-context'
 
 export const DELIVERY_LABELS = { queued: '待处理', received: '已接收', incorporated: '已纳入', withdrawn: '已撤回', cancelled: '已中断', unknown: '接收状态未知' }
 export function toolReceipt(result) {
@@ -29,7 +30,7 @@ export function conversationTurns(events) {
   function turn(rawId) {
     const game = /^game:(.+):(\d+):(\d+)$/.exec(rawId)
     const id = displayTurnId(rawId)
-    if (!byTurn.has(id)) { const value = { id, anchors: [], game: !!game, gameSession: game?.[1], generation: game ? Number(game[2]) : null, users: [], process: [], answers: [], notices: [], completed: false }; byTurn.set(id, value); turns.push(value) }
+    if (!byTurn.has(id)) { const value = { id, anchors: [], game: !!game, gameSession: game?.[1], generation: game ? Number(game[2]) : null, users: [], contexts: [], process: [], answers: [], notices: [], completed: false }; byTurn.set(id, value); turns.push(value) }
     const value = byTurn.get(id)
     if (rawId !== id && !value.anchors.includes(rawId)) value.anchors.push(rawId)
     return value
@@ -45,7 +46,7 @@ export function conversationTurns(events) {
         const messagesToMove = previous.users.filter(message=>message.gameplay && message.seq > after)
         for (const message of messagesToMove) { group.users.push(message); owners.set(message.id, group) }
         previous.users = previous.users.filter(message=>!messagesToMove.includes(message))
-        if (!previous.users.length && !previous.process.length && !previous.answers.length && !previous.notices.length) {
+        if (!previous.users.length && !previous.contexts.length && !previous.process.length && !previous.answers.length && !previous.notices.length) {
           group.anchors.push(...previous.anchors.filter(anchor=>!group.anchors.includes(anchor)))
           previous.anchors = []
         }
@@ -64,6 +65,8 @@ export function conversationTurns(events) {
         const previous=owners.get(data.message_id)
         if(data.turn_id && previous && previous!==group) {previous.users=previous.users.filter(message=>message.id!==value.id);group.users.push(value);owners.set(data.message_id,group)}
       }
+    } else if (event.kind === 'prompt_snapshot') {
+      group.contexts.push({ ...event, id: `prompt:${event.seq}` })
     } else if (event.kind === 'assistant_delta' || event.kind === 'assistant_final') {
       const channel = data.channel || 'text'
       if (!['text', 'summary', 'thinking'].includes(channel)) continue
@@ -114,8 +117,8 @@ export function conversationTurns(events) {
       group.notices.push({ ...event, id: `compression:${event.seq}`, text: event.message || '早期过程已压缩，用户指令及相关记忆保留。' })
     }
   }
-  return turns.filter(group => group.users.length || group.process.length || group.answers.length || group.notices.length)
-    .sort((left,right)=>Math.min(...[...left.users,...left.process,...left.answers,...left.notices].map(item=>item.seq)) - Math.min(...[...right.users,...right.process,...right.answers,...right.notices].map(item=>item.seq)))
+  return turns.filter(group => group.users.length || group.contexts.length || group.process.length || group.answers.length || group.notices.length)
+    .sort((left,right)=>Math.min(...[...left.users,...left.contexts,...left.process,...left.answers,...left.notices].map(item=>item.seq)) - Math.min(...[...right.users,...right.contexts,...right.process,...right.answers,...right.notices].map(item=>item.seq)))
 }
 export function diagnosticCategory(event) {
   const category = event.data?.category
@@ -128,7 +131,22 @@ export function diagnosticCategory(event) {
   return 'model'
 }
 export function safeDiagnostic(value) {
-  return JSON.parse(eventDetails(value) || '{}')
+  const safe = JSON.parse(eventDetails(value) || '{}')
+  function preserveRequestSnapshot(original, target) {
+    if (!original || !target) return
+    if (original.kind === 'prompt_snapshot' && original.data?.snapshot) {
+      target.data ||= {}
+      target.data.snapshot = publicRequest(original.data.snapshot)
+    }
+  }
+  // Only the caller's event or the exported journal's top-level event list is
+  // trusted. Tool results cannot grant themselves this exemption with a kind.
+  if (Array.isArray(value?.events) && Array.isArray(safe.events)) {
+    value.events.forEach((event, index) => preserveRequestSnapshot(event, safe.events[index]))
+  } else {
+    preserveRequestSnapshot(value, safe)
+  }
+  return safe
 }
 export function lineDiff(before, after) {
   const left = String(before || '').split('\n'), right = String(after || '').split('\n')

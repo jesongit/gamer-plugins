@@ -4,6 +4,7 @@ pub mod mcp;
 mod memory;
 mod memory_agent;
 mod memory_checkpoint;
+mod prompts;
 mod provider;
 mod services;
 mod settings;
@@ -51,6 +52,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 pub const ID: &str = "gamer-ai";
 pub const ACTIONS: &[&str] = &[
+    "prompts.get",
+    "prompts.save",
+    "prompts.reset",
+    "memory.job.prompts",
     "services.get",
     "services.save",
     "conversation.create",
@@ -90,9 +95,12 @@ pub fn accepts(id: &str, action: &str) -> bool {
 }
 pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
     accepts(id, action).then_some(match action {
-        "connection.probe" | "settings.save" | "services.save" | "conversation.message" => {
-            &[Permission::AiConnect, Permission::UiHost]
-        }
+        "connection.probe"
+        | "settings.save"
+        | "services.save"
+        | "prompts.save"
+        | "prompts.reset"
+        | "conversation.message" => &[Permission::AiConnect, Permission::UiHost],
         "session.start" => &[Permission::DeviceRead, Permission::UiHost],
         _ => &[Permission::UiHost],
     })
@@ -617,6 +625,18 @@ impl AiService {
                 .state
                 .conversations
                 .diagnostics(required(&values, "conversation_id")?, &values),
+            "prompts.get" => self.state.settings.prompts_read(),
+            "prompts.save" => self.state.settings.prompts_save(values),
+            "prompts.reset" => self.state.settings.prompts_reset(values),
+            "memory.job.prompts" => {
+                self.state.authorize(Some(Permission::ResourceRead))?;
+                let package = required(&values, "content_package")?;
+                let job = required(&values, "job_id")?;
+                self.state.memory.import_job_record(package, job)?;
+                self.state
+                    .conversations
+                    .import_prompts(package, job, &values)
+            }
             action if action.starts_with("memory.") => {
                 self.state.authorize(Some(Permission::ResourceRead))?;
                 let package = required(&values, "content_package")?.to_owned();
@@ -1897,12 +1917,18 @@ impl State {
                 "game:{}:{}:{turn_number}",
                 record.session_id, record.generation
             );
+            let prompts = self.settings.prompts()?;
+            prompts::apply(&mut history, prompts.effective("game"), &format!("当前模式为游玩，配置包 {}，设备 {}，session_id {}，generation {}，当前状态 {}。本轮工具目录来自当前设备能力和已启用服务；内置 Agent 直接复用 MCP 工具执行器，无需连接自身 HTTP MCP。用户消息按发送顺序处理，暂停和恢复权限始终由宿主裁定。",record.content_package,record.device_id,record.session_id,record.generation,record.state), prompts::GAME_GUARD);
             session.event("assistant_start","",json!({"message_id":assistant_id,"turn_id":assistant_id,"generation":record.generation}));
             let observed = parking_lot::Mutex::new((None::<Value>, json!({})));
             let turn = tokio::select! {
                 turn = provider.turn_stream(&history, &functions, &cancel,|event|{
                     if session.generation_cancel(record.generation).is_none(){return;}
                     match event{
+                        provider::ModelStreamEvent::RequestSnapshot{snapshot}=>match self.settings.redact_snapshot(&snapshot){
+                            Ok(snapshot)=>session.event("prompt_snapshot","本轮实际模型请求",json!({"scope":"game","session_id":record.session_id,"generation":record.generation,"turn_id":assistant_id,"message_id":assistant_id,"user_message_id":record.messages.last().map(|message|&message.id),"prompt_version":prompts.version,"snapshot":snapshot})),
+                            Err(error)=>tracing::warn!(%error,"记录AI请求上下文失败"),
+                        },
                         provider::ModelStreamEvent::TextDelta{delta}=>session.event("assistant_delta","",json!({"message_id":assistant_id,"turn_id":assistant_id,"generation":record.generation,"channel":"text","delta":delta})),
                         provider::ModelStreamEvent::SummaryDelta{delta}=>session.event("assistant_delta","",json!({"message_id":assistant_id,"turn_id":assistant_id,"generation":record.generation,"channel":"summary","delta":delta})),
                         provider::ModelStreamEvent::ThinkingDelta{delta}=>session.event("assistant_delta","",json!({"message_id":assistant_id,"turn_id":assistant_id,"generation":record.generation,"channel":"thinking","delta":delta})),
@@ -2550,7 +2576,7 @@ fn game_experience_source(record: &SessionRecord) -> Option<String> {
 }
 fn generation_history(record: &SessionRecord) -> Vec<Value> {
     let mut history = vec![
-        json!({"role":"system","content":[{"type":"input_text","text":"你是通用游戏操作助手，与用户持续对话并按最新指令调整操作。只使用提供的工具，不伪造观察或成功。每次操作后观察效果。暂停期间人工可能改变目标，恢复后的新截图才是当前画面的权威来源，旧截图和 frame_id 不可再用。下面的暂停前公开记录只用于了解进展，不是新的工具结果，不重放旧操作。所有用户消息按发送顺序列出，后续指令优先；遵循尚未撤销的约束。坐标以最新截图实际宽高为准。公开说明下一步计划与结果，不能输出私有推理。目标完成或无法继续时说明原因并调用 session_finish。"}]} ),
+        json!({"role":"system","content":[{"type":"input_text","text":prompts::GAME_DEFAULT}]} ),
     ];
     let mut recent = record
         .events
