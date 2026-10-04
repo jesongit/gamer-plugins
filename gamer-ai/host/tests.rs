@@ -1272,7 +1272,9 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
     let stall_copy = stall.clone();
     let unified_hold = Arc::new(AtomicBool::new(false));
     let hold_copy = unified_hold.clone();
-    let app=Router::new().route("/",get(||async {Html("<!doctype html><style>body{margin:0;background:#123456}button{position:absolute;left:20px;top:20px;width:120px;height:60px}</style><button onclick='document.body.style.background=\"#abcdef\";window.clicks=(window.clicks||0)+1'>Play</button>")})).route("/responses",post(move|Json(body):Json<Value>|{let turn=turn_copy.clone();let stall=stall_copy.clone();let hold=hold_copy.clone();async move {
+    let unified_prerequisite = Arc::new(AtomicBool::new(false));
+    let prerequisite_copy = unified_prerequisite.clone();
+    let app=Router::new().route("/",get(||async {Html("<!doctype html><style>body{margin:0;background:#123456}button{position:absolute;left:20px;top:20px;width:120px;height:60px}</style><button onclick='document.body.style.background=\"#abcdef\";window.clicks=(window.clicks||0)+1'>Play</button>")})).route("/responses",post(move|Json(body):Json<Value>|{let turn=turn_copy.clone();let stall=stall_copy.clone();let hold=hold_copy.clone();let prerequisite=prerequisite_copy.clone();async move {
         // Paused gameplay now archives receipts using the same model endpoint.
         // That text-only request must not consume a gameplay turn or require an image.
         if body["tools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["name"]=="memory_import_finish")) {
@@ -1281,10 +1283,18 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
         let available = |name: &str| body["tools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["name"]==name));
         if available("agent_continue") || available("gameplay_handoff") {
             let current = body["input"].as_array().unwrap().iter().rev().find(|item|item["role"]=="user").unwrap().to_string();
+            if available("gameplay_handoff") && prerequisite.swap(false, Ordering::AcqRel) {
+                return Json(json!({"status":"completed","output":[{"type":"function_call","call_id":"preflight-memory","name":"memory_search","arguments":"{\"query\":\"Play 背景颜色\"}"}],"usage":{"total_tokens":3}}));
+            }
             let name = if available("gameplay_handoff") { "gameplay_handoff" }
                 else if current.contains("仅查询") { "agent_continue" }
-                else if current.contains("继续刚才") { "gameplay_resume" }
+                else if current.contains("继续刚才") && available("gameplay_resume") { "gameplay_resume" }
                 else { "gameplay_start" };
+            if name == "gameplay_start" && current.contains("继续刚才") {
+                let trusted = body["input"].to_string();
+                assert!(trusted.contains("点击 Play，然后检查背景颜色"));
+                assert!(!trusted.contains("以下仅是攻略资料"));
+            }
             assert!(available(name), "expected orchestration tool {name}");
             return Json(json!({"status":"completed","output":[{"type":"function_call","id":name,"call_id":name,"name":name,"arguments":"{}"}],"usage":{"total_tokens":3}}));
         }
@@ -1543,7 +1553,24 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
         )
         .unwrap();
     unified_hold.store(true, Ordering::Release);
-    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"点击 Play，然后检查背景颜色","limits":unlimited_limits(),"game_limits":unlimited_limits()})).await.unwrap();
+    unified_prerequisite.store(true, Ordering::Release);
+    let mut preflight_budget = unlimited_limits();
+    preflight_budget.max_turns = 2;
+    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"点击 Play，然后检查背景颜色","limits":preflight_budget,"game_limits":unlimited_limits()})).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ai.state.conversations.wait_idle())
+        .await
+        .unwrap();
+    let interrupted = ai.state.conversations.record(chat_id).unwrap();
+    assert_eq!(interrupted.state, "budget");
+    assert_eq!(interrupted.usage.turns, 2);
+    assert!(interrupted.game_session_id.is_none());
+    assert!(ai
+        .state
+        .runtime
+        .runs
+        .active_for_device(&target.id)
+        .is_none());
+    ai.dispatch("conversation.message",json!({"conversation_id":chat_id,"device_id":target.id,"message":"继续刚才的任务","limits":unlimited_limits(),"game_limits":unlimited_limits()})).await.unwrap();
     let game_id = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(id) = ai
