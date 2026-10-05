@@ -8,6 +8,12 @@ pub struct TemplateCase {
     pub body: Vec<SurfaceStep>,
 }
 
+/// Single-shot branches keep forwarding break to an enclosing repeat.
+pub(super) fn repeats(times: &SurfaceExpr) -> bool {
+    matches!(times, SurfaceExpr::Ref(_))
+        || matches!(times, SurfaceExpr::Lit(value) if value.as_u64().is_some_and(|n| n > 1))
+}
+
 fn fields<'a>(
     value: &'a YamlValue,
     allowed: &[&str],
@@ -30,7 +36,11 @@ fn fields<'a>(
 }
 
 pub(super) fn parse(value: &YamlValue, path: &str) -> Result<SurfaceStep, Vec<Diagnostic>> {
-    let map = fields(value, &["cases", "else", "threshold"], path)?;
+    let map = fields(
+        value,
+        &["cases", "else", "threshold", "times", "interval"],
+        path,
+    )?;
     let cases = map
         .get("cases")
         .and_then(YamlValue::as_sequence)
@@ -93,6 +103,32 @@ pub(super) fn parse(value: &YamlValue, path: &str) -> Result<SurfaceStep, Vec<Di
             "threshold 必须为 0..1 数字或引用",
         ));
     }
+    let times = match map.get("times") {
+        Some(value) => expr_from_yaml(value, &format!("{path}.times"))?,
+        None => SurfaceExpr::Lit(json!(1)),
+    };
+    if !matches!(&times, SurfaceExpr::Ref(_))
+        && !matches!(&times, SurfaceExpr::Lit(v) if v.as_u64().is_some_and(|n| n >= 1))
+    {
+        return Err(one_diagnostic(
+            "yaml.match_templates.times",
+            &format!("{path}.times"),
+            "匹配次数必须为正整数或引用",
+        ));
+    }
+    let interval = match map.get("interval") {
+        Some(value) => expr_from_yaml(value, &format!("{path}.interval"))?,
+        None => SurfaceExpr::Lit(json!("250ms")),
+    };
+    if !matches!(&interval, SurfaceExpr::Ref(_))
+        && !matches!(&interval, SurfaceExpr::Lit(v) if check_type(ParamType::Duration, v).is_ok())
+    {
+        return Err(one_diagnostic(
+            "yaml.match_templates.interval",
+            &format!("{path}.interval"),
+            "匹配间隔必须为非负毫秒数、带单位时间或引用",
+        ));
+    }
     let else_steps = match map.get("else") {
         Some(value) => parse_steps(value, &format!("{path}.else"))?,
         None => Vec::new(),
@@ -100,6 +136,8 @@ pub(super) fn parse(value: &YamlValue, path: &str) -> Result<SurfaceStep, Vec<Di
     Ok(SurfaceStep::MatchTemplates {
         cases: parsed,
         threshold,
+        times,
+        interval,
         else_steps,
     })
 }
@@ -107,16 +145,21 @@ pub(super) fn parse(value: &YamlValue, path: &str) -> Result<SurfaceStep, Vec<Di
 pub(super) fn wire(
     cases: &[TemplateCase],
     threshold: &SurfaceExpr,
+    times: &SurfaceExpr,
+    interval: &SurfaceExpr,
     otherwise: &[SurfaceStep],
     path: &str,
     functions: &FunctionLibrary,
 ) -> Value {
     json!({
-        "op":"match_templates", "path":path, "desc":"模板分支",
+        // An old guest must reject polling, rather than silently ignoring times.
+        "op":if repeats(times) { "match_templates_loop" } else { "match_templates" }, "path":path, "desc":"模板分支",
         "args": SurfaceExpr::Map(vec![
             ("templates".into(), SurfaceExpr::List(cases.iter().map(|c| c.template.clone()).collect())),
             ("threshold".into(), threshold.clone()),
         ]).to_wire(),
+        "times":times.to_wire(),
+        "interval":interval.to_wire(),
         "cases":cases.iter().enumerate().map(|(i,c)| json!({
             "as":c.save_as, "do":wire_steps(&c.body, &format!("{path}.cases[{i}].do"), functions)
         })).collect::<Vec<_>>(),
@@ -127,6 +170,8 @@ pub(super) fn wire(
 pub(super) fn yaml_lines(
     cases: &[TemplateCase],
     threshold: &SurfaceExpr,
+    times: &SurfaceExpr,
+    interval: &SurfaceExpr,
     otherwise: &[SurfaceStep],
     indent: usize,
     out: &mut Vec<String>,
@@ -135,6 +180,10 @@ pub(super) fn yaml_lines(
     out.push(format!("{pad}match_templates:"));
     out.push(format!("{pad}  threshold:"));
     expr_yaml_lines(threshold, indent + 2, out);
+    out.push(format!("{pad}  times:"));
+    expr_yaml_lines(times, indent + 2, out);
+    out.push(format!("{pad}  interval:"));
+    expr_yaml_lines(interval, indent + 2, out);
     out.push(format!("{pad}  cases:"));
     for case in cases {
         out.push(format!("{pad}    - template:"));
@@ -215,5 +264,55 @@ mod tests {
             );
         }
         assert!(parse_function_library("functions:\n  match_templates:\n    run: []\n").is_err());
+    }
+
+    #[test]
+    fn polling_defaults_roundtrip_references_and_break_scope() {
+        let default = build_program(&parse_script(SOURCE).unwrap(), &vec![], JsonMap::new(), 0);
+        assert_eq!(default["run"][0]["times"], json!({"expr":"lit","value":1}));
+        assert_eq!(
+            default["run"][0]["interval"],
+            json!({"expr":"lit","value":"250ms"})
+        );
+        let source = "params:\n  rounds: {type: integer, default: 999}\n  gap: {type: duration, default: 1s}\nrun:\n  - match_templates:\n      times: $rounds\n      interval: $gap\n      cases: [{template: a.png, do: [{break: {}}]}]\n";
+        let parsed = parse_script(source).unwrap();
+        assert_eq!(
+            parse_script(&serialize_script(&parsed)).unwrap().run,
+            parsed.run
+        );
+        assert_eq!(
+            parsed.called_functions(),
+            BTreeSet::from(["find_any".into(), "sleep".into()])
+        );
+        let wire = build_program(&parsed, &vec![], JsonMap::new(), 0);
+        assert_eq!(
+            wire["run"][0]["times"],
+            json!({"expr":"ref","path":"rounds"})
+        );
+        assert_eq!(wire["run"][0]["op"], "match_templates_loop");
+        assert_eq!(
+            wire["run"][0]["interval"],
+            json!({"expr":"ref","path":"gap"})
+        );
+        for times in ["", "times: 1,"] {
+            assert_eq!(parse_script(&format!("run: [{{match_templates: {{{times} cases: [{{template: a.png, do: [{{break: {{}}}}]}}]}}}}]" )).unwrap_err()[0].code, "yaml.break.outside_loop");
+            assert!(parse_script(&format!("run: [{{repeat: 3, do: [{{match_templates: {{{times} cases: [{{template: a.png, do: [{{break: {{}}}}]}}]}}}}]}}]" )).is_ok());
+        }
+        assert!(parse_function_library("functions: {helper: {run: [{match_templates: {times: 3, interval: 1s, cases: [{template: a.png, do: [{break: {}}]}]}}]}}" ).is_ok());
+    }
+
+    #[test]
+    fn polling_rejects_invalid_counts_and_intervals() {
+        for times in ["0", "-1", "1.5", "'3'", "null", "true"] {
+            let diagnostics = parse_script(&format!("run: [{{match_templates: {{times: {times}, cases: [{{template: a.png, do: []}}]}}}}]" )).unwrap_err();
+            assert_eq!(diagnostics[0].code, "yaml.match_templates.times", "{times}");
+        }
+        for interval in ["-1", "-1ms", "wrong", "null", "true"] {
+            let diagnostics = parse_script(&format!("run: [{{match_templates: {{interval: {interval}, cases: [{{template: a.png, do: []}}]}}}}]" )).unwrap_err();
+            assert_eq!(
+                diagnostics[0].code, "yaml.match_templates.interval",
+                "{interval}"
+            );
+        }
     }
 }

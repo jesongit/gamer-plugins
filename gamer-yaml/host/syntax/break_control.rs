@@ -13,7 +13,7 @@ pub(super) fn validate(
                 return Err(one_diagnostic(
                     "yaml.break.outside_loop",
                     &path,
-                    "break 只能在当前脚本或函数的 repeat 循环内使用",
+                    "break 只能在当前脚本或函数的 repeat 或多轮模板匹配内使用",
                 ))
             }
             SurfaceStep::Repeat { body, .. } => validate(body, &format!("{path}.do"), true)?,
@@ -26,8 +26,12 @@ pub(super) fn validate(
                 validate(else_steps, &format!("{path}.else"), in_loop)?;
             }
             SurfaceStep::MatchTemplates {
-                cases, else_steps, ..
+                cases,
+                times,
+                else_steps,
+                ..
             } => {
+                let in_loop = in_loop || match_templates::repeats(times);
                 for (n, case) in cases.iter().enumerate() {
                     validate(&case.body, &format!("{path}.cases[{n}].do"), in_loop)?;
                 }

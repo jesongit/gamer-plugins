@@ -222,6 +222,8 @@ pub enum SurfaceStep {
     MatchTemplates {
         cases: Vec<TemplateCase>,
         threshold: SurfaceExpr,
+        times: SurfaceExpr,
+        interval: SurfaceExpr,
         else_steps: Vec<SurfaceStep>,
     },
     Call {
@@ -251,10 +253,17 @@ impl SurfaceStep {
             Self::MatchTemplates {
                 cases,
                 threshold,
+                times,
+                interval,
                 else_steps,
             } => {
                 calls.insert("find_any".into());
                 threshold.collect_refs(refs);
+                times.collect_refs(refs);
+                interval.collect_refs(refs);
+                if match_templates::repeats(times) {
+                    calls.insert("sleep".into());
+                }
                 for case in cases {
                     case.template.collect_refs(refs);
                     for step in &case.body {
@@ -1317,9 +1326,13 @@ fn wire_step(step: &SurfaceStep, path: &str, functions: &FunctionLibrary) -> Val
         SurfaceStep::MatchTemplates {
             cases,
             threshold,
+            times,
+            interval,
             else_steps,
         } => {
-            return match_templates::wire(cases, threshold, else_steps, path, functions);
+            return match_templates::wire(
+                cases, threshold, times, interval, else_steps, path, functions,
+            );
         }
         SurfaceStep::Call {
             name,
@@ -1693,8 +1706,12 @@ fn step_yaml_lines(step: &SurfaceStep, indent: usize, out: &mut Vec<String>) {
         SurfaceStep::MatchTemplates {
             cases,
             threshold,
+            times,
+            interval,
             else_steps,
-        } => match_templates::yaml_lines(cases, threshold, else_steps, indent, out),
+        } => {
+            match_templates::yaml_lines(cases, threshold, times, interval, else_steps, indent, out)
+        }
         SurfaceStep::Call {
             name,
             args,

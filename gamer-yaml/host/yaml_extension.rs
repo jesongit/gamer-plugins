@@ -2509,6 +2509,55 @@ runtime = "^1.0"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_polls_fresh_frames_and_breaks_after_actions() {
+        let trace = Arc::new(tests::Trace::default());
+        let vision = tests::VisionStub::new(FrameSize::new(1920, 1080));
+        vision.push_outcome(MatchOutcome::NotFound);
+        vision.push_outcome(MatchOutcome::Found(crate::capabilities::MatchBox {
+            x: 100,
+            y: 200,
+            width: 20,
+            height: 20,
+            score: 0.97,
+        }));
+        let host = tests::vision_host(
+            trace.clone(),
+            &vision,
+            tests::LogTrace::new(),
+            &[
+                "device.read",
+                "vision.match",
+                "resource.read",
+                "input.tap",
+                "runtime.sleep",
+            ],
+        );
+        let program = wire("run:\n  - match_templates:\n      times: 999\n      interval: 1ms\n      cases:\n        - template: reward.png\n          as: hit\n          do:\n            - tap: $hit\n            - break: {}\n  - return: done\n");
+        assert_eq!(program["run"][0]["op"], "match_templates_loop");
+        let sink = tests::EventCollect::new();
+        let result = LazyYamlWasmtimeRuntime::new()
+            .run(run_request(
+                program,
+                host,
+                Arc::new(AtomicBool::new(false)),
+                Some(sink.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.value, json!("done"));
+        assert_eq!(*trace.taps.lock().unwrap(), vec![[110, 210]]);
+        assert_eq!(vision.captures.load(Ordering::SeqCst), 2);
+        assert_eq!(vision.match_calls.load(Ordering::SeqCst), 2);
+        let sleeps: Vec<_> = sink
+            .of("detail")
+            .into_iter()
+            .filter(|event| event["name"] == "arguments" && event["data"]["function"] == "sleep")
+            .collect();
+        assert_eq!(sleeps.len(), 1, "should wait only between the two captures");
+        assert_eq!(sleeps[0]["data"]["args"]["duration"], "1ms");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn real_yaml_component_tap_accepts_match_reference_and_center() {
         let trace = Arc::new(tests::Trace::default());
         let runtime = LazyYamlWasmtimeRuntime::new();

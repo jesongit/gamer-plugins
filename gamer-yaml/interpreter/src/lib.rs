@@ -166,9 +166,14 @@ pub struct Step {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StepKind {
+    #[serde(alias = "match_templates_loop")]
     MatchTemplates {
         args: Expr,
         cases: Vec<TemplateBranch>,
+        #[serde(default = "template_match_times")]
+        times: Expr,
+        #[serde(default = "template_match_interval")]
+        interval: Expr,
         #[serde(default, rename = "else")]
         else_steps: Vec<Step>,
     },
@@ -206,6 +211,18 @@ pub struct TemplateBranch {
     pub save_as: Option<String>,
     #[serde(rename = "do")]
     pub body: Vec<Step>,
+}
+
+fn template_match_times() -> Expr {
+    Expr::Lit {
+        value: serde_json::json!(1),
+    }
+}
+
+fn template_match_interval() -> Expr {
+    Expr::Lit {
+        value: serde_json::json!("250ms"),
+    }
 }
 
 /// 表达式：字面量或 `$name.field` 引用（无第三种）；字面量容器（数组/映射）
@@ -309,7 +326,7 @@ impl<'a> Interpreter<'a> {
             .run_steps(steps, &mut values)
             .and_then(|flow| match flow {
                 Flow::Break => {
-                    Err("yaml.break.outside_loop: break 只能在当前函数的 repeat 循环内使用".into())
+                    Err("yaml.break.outside_loop: break 只能在当前函数的循环内使用".into())
                 }
                 flow => Ok(flow),
             });
@@ -415,6 +432,51 @@ impl<'a> Interpreter<'a> {
         Ok(Flow::Continue)
     }
 
+    fn run_template_branch(
+        &mut self,
+        path: &str,
+        args: &Expr,
+        cases: &[TemplateBranch],
+        else_steps: &[Step],
+        values: &mut serde_json::Map<String, Value>,
+    ) -> Result<Flow, String> {
+        let args = self.eval(Some(args), values)?;
+        self.detail(
+            "arguments",
+            serde_json::json!({"path":path,"function":"find_any","args":args}),
+        );
+        let matched = self
+            .host
+            .invoke("find_any", args)
+            .map_err(|e| e.to_string())?;
+        self.detail("branch", serde_json::json!({"path":path,"kind":"match_templates","selected":matched.get("index").cloned().unwrap_or(Value::String("else".into())),"result":matched}));
+        if matched.is_null() {
+            return self.run_steps(else_steps, values);
+        }
+        let index = matched
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or("匹配结果缺少有效分支 index")?;
+        let branch = cases.get(index).ok_or("匹配分支 index 越界")?;
+        let previous = branch
+            .save_as
+            .as_ref()
+            .map(|name| values.insert(name.clone(), matched));
+        let outcome = self.run_steps(&branch.body, values);
+        if let (Some(name), Some(previous)) = (&branch.save_as, previous) {
+            match previous {
+                Some(value) => {
+                    values.insert(name.clone(), value);
+                }
+                None => {
+                    values.remove(name);
+                }
+            }
+        }
+        outcome
+    }
+
     fn run_step(
         &mut self,
         step: &Step,
@@ -424,43 +486,41 @@ impl<'a> Interpreter<'a> {
             StepKind::MatchTemplates {
                 args,
                 cases,
+                times,
+                interval,
                 else_steps,
             } => {
-                let args = self.eval(Some(args), values)?;
-                self.detail(
-                    "arguments",
-                    serde_json::json!({"path":step.path,"function":"find_any","args":args}),
-                );
-                let matched = self
-                    .host
-                    .invoke("find_any", args)
-                    .map_err(|e| e.to_string())?;
-                self.detail("branch", serde_json::json!({"path":step.path,"kind":"match_templates","selected":matched.get("index").cloned().unwrap_or(Value::String("else".into())),"result":matched}));
-                if matched.is_null() {
-                    return self.run_steps(else_steps, values);
+                let times = self.eval(Some(times), values)?;
+                let count = times
+                    .as_u64()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| format!("匹配次数必须是正整数，得到 {times}"))?;
+                if count == 1 {
+                    return self.run_template_branch(&step.path, args, cases, else_steps, values);
                 }
-                let index = matched
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .and_then(|i| usize::try_from(i).ok())
-                    .ok_or("匹配结果缺少有效分支 index")?;
-                let branch = cases.get(index).ok_or("匹配分支 index 越界")?;
-                let previous = branch
-                    .save_as
-                    .as_ref()
-                    .map(|name| values.insert(name.clone(), matched));
-                let outcome = self.run_steps(&branch.body, values);
-                if let (Some(name), Some(previous)) = (&branch.save_as, previous) {
-                    match previous {
-                        Some(value) => {
-                            values.insert(name.clone(), value);
-                        }
-                        None => {
-                            values.remove(name);
-                        }
+                let interval = self.eval(Some(interval), values)?;
+                for iteration in 0..count {
+                    self.begin_step()?;
+                    self.detail(
+                        "iteration",
+                        serde_json::json!({"path":step.path,"iteration":iteration+1,"total":count}),
+                    );
+                    match self.run_template_branch(&step.path, args, cases, else_steps, values)? {
+                        Flow::Continue => {}
+                        Flow::Break => break,
+                        flow => return Ok(flow),
+                    }
+                    if iteration + 1 < count {
+                        self.begin_step()?;
+                        let args = serde_json::json!({"duration":interval});
+                        self.detail(
+                            "arguments",
+                            serde_json::json!({"path":step.path,"function":"sleep","args":args}),
+                        );
+                        self.call_host_function("sleep", args, &None, values)?;
                     }
                 }
-                outcome
+                Ok(Flow::Continue)
             }
             StepKind::Fn {
                 name,
