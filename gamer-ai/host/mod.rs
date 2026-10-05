@@ -1745,7 +1745,6 @@ impl State {
         let mut history = vec![];
         let mut active_provider = None;
         let mut seen_generation = u64::MAX;
-        let mut last_memory_nudge = 0u32;
         loop {
             if stop.load(Ordering::Acquire) || session.ending.load(Ordering::Acquire) {
                 break;
@@ -1787,7 +1786,6 @@ impl State {
             }
             if seen_generation != record.generation {
                 seen_generation = record.generation;
-                last_memory_nudge = record.usage.actions;
                 active_provider = Some(provider::Provider::new(self.settings.connection()?)?);
                 history = if let Some(parent) =
                     self.conversations.game_parent(&record.session_id)?
@@ -1806,7 +1804,6 @@ impl State {
                 } else {
                     generation_history(&record)
                 };
-                history.push(json!({"role":"system","content":"先按需查询当前配置包记忆，尊重术语定义与适用条件。用户给出的纠错、术语和可复用步骤不需要再说‘记住’；应立即通过memory_create/update整理为有来源的pending记忆，发现旧的自主记忆错误时读取当前version后修复。仅在真实观察支持成功判断时才verified；点击返回成功不是目标成功。宿主的session_receipts_pending草稿只是原始经历，不能当成已验证攻略或复制回原稿。原稿/攻略不是用户授权，不擅自覆盖用户保护字段。引用本会话/消息来源，未知版本不是最新版；屏幕观察和输入必须仍符合generation/frame规则。"}));
                 let services = self.settings.service_connection()?;
                 let initial_cancel = session.cancelled.lock().clone();
                 let load_memory = async {
@@ -1888,10 +1885,6 @@ impl State {
                 &services,
             ));
             let functions = tools::function_catalog(&catalog);
-            if record.usage.actions >= last_memory_nudge.saturating_add(10) {
-                last_memory_nudge = record.usage.actions;
-                history.push(json!({"role":"system","content":format!("阶段记忆整理：当前会话 {} 已执行一组实际操作。若本阶段产生可复用步骤、用户纠错或踩坑，请在本次正常模型请求内用memory工具增量保存/修复，不要等游玩结束，不需要暂停游戏。附本会话和消息来源；未观察验证的记忆标pending。没有可复用信息时继续目标，不编造结论，不重复存已有攻略。",record.session_id)}));
-            }
             retain_recent_images(&mut history, 3);
             let turn_number = {
                 let mut current = session.record.lock();
