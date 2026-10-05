@@ -1,5 +1,5 @@
 <template>
-  <div v-if="preview.open" class="modal-mask" @click.self="emit('close')">
+  <div v-if="preview.open" class="modal-mask" v-backdrop-dismiss="() => emit('close')">
     <div class="modal resource-preview-modal" role="dialog" aria-modal="true" :aria-label="preview.title">
       <div class="modal-head">
         <div>
@@ -34,6 +34,7 @@
 </template>
 
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 import ScriptSummary from './ScriptSummary.vue'
 
 defineProps({

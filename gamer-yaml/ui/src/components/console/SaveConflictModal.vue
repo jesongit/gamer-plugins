@@ -1,5 +1,5 @@
 <template>
-  <div v-if="open" class="modal-mask" @click.self="emit('close')">
+  <div v-if="open" class="modal-mask" v-backdrop-dismiss="() => emit('close')">
     <div class="modal conflict-modal">
       <div class="modal-head">
         <span class="title">保存冲突</span>
@@ -19,6 +19,7 @@
 </template>
 
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 /**
  * 保存版本冲突弹窗（阶段 4：expected_version → 409 {code:"version_conflict"}）：
  * Console 紧凑外壳与独立全屏外壳共用。重载 = shell.reload()（放弃本地）；覆盖 = shell.overwrite()。
