@@ -98,10 +98,14 @@ export function stepCaption(step: Step, defaultName?: string): { title: string; 
       if (step.as) detail += `${detail ? ' ' : ''}→ ${step.as}`
       return { title, detail }
     }
-    case 'match_templates': return { title: '模板分支', detail: step.cases.map(c => valuePreview(c.template, '未选择模板')).join(' → ') }
+    case 'match_templates': {
+      const rounds = valuePreview(step.times, '1')
+      const interval = step.times?.ref || step.times?.lit !== 1 ? ` · 间隔 ${valuePreview(step.interval, '250ms')}` : ''
+      return { title: '模板分支', detail: `${rounds} 次${interval} · ${step.cases.map(c => valuePreview(c.template, '未选择模板')).join(' → ')}` }
+    }
     case 'if': return { title: '如果', detail: valuePreview(step.cond, '未填写条件') }
     case 'repeat': return { title: '重复', detail: `${valuePreview(step.times, '未填写次数')} 次` }
-    case 'break': return { title: '跳出循环', detail: '退出最近一层 repeat' }
+    case 'break': return { title: '跳出循环', detail: '退出最近一层循环' }
     case 'return': return { title: '返回', detail: valuePreview(step.value, '未填写返回值') }
   }
 }

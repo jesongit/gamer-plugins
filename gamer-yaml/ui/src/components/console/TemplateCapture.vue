@@ -80,7 +80,7 @@
     </div>
 
     <!-- 二次裁切弹窗已拆到 TemplateCropModal.vue（挂在面板层级，任何页签下框选都可见） -->
-    <div v-if="ctx.viewTpl" class="tpl-view-mask" @click.self="ctx.closeTplView">
+    <div v-if="ctx.viewTpl" class="tpl-view-mask" v-backdrop-dismiss="ctx.closeTplView">
       <div class="tpl-view-modal">
         <button class="tpl-view-close" aria-label="关闭模板预览" @click="ctx.closeTplView"><UiIcon name="close" /></button>
         <div class="tpl-view-img"><img :src="ctx.tplThumbUrl(ctx.viewTpl)" alt="模板预览" /></div>
@@ -91,6 +91,7 @@
 </template>
 
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 import UiIcon from '../../../../../../web/src/components/ui/UiIcon.vue'
 import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 

@@ -100,6 +100,11 @@ export function useConsoleScriptRunner({
   const editorShellApi = createEditorShellApi(api)
   const scriptShell = useScriptEditorShell({
     api: editorShellApi,
+    refreshTemplates: async requestedPackage => {
+      if (!requestedPackage) return
+      const list = await api.listTemplates(requestedPackage)
+      if (packageId.value === requestedPackage && Array.isArray(list)) templatesData.value = list
+    },
     getContext: () => ({
       resolveParams: funcParamsFor,
       resolveTemplate: (n) => {
@@ -690,7 +695,7 @@ export function useConsoleScriptRunner({
     }
     const pending = Promise.resolve()
       .then(() => scriptShell.save(opts))
-      .then(result => ({ ...result, _savedSnapshot: savedSnapshot }))
+      .then(result => ({ ...result, _savedSnapshot: result.submittedYaml ?? savedSnapshot }))
     shellSaveInflight = pending
     pending.finally(() => {
       if (shellSaveInflight === pending) shellSaveInflight = null
@@ -1275,7 +1280,7 @@ export function useConsoleScriptRunner({
     scriptShell, rawEditor, fnLib, beforePackageChange,
     liveLogs, startPending, runStopping, runArgsFlow, onRunArgsSubmit,
     startLogPolling, stopLogPolling, pushLog,
-    clearCallParamsCache, editorMatchThreshold,
+    clearCallParamsCache, editorMatchThreshold, onTemplateRenamed: scriptShell.onTemplateRenamed,
     startRunStatusPoll, stopRunStatusPoll, restoreRunState, onBeforeUnload,
     refreshScripts,
     // 面板作用域上下文（扩展面板经 workspace context 消费）

@@ -1,5 +1,5 @@
 <template>
-  <div v-if="open" class="studio-mask" @click.self="close">
+  <div v-if="open" class="studio-mask" v-backdrop-dismiss="close">
     <section class="studio" role="dialog" aria-modal="true" data-testid="template-studio">
       <header class="studio-head">
         <span class="studio-title">✂️ 帧上做模板 / 离线测试</span>
@@ -96,6 +96,7 @@
 </template>
 
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 import ThemedCombobox from '../../../../../ui-shared/ThemedCombobox.vue'
 // 模板工作台弹窗（Phase 7 §10.2）：视频模式从确定帧框选创建模板 + 离线匹配测试。
 // - 底图 = 服务端确定帧 PNG（按帧身份寻址，字节级可重复；**保存绝不重抓画面**）；

@@ -154,14 +154,15 @@ function validateStepList(
   steps.forEach((step, i) => {
     const path = `${basePath}[${i}]`
     validateStep(step, path, declaredVars, ctx, diags)
-    if (step.kind === 'break' && !inLoop) diags.push(diag('yaml.break.outside_loop', path, 'break', 'break 只能在当前脚本或函数的 repeat 循环内使用'))
+    if (step.kind === 'break' && !inLoop) diags.push(diag('yaml.break.outside_loop', path, 'break', 'break 只能在当前脚本或函数的 repeat 或多轮模板匹配内使用'))
     if (depth >= maxDepth) {
       diags.push(diag('yaml.flow.nesting_depth', path, '', `步骤嵌套超过 ${maxDepth} 层`))
       return
     }
     if (step.kind === 'match_templates') {
-      step.cases.forEach((c, n) => validateStepList(c.body, `${path}.cases[${n}].do`, new Set([...declaredVars, ...(c.as ? [c.as] : [])]), ctx, diags, depth + 1, inLoop))
-      validateStepList(step.else, `${path}.else`, declaredVars, ctx, diags, depth + 1, inLoop)
+      const branchLoop = inLoop || isRefCell(step.times) || (!step.times.missing && typeof step.times.lit === 'number' && step.times.lit > 1)
+      step.cases.forEach((c, n) => validateStepList(c.body, `${path}.cases[${n}].do`, new Set([...declaredVars, ...(c.as ? [c.as] : [])]), ctx, diags, depth + 1, branchLoop))
+      validateStepList(step.else, `${path}.else`, declaredVars, ctx, diags, depth + 1, branchLoop)
     } else for (const child of childStepLists(step)) {
       validateStepList(child.list, `${path}.${child.key}`, declaredVars, ctx, diags, depth + 1, inLoop || step.kind === 'repeat')
     }
@@ -223,6 +224,14 @@ function validateStep(
     }
     case 'match_templates': {
       if (!step.cases.length || step.cases.length > 64) diags.push(diag('yaml.match_templates.cases', path, 'cases', '必须有 1..64 个模板分支'))
+      validateCell(step.times, path, 'times', declaredVars, ctx, diags)
+      if (!isRefCell(step.times) && (typeof step.times.lit !== 'number' || !Number.isSafeInteger(step.times.lit) || step.times.lit < 1)) {
+        diags.push(diag('yaml.match_templates.times', path, 'times', '匹配次数必须为正整数或引用'))
+      }
+      validateCell(step.interval, path, 'interval', declaredVars, ctx, diags)
+      if (!isRefCell(step.interval) && checkLiteral('duration', step.interval.lit)) {
+        diags.push(diag('yaml.match_templates.interval', path, 'interval', '匹配间隔必须为非负毫秒数、带单位时间或引用'))
+      }
       validateCell(step.threshold, path, 'threshold', declaredVars, ctx, diags)
       if (!isRefCell(step.threshold) && (typeof step.threshold.lit !== 'number' || !Number.isFinite(step.threshold.lit) || step.threshold.lit < 0 || step.threshold.lit > 1)) {
         diags.push(diag('yaml.match_templates.threshold', path, 'threshold', '匹配阈值必须为 0..1 数字或引用'))

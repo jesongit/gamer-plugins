@@ -128,7 +128,7 @@ export type Step =
   & StepUuid
   & (
     | { kind: 'call'; fn: string; args: CallArgs; as: string | null }
-    | { kind: 'match_templates'; cases: { template: Cell; as: string | null; body: Step[] }[]; threshold: Cell; else: Step[] }
+    | { kind: 'match_templates'; cases: { template: Cell; as: string | null; body: Step[] }[]; threshold: Cell; times: Cell; interval: Cell; else: Step[] }
     | { kind: 'if'; cond: Cell; then: Step[]; else: Step[] }
     | { kind: 'repeat'; times: Cell; body: Step[] }
     | { kind: 'break' }
@@ -245,6 +245,8 @@ export function collectStepUsage(
     }
     case 'match_templates': {
       collectCellRefs(step.threshold, refs)
+      collectCellRefs(step.times, refs)
+      collectCellRefs(step.interval, refs)
       for (const c of step.cases) collectCellRefs(c.template, refs)
       for (const child of childStepLists(step)) for (const s of child.list) collectStepUsage(s, calls, refs)
       break

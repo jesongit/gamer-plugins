@@ -1,7 +1,7 @@
 <template>
   <!-- 二次裁切弹窗：独立于模板页签挂载（框选可从脚本编辑的「框选」按钮发起，不切页签）；
        确认/取消是独立操作，弹窗形态下列表保持可见 -->
-  <div v-if="ctx.crop.active" class="modal-mask" @click.self="ctx.cancelCrop">
+  <div v-if="ctx.crop.active" class="modal-mask" v-backdrop-dismiss="ctx.cancelCrop">
     <div class="modal crop-modal" ref="cropSec">
       <div class="modal-head">
         <span class="title">{{ ctx.crop.conflict ? '⚠️ 模板短名冲突' : ctx.crop.replacement ? '✂️ 替换模板' : '✂️ 二次裁切' }}</span>
@@ -46,6 +46,7 @@
   </div>
 </template>
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 const props = defineProps({ context: { type: Object, required: true }, onCropMounted: { type: Function, required: true } })
 const ctx = reactive(props.context); const cropSec = ref(null); const cropCanvas = ref(null)

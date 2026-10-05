@@ -87,6 +87,8 @@ function walk(steps: Step[], base: string, env: Env, ctx: ValidationContext, out
       if (step.as) env.set(step.as, matches.has(step.fn) ? 'match' : booleans.has(step.fn) ? 'boolean' : 'any')
     } else if (step.kind === 'match_templates') {
       check(step.threshold, 'number', false, path, 'threshold', env, out)
+      check(step.times, 'integer', false, path, 'times', env, out)
+      check(step.interval, 'duration', false, path, 'interval', env, out)
       step.cases.forEach((c, index) => {
         check(c.template, 'template', false, path, `cases[${index}].template`, env, out)
         const local = new Map(env)

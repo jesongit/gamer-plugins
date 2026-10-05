@@ -228,8 +228,26 @@ fn walk(
             SurfaceStep::MatchTemplates {
                 cases,
                 threshold,
+                times,
+                interval,
                 else_steps,
             } => {
+                check(
+                    times,
+                    ParamType::Integer,
+                    false,
+                    &format!("{path}.times"),
+                    env,
+                    out,
+                );
+                check(
+                    interval,
+                    ParamType::Duration,
+                    false,
+                    &format!("{path}.interval"),
+                    env,
+                    out,
+                );
                 check(
                     threshold,
                     ParamType::Number,

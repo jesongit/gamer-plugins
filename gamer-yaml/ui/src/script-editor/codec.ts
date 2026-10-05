@@ -274,6 +274,8 @@ function emitStep(step: Step, col: number, lines: string[]): void {
       const pad = ' '.repeat(col)
       lines.push(`${pad}match_templates:`)
       lines.push(`${pad}  threshold: ${cellInline(step.threshold)}`)
+      lines.push(`${pad}  times: ${cellInline(step.times)}`)
+      lines.push(`${pad}  interval: ${cellInline(step.interval)}`)
       lines.push(`${pad}  cases:${step.cases.length ? '' : ' []'}`)
       for (const c of step.cases) {
         lines.push(`${pad}    - template: ${cellInline(c.template)}`)
@@ -670,8 +672,8 @@ function parseStepNode(item: unknown, path: string, diags: Diagnostic[]): Step |
         const problem = (code: string, message: string) => diags.push(diag(code, path, '', message))
         const shape = (value: unknown, keys: string[]): value is Record<string, unknown> =>
           !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k))
-        if (!shape(keywordValue, ['cases', 'else', 'threshold']) || structural) {
-          problem('yaml.match_templates.shape', 'match_templates 仅支持 cases/else/threshold')
+        if (!shape(keywordValue, ['cases', 'else', 'threshold', 'times', 'interval']) || structural) {
+          problem('yaml.match_templates.shape', 'match_templates 仅支持 cases/else/threshold/times/interval')
           return null
         }
         const input = keywordValue
@@ -689,6 +691,8 @@ function parseStepNode(item: unknown, path: string, diags: Diagnostic[]): Step |
         })
         return { uuid: newStepUuid(), kind: 'match_templates', cases,
           threshold: exprCell('threshold' in input ? input.threshold : 0.8, path, 'threshold', diags),
+          times: exprCell('times' in input ? input.times : 1, path, 'times', diags),
+          interval: exprCell('interval' in input ? input.interval : '250ms', path, 'interval', diags),
           else: parseStepsNode(input.else, `${path}.else`, diags) }
       }
       case 'if': {

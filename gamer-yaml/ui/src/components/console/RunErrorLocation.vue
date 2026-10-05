@@ -1,5 +1,5 @@
 <template>
-  <Teleport to="body"><div class="modal-mask" @click.self="$emit('close')"><section class="modal error-location">
+  <Teleport to="body"><div class="modal-mask" v-backdrop-dismiss="() => $emit('close')"><section class="modal error-location">
     <div class="modal-head"><span>运行报错位置</span><button class="btn btn-icon" aria-label="关闭报错位置" @click="$emit('close')"><UiIcon name="close" /></button></div>
     <div class="modal-body">
       <p class="source mono">{{ source?.package_id }} / {{ source?.path }}<template v-if="source?.function"> · {{ source.function }}</template></p>
@@ -12,6 +12,7 @@
   </section></div></Teleport>
 </template>
 <script setup>
+import { vBackdropDismiss } from '../../../../../ui-shared/backdrop-dismiss.js'
 import { computed, nextTick, onMounted, ref, shallowRef } from 'vue'
 import UiIcon from '../../../../../../web/src/components/ui/UiIcon.vue'
 import StepCanvas from '../../script-editor/components/StepCanvas.vue'

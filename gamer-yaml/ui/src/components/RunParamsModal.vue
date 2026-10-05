@@ -1,5 +1,5 @@
 <template>
-  <div v-if="open" class="modal-mask" @click.self="emit('close')">
+  <div v-if="open" class="modal-mask" v-backdrop-dismiss="() => emit('close')">
     <div class="modal run-params-modal">
       <div class="modal-head">
         <span class="title">{{ title }}</span>
@@ -27,6 +27,7 @@
 </template>
 
 <script setup>
+import { vBackdropDismiss } from '../../../../ui-shared/backdrop-dismiss.js'
 /**
  * 运行参数弹窗（阶段 5）：ParamsForm 的模态外壳——Console 手动运行 /
  * 独立页函数测试共用。提交前先跑客户端校验（必填缺失/类型不合规阻断并标红），
