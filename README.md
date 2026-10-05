@@ -4,7 +4,7 @@
 
 | 插件 | 当前源码版本 | 执行类型 | 使用说明 |
 | --- | --- | --- | --- |
-| `gamer-yaml` 自动化 | `0.1.4` | WASM | [自动化](gamer-yaml/README.md) |
+| `gamer-yaml` 自动化 | `0.1.5` | WASM | [自动化](gamer-yaml/README.md) |
 | `gamer-keymap` 键盘映射 | `0.1.5` | WASM | [键盘映射](gamer-keymap/README.md) |
 | `gamer-video` 视频工作台 | `0.1.3` | builtin | [视频工作台](gamer-video/README.md) |
 | `gamer-package-publisher` 配置包发布 | `0.1.0` | builtin | [配置包发布](gamer-package-publisher/README.md) |
