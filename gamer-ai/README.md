@@ -1,6 +1,6 @@
 # AI 助手
 
-`gamer-ai` 是通用 builtin 插件，提供持续对话、配置包记忆、模型 API 游玩和本机 Streamable HTTP MCP。内置 Agent 与外部客户端共用受限记忆、网页、截图和输入工具。Android 与浏览器目标复用宿主能力，没有固定游戏脚本。版本为 `0.3.9`，需要 Gamer `0.2.14` 或更高版本中包含本次对话与记忆实现的宿主；只更新 UI 归档不能更新宿主执行能力。
+`gamer-ai` 是通用 builtin 插件，提供持续对话、配置包记忆、模型 API 游玩和本机 Streamable HTTP MCP。内置 Agent 与外部客户端共用受限记忆、网页、截图和输入工具。Android 与浏览器目标复用宿主能力，没有固定游戏脚本。版本为 `0.3.10`，需要 Gamer `0.2.14` 或更高版本中包含本次对话与记忆实现的宿主；只更新 UI 归档不能更新宿主执行能力。
 
 ## 对话与记忆
 
@@ -247,6 +247,6 @@ pnpm test
 pnpm build
 ```
 
-插件仓根目录可运行 `./gamer-ai/build.ps1`，或 `./build.ps1 -Plugin gamer-ai`，输出 `dist/plugins/gamer-ai-0.3.9.gplugin`、目录和校验清单。主仓 `tools/build-plugins.ps1` 也能包装；开发时可显式指定输出目录以免覆盖本地市场目录。
+插件仓根目录可运行 `./gamer-ai/build.ps1`，或 `./build.ps1 -Plugin gamer-ai`，输出 `dist/plugins/gamer-ai-0.3.10.gplugin`、目录和校验清单。主仓 `tools/build-plugins.ps1` 也能包装；开发时可显式指定输出目录以免覆盖本地市场目录。
 
 执行体位于 `host/` 并编译进宿主，安装 UI 归档需要匹配的宿主版本。独立包装复用 `sdk/lock.json` 固定快照，无 WASM 占位文件，不依赖 gamer-yaml。修改 host 后必须一起构建/发布 Gamer 本体。

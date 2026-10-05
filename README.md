@@ -10,7 +10,7 @@
 | `gamer-package-publisher` 配置包发布 | `0.1.0` | builtin | [配置包发布](gamer-package-publisher/README.md) |
 | `gamer-live` 直播助手 | `0.2.5` | builtin | [直播助手](gamer-live/README.md) |
 | `gamer-notify` 通知助手 | `0.1.0` | builtin | [通知助手](gamer-notify/README.md) |
-| `gamer-ai` AI 助手 | `0.3.9` | builtin | [AI 助手](gamer-ai/README.md) |
+| `gamer-ai` AI 助手 | `0.3.10` | builtin | [AI 助手](gamer-ai/README.md) |
 
 源码迁自 `jesongit/gamer` 的 `689cc47b1fcaa2780fc97cd357db25f23da84ddd:plugins/`；迁移前历史保留在主仓。
 
