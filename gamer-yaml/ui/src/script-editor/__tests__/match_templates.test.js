@@ -9,6 +9,7 @@ import { resolveStepList } from '../commands'
 import { findStepLocation } from '../selection'
 import { locateDiagnostic } from '../components/kinds'
 import StepCard from '../components/StepCard.vue'
+import { createControl } from '../factories'
 import { setupScript } from './component_helpers'
 
 const source = `run:
@@ -26,6 +27,53 @@ const source = `run:
 `
 
 describe('模板分支：完整编辑与执行路径契约', () => {
+  it('旧脚本和新建步骤默认单次匹配，保存重开保留次数与间隔', async () => {
+    const { model, stack } = setupScript(source)
+    const step = model.run[0]
+    expect(step.times).toEqual({ lit: 1 })
+    expect(step.interval).toEqual({ lit: '250ms' })
+    expect(createControl('match_templates')).toMatchObject({ times: { lit: 1 }, interval: { lit: '250ms' } })
+    const wrapper = mount(StepCard, { props: { model, stack, step, index: 0, containerPath: ['run'], basePath: 'run', expandedUuids: new Set([step.uuid]) } })
+    await wrapper.get('input[aria-label="匹配次数"]').setValue('999')
+    expect(step.times.lit).toBe(999)
+    stack.undo()
+    expect(step.times.lit).toBe(1)
+    stack.redo()
+    await wrapper.get('input[aria-label="匹配间隔数值"]').setValue('1')
+    await wrapper.get('select[aria-label="匹配间隔单位"]').setValue('s')
+    expect(step.interval.lit).toBe('1s')
+    stack.undo()
+    expect(step.interval.lit).toBe('1ms')
+    stack.redo()
+    const reopened = parseScript(serialize(model)).model.run[0]
+    expect(reopened).toMatchObject({ times: { lit: 999 }, interval: { lit: '1s' } })
+    expect(validateSource(serialize(model), 'script').diagnostics).toEqual([])
+    wrapper.unmount()
+  })
+
+  it('多轮匹配允许退出匹配循环，默认或显式一次不新建循环作用域', () => {
+    const branch = 'cases: [{template: a.png, do: [{break: {}}]}]'
+    expect(validateSource(`run: [{match_templates: {times: 999, ${branch}}}]`, 'script').diagnostics).toEqual([])
+    for (const times of ['', 'times: 1, ']) {
+      expect(validateSource(`run: [{match_templates: {${times}${branch}}}]`, 'script').diagnostics[0].code).toBe('yaml.break.outside_loop')
+      expect(validateSource(`run: [{repeat: 3, do: [{match_templates: {${times}${branch}}}]}]`, 'script').diagnostics).toEqual([])
+    }
+  })
+
+  it('次数和间隔支持参数引用并校验引用类型', () => {
+    const text = `params:\n  rounds: {type: integer, default: 3}\n  gap: {type: duration, default: 1s}\nrun:\n  - match_templates:\n      times: $rounds\n      interval: $gap\n      cases: [{template: a.png, do: []}]\n`
+    expect(validateSource(text, 'script').diagnostics).toEqual([])
+    expect(validateSource(text.replace('rounds: {type: integer, default: 3}', 'rounds: {type: boolean, default: true}'), 'script').diagnostics.some(d => d.field === 'times')).toBe(true)
+    expect(validateSource(text.replace('gap: {type: duration, default: 1s}', 'gap: {type: boolean, default: true}'), 'script').diagnostics.some(d => d.field === 'interval')).toBe(true)
+  })
+
+  it.each([0, -1, 1.5, '"3"', 'null', 'true'])('拒绝无效匹配次数 %s', times => {
+    expect(validateSource(`run: [{match_templates: {times: ${times}, cases: [{template: a.png, do: []}]}}]`, 'script').diagnostics.some(d => d.code === 'yaml.match_templates.times')).toBe(true)
+  })
+
+  it.each(['-1ms', '-1', 'wrong', 'null', 'true'])('拒绝无效匹配间隔 %s', interval => {
+    expect(validateSource(`run: [{match_templates: {interval: ${interval}, cases: [{template: a.png, do: []}]}}]`, 'script').diagnostics.some(d => d.code === 'yaml.match_templates.interval')).toBe(true)
+  })
   it('保存重开、分支局部变量、嵌套定位和复制', () => {
     const first = validateSource(source, 'script', { knownFunctions: new Set(['tap', 'log']), resolveTemplate: () => true })
     expect(first.diagnostics).toEqual([])

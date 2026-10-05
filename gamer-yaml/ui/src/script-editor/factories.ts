@@ -18,7 +18,7 @@ export function createCall(fn: string, args: CallArgs = { kind: 'none' }, as: st
 export function createControl(kind: 'if' | 'repeat' | 'return' | 'match_templates' | 'break'): Step {
   switch (kind) {
     case 'match_templates':
-      return { uuid: newStepUuid(), kind: 'match_templates', threshold: lit(0.8), cases: [{ template: lit(''), as: null, body: [] }], else: [] }
+      return { uuid: newStepUuid(), kind: 'match_templates', threshold: lit(0.8), times: lit(1), interval: lit('250ms'), cases: [{ template: lit(''), as: null, body: [] }], else: [] }
     case 'if':
       return { uuid: newStepUuid(), kind: 'if', cond: lit(true), then: [], else: [] }
     case 'repeat':

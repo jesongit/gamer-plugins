@@ -149,6 +149,15 @@
       <template v-else-if="step.kind === 'match_templates'">
         <p class="field-hint">从上到下匹配同一帧，只执行首个命中的分支；模板不会自动点击。</p>
         <div class="field-row">
+          <span class="field-label">匹配次数</span>
+          <CellEditor :cell="step.times" type="integer" :params="params" label="匹配次数" :error="fieldError('times')" @change="c => updateCell('times', c)" />
+        </div>
+        <div class="field-row">
+          <span class="field-label">匹配间隔</span>
+          <CellEditor :cell="step.interval" type="duration" :params="params" label="匹配间隔" :error="fieldError('interval')" @change="c => updateCell('interval', c)" />
+        </div>
+        <p class="field-hint">默认匹配 1 次。多轮匹配时，本轮动作完成后等待间隔再取新画面；用“跳出循环”提前结束。</p>
+        <div class="field-row">
           <span class="field-label">匹配阈值</span>
           <CellEditor :cell="step.threshold" type="number" :params="params" label="匹配阈值" :error="fieldError('threshold')" @change="c => updateCell('threshold', c)" />
         </div>

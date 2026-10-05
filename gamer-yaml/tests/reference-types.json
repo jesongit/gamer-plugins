@@ -1,4 +1,6 @@
 [
+  {"name":"模板轮询参数引用", "source":"params:\n  rounds: {type: integer, default: 3}\n  gap: {type: duration, default: 1s}\nrun:\n  - match_templates:\n      times: $rounds\n      interval: $gap\n      cases: [{template: a.png, do: [{break: {}}]}]\n", "errors":[]},
+  {"name":"模板轮询拒绝布尔次数与间隔", "source":"params:\n  enabled: {type: boolean, default: true}\nrun:\n  - match_templates:\n      times: $enabled\n      interval: $enabled\n      cases: [{template: a.png, do: []}]\n", "errors":["run[0].times","run[0].interval"]},
   {"name":"时间参数的实际表示保持运行时校验", "source":"params:\n  delay: {type: duration, default: 0.5}\nrun:\n  - find: {template: a.png, threshold: $delay}\n", "errors":[]},
   {"name":"分支匹配结果不能当模板名", "source":"run:\n  - match_templates:\n      cases:\n        - template: a.png\n          as: hit\n          do:\n            - tap_template: {template: $hit}\n", "errors":["run[0].cases[0].do[0].template"]},
   {"name":"分支匹配结果可以直接点击", "source":"run:\n  - match_templates:\n      cases:\n        - template: a.png\n          as: hit\n          do:\n            - tap: $hit\n            - tap: {position: $hit}\n            - tap: $hit.center\n            - tap_template: $hit.template\n", "errors":[]},
