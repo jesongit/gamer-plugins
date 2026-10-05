@@ -1,6 +1,7 @@
 import { templateShortName } from '../console/template-resource'
 import { parseFunctionLibrary, parseScript, serialize } from './codec'
-import { walkSteps, type Cell, type EditorModel } from './model'
+import { walkSteps, type Cell } from './model'
+import type { EditorModel } from './commands'
 
 export interface TemplateRename {
   oldName: string
