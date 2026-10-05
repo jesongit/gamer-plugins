@@ -77,10 +77,16 @@
         <span class="mono">{{ sourceLabel(m.source) }}</span>
         <span class="tag" :class="stateTagClass(m.state)">{{ stateLabel(m.state) }}</span>
         <span class="row-actions">
-          <button class="mini-btn danger" type="button" :class="{ armed: armedId === m.id }" @click.stop="remove(m)">
+          <button class="mini-btn danger" type="button" :disabled="renamingBusy" :class="{ armed: armedId === m.id }" @click.stop="remove(m)">
             {{ armedId === m.id ? '确认删除' : '删除' }}
           </button>
+          <button class="mini-btn" type="button" :disabled="renamingBusy" data-testid="media-rename" @click.stop="beginRename(m)">重命名</button>
         </span>
+        <form v-if="renamingId === m.id" class="media-rename-form" data-testid="media-rename-form" @click.stop @submit.prevent="confirmRename(m)">
+          <input ref="renameInput" v-model="renameName" class="input" type="text" maxlength="255" aria-label="视频名称" :disabled="renamingBusy" data-testid="media-rename-input" @keydown.esc.prevent.stop="cancelRename" />
+          <button class="mini-btn" type="submit" :disabled="!renameReady || renamingBusy" data-testid="media-rename-save">{{ renamingBusy ? '保存中…' : '保存' }}</button>
+          <button class="mini-btn" type="button" :disabled="renamingBusy" data-testid="media-rename-cancel" @click="cancelRename">取消</button>
+        </form>
       </div>
     </div>
 
@@ -182,7 +188,7 @@
 // 素材库区：列表（listMedia 数据由宿主注入）/导入（1GiB 内字节直传）/删除（409 = 被引用）/
 // 录制入口（设备下拉复用全局 devicesData，activeRecording 3s 轮询驱动按钮态）。
 // 本组件不解释素材内容语义；预览与精确帧在时间轴区。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import UiIcon from '../../../../../../web/src/components/ui/UiIcon.vue'
 import { useOperationStatus } from '../../../../../../web/src/components/ui/useOperationStatus'
 import { devicesData } from '../../../../../../web/src/store'
@@ -210,6 +216,12 @@ const importingName = ref('')
 const error = ref('')
 const operationNote = ref('')
 const armedId = ref('')
+const renamingId = ref('')
+const renameName = ref('')
+const renameOriginalName = ref('')
+const renameInput = ref([])
+const renamingBusy = ref(false)
+const renameReady = computed(() => !!renameName.value.trim() && renameName.value.trim() !== renameOriginalName.value)
 const armedHistoryId = ref('')
 const deletingHistory = ref(false)
 const historySearch = ref('')
@@ -406,6 +418,8 @@ async function onFileChosen(event) {
 }
 
 async function remove(media) {
+  if (renamingBusy.value) return
+  cancelRename()
   if (armedId.value !== media.id) {
     armedId.value = media.id
     error.value = ''
@@ -422,6 +436,40 @@ async function remove(media) {
     error.value = e?.status === 409 || e?.code === 'media_referenced'
       ? referenceReason(media, e)
       : describe(e, '删除失败')
+  }
+}
+
+async function beginRename(media) {
+  if (renamingBusy.value) return
+  armedId.value = ''
+  error.value = ''
+  renamingId.value = media.id
+  renameName.value = media.name || ''
+  renameOriginalName.value = renameName.value.trim()
+  await nextTick()
+  renameInput.value[0]?.focus()
+  renameInput.value[0]?.select()
+}
+
+function cancelRename() {
+  if (renamingBusy.value) return
+  renamingId.value = ''
+  renameName.value = ''
+}
+
+async function confirmRename(media) {
+  if (renamingBusy.value || renamingId.value !== media.id || !renameReady.value) return
+  renamingBusy.value = true
+  error.value = ''
+  try {
+    const updated = await videoApi.renameMedia(media.id, renameName.value.trim())
+    operationNote.value = `视频已重命名 · ${updated.name}`
+    renamingId.value = ''
+    emit('changed')
+  } catch (e) {
+    error.value = describe(e, '重命名失败')
+  } finally {
+    renamingBusy.value = false
   }
 }
 
@@ -571,6 +619,8 @@ function stateTagClass(state) {
 .media-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-0); }
 .list-empty { padding: 16px 10px; text-align: center; color: var(--text-2); font-size: 12px; }
 .row-actions { display: flex; gap: 4px; }
+.media-rename-form { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px; padding: 4px 0; cursor: default; }
+.media-rename-form .input { flex: 1; min-width: 0; }
 .mini-btn { border: 1px solid var(--border); border-radius: 4px; background: var(--bg-2); color: var(--text-1); cursor: pointer; font-size: 12px; padding: 2px 6px; }
 .mini-btn:hover { border-color: var(--accent); color: var(--accent); }
 .mini-btn.danger:hover, .mini-btn.danger.armed { border-color: var(--danger); color: var(--danger); }
