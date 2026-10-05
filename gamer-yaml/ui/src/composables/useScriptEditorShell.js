@@ -15,7 +15,7 @@ import { CommandStack, resolveStep } from '../script-editor/commands'
 import { parseFunctionLibrary, parseScript, serialize } from '../script-editor/codec'
 import { defaultAnchor, findStepLocation, startIndexOf } from '../script-editor/selection'
 import { validateFunctionLibrary, validateScript } from '../script-editor/validation'
-import { parseEditorSource, renamedTemplateSource, renameTemplateReferences } from '../script-editor/template-rename'
+import { inferTemplateRenames, parseEditorSource, renamedTemplateSource, renameTemplateReferences } from '../script-editor/template-rename'
 
 const YAML_EXT_RE = /\.(ya?ml)$/i
 
@@ -25,7 +25,7 @@ function ensureYamlExt(name) {
   return YAML_EXT_RE.test(t) ? t : `${t}.yml`
 }
 
-export function useScriptEditorShell({ api, getContext = null } = {}) {
+export function useScriptEditorShell({ api, getContext = null, refreshTemplates = null } = {}) {
   // ---- 会话状态 ----
   const kind = ref('script') // 'script' | 'function_library'
   const resourceId = ref(null) // <pkg>/<file>.yaml（脚本或函数库文件；新建未保存 = null）
@@ -230,7 +230,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
 
   // ---- 保存 / 冲突 / 重载 ----
 
-  function onTemplateRenamed({ pkg: renamedPackage, oldName, newName }) {
+  function onTemplateRenamed({ pkg: renamedPackage, oldName, newName, resource: renamedResource = null }) {
     if (!model.value || pkg.value !== renamedPackage || loading.value) return Promise.resolve()
     const currentModel = model.value
     const currentId = resourceId.value
@@ -247,8 +247,8 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
     // 其他页面的额外修改仍交给 expected_version 的 409 冲突保护。
     const pending = templateSync.catch(() => {}).then(async () => {
       if (!currentId || baseline === null) return
-      const resource = currentKind === 'script'
-        ? await api.getScript(currentId) : await api.getFunction(currentId)
+      const resource = renamedResource || (currentKind === 'script'
+        ? await api.getScript(currentId) : await api.getFunction(currentId))
       if (generation !== loadGeneration || model.value !== currentModel || savedYaml.value !== baseline) return
       const parsed = parseEditorSource(currentKind, resource.content ?? '')
       if (!parsed.diagnostics.length && serialize(parsed.model) === baseline) {
@@ -265,7 +265,25 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
     }
     const m = model.value
     if (!m || !stack.value) return { ok: false, reason: 'empty' }
-    const diags = diagnostics.value
+    const generation = loadGeneration
+    try { await refreshTemplates?.(pkg.value) } catch { /* 保留候选快照，保存仍受版本保护 */ }
+    if (model.value !== m || generation !== loadGeneration) return { ok: false, reason: 'empty' }
+    let diags = diagnostics.value
+    if (resourceId.value) {
+      const baseline = savedYaml.value
+      try {
+        const resource = kind.value === 'script'
+          ? await api.getScript(resourceId.value) : await api.getFunction(resourceId.value)
+        if (model.value !== m || generation !== loadGeneration) return { ok: false, reason: 'empty' }
+        const resolver = getContext?.()?.resolveTemplate
+        if (resolver && savedYaml.value === baseline
+          && (resource.version !== version.value || diags.some(diag => diag.code === 'yaml.resource.tmpl_not_found'))) {
+          const renames = inferTemplateRenames(kind.value, baseline, resource.content ?? '', resolver)
+          for (const rename of renames) await onTemplateRenamed({ ...rename, pkg: pkg.value, resource })
+        }
+        diags = diagnostics.value
+      } catch { /* 无法证明引用改写时，保留原校验错误，不猜新名也不覆盖 */ }
+    }
     if (diags.length) return { ok: false, reason: 'invalid', diagnostics: diags }
     const yaml = serialize(m)
     const submittedName = name.value

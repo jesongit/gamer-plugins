@@ -100,6 +100,11 @@ export function useConsoleScriptRunner({
   const editorShellApi = createEditorShellApi(api)
   const scriptShell = useScriptEditorShell({
     api: editorShellApi,
+    refreshTemplates: async requestedPackage => {
+      if (!requestedPackage) return
+      const list = await api.listTemplates(requestedPackage)
+      if (packageId.value === requestedPackage && Array.isArray(list)) templatesData.value = list
+    },
     getContext: () => ({
       resolveParams: funcParamsFor,
       resolveTemplate: (n) => {
