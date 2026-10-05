@@ -15,6 +15,7 @@ import { CommandStack, resolveStep } from '../script-editor/commands'
 import { parseFunctionLibrary, parseScript, serialize } from '../script-editor/codec'
 import { defaultAnchor, findStepLocation, startIndexOf } from '../script-editor/selection'
 import { validateFunctionLibrary, validateScript } from '../script-editor/validation'
+import { parseEditorSource, renamedTemplateSource, renameTemplateReferences } from '../script-editor/template-rename'
 
 const YAML_EXT_RE = /\.(ya?ml)$/i
 
@@ -46,6 +47,8 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
   let offChange = null
   let loadGeneration = 0
   let savedFunctions = new WeakMap()
+  let templateRenames = []
+  let templateSync = Promise.resolve()
 
   // 函数改名后仍能定位磁盘定义；新插入的函数没有已保存身份。
   function savedFunctionName(currentName) {
@@ -117,7 +120,12 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
       offChange()
       offChange = null
     }
-    if (stack.value) offChange = stack.value.onChange(() => { historyTick.value++ })
+    if (stack.value) offChange = stack.value.onChange(() => {
+      // 重命名来自外部资源变更，不占一个撤销步骤；历史闭包重新插入旧值后
+      // 也必须指向同一个已重命名的模板，不能撤销成不存在的旧文件。
+      for (const rename of templateRenames) renameTemplateReferences(model.value, rename)
+      historyTick.value++
+    })
   }
 
   function mountModel(parsedKind, parsed, meta = {}) {
@@ -126,6 +134,8 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
       offChange = null
     }
     kind.value = parsedKind
+    templateRenames = []
+    templateSync = Promise.resolve()
     model.value = reactive(parsed.model)
     stack.value = new CommandStack(model.value)
     bindStackNotifications()
@@ -220,7 +230,39 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
 
   // ---- 保存 / 冲突 / 重载 ----
 
+  function onTemplateRenamed({ pkg: renamedPackage, oldName, newName }) {
+    if (!model.value || pkg.value !== renamedPackage || loading.value) return Promise.resolve()
+    const currentModel = model.value
+    const currentId = resourceId.value
+    const currentKind = kind.value
+    const generation = loadGeneration
+    const rename = { oldName, newName }
+    templateRenames.push(rename)
+    renameTemplateReferences(currentModel, rename)
+    const baseline = renamedTemplateSource(currentKind, savedYaml.value, rename)
+    if (baseline !== null) savedYaml.value = baseline
+    historyTick.value++
+    // 不重载模型：未保存的步骤、当前选择和命令栈都保留。
+    // 只有磁盘内容恰好等于引用改写后的已保存快照，才能接纳新版本；
+    // 其他页面的额外修改仍交给 expected_version 的 409 冲突保护。
+    const pending = templateSync.catch(() => {}).then(async () => {
+      if (!currentId || baseline === null) return
+      const resource = currentKind === 'script'
+        ? await api.getScript(currentId) : await api.getFunction(currentId)
+      if (generation !== loadGeneration || model.value !== currentModel || savedYaml.value !== baseline) return
+      const parsed = parseEditorSource(currentKind, resource.content ?? '')
+      if (!parsed.diagnostics.length && serialize(parsed.model) === baseline) {
+        version.value = resource.version ?? version.value
+      }
+    })
+    templateSync = pending
+    return pending
+  }
+
   async function save(opts = {}) {
+    try { await templateSync } catch {
+      // 刷新失败时保留旧 expected_version，让服务端拒绝覆盖新内容。
+    }
     const m = model.value
     if (!m || !stack.value) return { ok: false, reason: 'empty' }
     const diags = diagnostics.value
@@ -323,6 +365,8 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
       offChange = null
     }
     model.value = null
+    templateRenames = []
+    templateSync = Promise.resolve()
     stack.value = null
     resourceId.value = null
     pkg.value = ''
@@ -409,7 +453,7 @@ export function useScriptEditorShell({ api, getContext = null } = {}) {
     hasModel, dirty, editorContext, diagnostics, canUndo, canRedo, savedFunctionName,
     canJumpBack, jumpBackLabel,
     loadScript, loadFunctionFile, newScript, newFunctionFile,
-    save, reload, overwrite, dismissConflict, reset, undo, redo,
+    save, reload, overwrite, dismissConflict, reset, undo, redo, onTemplateRenamed,
     select, insertStep,
     runStartIndexOf, jumpToScript, jumpToFunctionFile, jumpBack,
   })

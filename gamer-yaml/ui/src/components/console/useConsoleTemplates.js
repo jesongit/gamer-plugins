@@ -38,6 +38,7 @@ export function useConsoleTemplates({
   clearCallParamsCache,
   refreshScripts,
   refreshFnLib,
+  onTemplateRenamed,
 }) {
   const beginReport = operationReporter(feedback, GAMER_YAML_PLUGIN_ID, toast)
   const picking = ref(false)
@@ -529,14 +530,16 @@ export function useConsoleTemplates({
     }
   }, { flush: 'sync' })
 
-  async function finishCropSave(rep, shortName, toast) {
+  async function finishCropSave(rep, shortName, toast, referencesRefreshed = true) {
     const refreshed = await refreshTemplatesData()
     crop.conflict = null
     crop.active = false
     crop.replacement = null
     cropBaseCanvas = null
     hideLoupe()
-    toast(`模板 ${rep?.name || shortName} 已保存${tplSizeHint(rep)}${refreshed ? '' : '（模板列表刷新失败）'}`, refreshed ? 'success' : 'warn')
+    const warning = !refreshed ? '（模板列表刷新失败）'
+      : !referencesRefreshed ? '（编辑器引用刷新失败，未保存修改已保留）' : ''
+    toast(`模板 ${rep?.name || shortName} 已保存${tplSizeHint(rep)}${warning}`, refreshed && referencesRefreshed ? 'success' : 'warn')
     // 框选回填：保存成功把模板短名交回发起框选的单元格（CellEditor 自动填入）
     if (cellCaptureResolve) { cellCaptureResolve(shortName); cellCaptureResolve = null }
   }
@@ -597,7 +600,13 @@ export function useConsoleTemplates({
       // One conditional request replaces the pixels and, when needed, the
       // region/color suffix. The server stages bytes before moving the old file.
       const rep = await putTemplateBytes(existing.name, payload.dataB64, payload.pkg, expectedVersion, targetName)
-      await finishCropSave(rep, payload.shortName, toast)
+      let referencesRefreshed = true
+      if (targetName !== existing.name) {
+        try {
+          await onTemplateRenamed?.({ pkg: payload.pkg, oldName: existing.name, newName: targetName })
+        } catch { referencesRefreshed = false }
+      }
+      await finishCropSave(rep, payload.shortName, toast, referencesRefreshed)
     } catch (e) {
       if (e?.status === 409) {
         // 条件 PUT 拒绝说明其他页面已经改变了目标；更新冲突态中的完整
@@ -918,16 +927,25 @@ export function useConsoleTemplates({
     try {
       await api.renameTemplate(t.name, newName, requestedPackage)
       let refreshed = true
+      let referencesRefreshed = true
       if (packageId.value === requestedPackage) {
+        // 文件移动已成功：编辑中的模型也要同步，不能只刷新下拉候选。
+        try {
+          await onTemplateRenamed?.({ pkg: requestedPackage, oldName: t.name, newName })
+        } catch { referencesRefreshed = false }
         refreshed = await refreshTemplatesData()
         if (packageId.value === requestedPackage) {
           if (viewTpl.value === t.name) viewTpl.value = newName
           // 后端同步改写脚本/函数引用；刷新缓存，让摘要和后续编辑立即看到新名称。
-          await Promise.all([refreshScripts?.(), refreshFnLib?.(requestedPackage)])
+          try {
+            await Promise.all([refreshScripts?.(), refreshFnLib?.(requestedPackage)])
+          } catch { referencesRefreshed = false }
           if (packageId.value === requestedPackage) clearCallParamsCache?.()
         }
       }
-      toast(`模板已重命名为 ${newName}${refreshed ? '' : '（模板列表刷新失败，请刷新页面）'}`, refreshed ? 'success' : 'warn')
+      const warning = !refreshed ? '（模板列表刷新失败，请刷新页面）'
+        : !referencesRefreshed ? '（编辑器引用刷新失败，未保存修改已保留，请重试）' : ''
+      toast(`模板已重命名为 ${newName}${warning}`, refreshed && referencesRefreshed ? 'success' : 'warn')
     } catch (e) {
       toast('重命名失败：' + e.message, 'error')
     }

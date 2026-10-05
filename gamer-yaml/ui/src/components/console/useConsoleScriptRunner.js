@@ -1275,7 +1275,7 @@ export function useConsoleScriptRunner({
     scriptShell, rawEditor, fnLib, beforePackageChange,
     liveLogs, startPending, runStopping, runArgsFlow, onRunArgsSubmit,
     startLogPolling, stopLogPolling, pushLog,
-    clearCallParamsCache, editorMatchThreshold,
+    clearCallParamsCache, editorMatchThreshold, onTemplateRenamed: scriptShell.onTemplateRenamed,
     startRunStatusPoll, stopRunStatusPoll, restoreRunState, onBeforeUnload,
     refreshScripts,
     // 面板作用域上下文（扩展面板经 workspace context 消费）
