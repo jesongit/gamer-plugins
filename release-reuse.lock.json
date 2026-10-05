@@ -3,30 +3,37 @@
     {
       "id": "gamer-keymap",
       "version": "0.1.4",
-      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.2/gamer-keymap-0.1.4.gplugin",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.3/gamer-keymap-0.1.4.gplugin",
       "size": 131897,
       "sha256": "57b9b06ffe74ac259ae8ad295d48f7125a9459a626a2ee5161afdbef29e0788a"
     },
     {
       "id": "gamer-live",
       "version": "0.2.5",
-      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.2/gamer-live-0.2.5.gplugin",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.3/gamer-live-0.2.5.gplugin",
       "size": 22325,
       "sha256": "ea9f03d91026b2152c9d096e0baae63dac7c5db5ce96136481a48e43febbcf6f"
     },
     {
+      "id": "gamer-notify",
+      "version": "0.1.0",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.3/gamer-notify-0.1.0.gplugin",
+      "size": 5994,
+      "sha256": "e5006ef20a8110498b531e6c3ed0cc1b1d5e28aeb2603f4ad434c8ffc7ba3794"
+    },
+    {
       "id": "gamer-package-publisher",
       "version": "0.1.0",
-      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.2/gamer-package-publisher-0.1.0.gplugin",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.3/gamer-package-publisher-0.1.0.gplugin",
       "size": 5120,
       "sha256": "de16d36c1b99c1253992b6d4412b70ce19a9f9dec0d878dc75020c850eb613a9"
     },
     {
-      "id": "gamer-video",
-      "version": "0.1.2",
-      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.2/gamer-video-0.1.2.gplugin",
-      "size": 65527,
-      "sha256": "d6900e731affe8ba2c572238d027be17a46b8f2d2bfda6dd4bee1f4c750e0058"
+      "id": "gamer-yaml",
+      "version": "0.1.3",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v0.1.3/gamer-yaml-0.1.3.gplugin",
+      "size": 456945,
+      "sha256": "09c51dc32d13d74d7aa0e7d37a6d72e830ce3574fc9c30aec1db5bc370e7bc05"
     }
   ]
 }
