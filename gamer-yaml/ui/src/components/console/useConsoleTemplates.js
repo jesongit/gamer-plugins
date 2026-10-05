@@ -908,20 +908,26 @@ export function useConsoleTemplates({
   /** 确认重命名：名称去空格、自动补 .png 后缀、重名校验，成功后刷新列表 */
   async function confirmRename(t) {
     const toast = beginReport()
+    const requestedPackage = packageId.value
     const raw = renameVal.value.trim()
     if (!raw) return toast('名称不能为空', 'warn')
     const newName = /\.(png|jpe?g)$/i.test(raw) ? raw : raw + '.png'
     renaming.value = null
     if (newName === t.name) return
-    if (templatesData.value.some(x => x.pkg === packageId.value && x.name === newName)) return toast(`已存在同名模板：${newName}`, 'warn')
+    if (templatesData.value.some(x => x.pkg === requestedPackage && x.name === newName)) return toast(`已存在同名模板：${newName}`, 'warn')
     try {
-      await api.renameTemplate(t.name, newName, packageId.value)
-      // 后端会同步改写当前分区 scripts/functions 中的模板引用；刷新脚本与函数缓存，
-      // 让当前摘要、调用参数和后续编辑都立即看到新名称。
-      await refreshScripts?.()
-      await refreshFnLib?.(packageId.value)
-      clearCallParamsCache()
-      toast(`模板已重命名为 ${newName}`, 'success')
+      await api.renameTemplate(t.name, newName, requestedPackage)
+      let refreshed = true
+      if (packageId.value === requestedPackage) {
+        refreshed = await refreshTemplatesData()
+        if (packageId.value === requestedPackage) {
+          if (viewTpl.value === t.name) viewTpl.value = newName
+          // 后端同步改写脚本/函数引用；刷新缓存，让摘要和后续编辑立即看到新名称。
+          await Promise.all([refreshScripts?.(), refreshFnLib?.(requestedPackage)])
+          if (packageId.value === requestedPackage) clearCallParamsCache?.()
+        }
+      }
+      toast(`模板已重命名为 ${newName}${refreshed ? '' : '（模板列表刷新失败，请刷新页面）'}`, refreshed ? 'success' : 'warn')
     } catch (e) {
       toast('重命名失败：' + e.message, 'error')
     }
