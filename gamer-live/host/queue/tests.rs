@@ -236,7 +236,9 @@ async fn audience_is_read_only_revocable_and_whitelists_fields() {
         .unwrap();
     let (base, token) = window.url.split_once('#').unwrap();
     let url = format!("{base}state");
-    let client = reqwest::Client::new();
+    // This fixture is a loopback server; a system proxy must not turn its
+    // expected connection close after revocation into a proxy HTTP response.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     assert_eq!(client.get(&url).send().await.unwrap().status(), 403);
     assert_eq!(
         client

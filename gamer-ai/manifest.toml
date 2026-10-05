@@ -1,0 +1,33 @@
+manifest_version = 2
+id = "gamer-ai"
+version = "0.3.9"
+name = "AI 助手"
+description = "Agent 对话、配置包攻略记忆与混合检索，可选联网服务和本机 MCP 游玩接入"
+permissions = ["ui.host", "ai.connect", "resource.read", "device.read", "device.app", "input.tap", "input.swipe", "input.key", "input.text", "touch", "runtime.sleep", "log.write"]
+
+[host_api]
+ui = "^1.0"
+device = "^1.0"
+input = "^1.0"
+touch = "^1.0"
+runtime = "^1.0"
+log = "^1.0"
+resource = "^1.0"
+
+[targets.android]
+packages = ["*"]
+
+[execution]
+kind = "builtin"
+builtin_id = "gamer-ai"
+host_version = ">=0.2.14"
+
+[[ui.contributions]]
+panel_id = "ai"
+title = "AI 助手"
+order = 60
+location = "console.right"
+runtime = "core"
+entry = "ui/plugin.js"
+requires_device = false
+component = "AiWorkspace"

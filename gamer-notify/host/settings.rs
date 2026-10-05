@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +22,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn load(path: &PathBuf) -> Result<Self> {
+    pub fn load(path: &Path) -> Result<Self> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),

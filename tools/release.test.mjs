@@ -63,3 +63,45 @@ test('notify release accepts the complete catalog and emits immutable notificati
   assert.equal(released.plugins[1].download_url, 'https://github.com/jesongit/gamer-plugins/releases/download/gamer-notify-v0.1.0/gamer-notify-0.1.0.gplugin')
   assert.ok(readFileSync(resolve(root, 'sha256sums.txt'), 'utf8').includes(`${yaml.sha256}  gamer-notify-0.1.0.gplugin`))
 })
+
+test('AI release validates all seven official artifacts and emits immutable URLs and checksums', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  const yaml = registry.plugins[0]
+  const bytes = readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin'))
+  for (const id of ['gamer-keymap', 'gamer-video', 'gamer-package-publisher', 'gamer-live', 'gamer-notify', 'gamer-ai']) {
+    registry.plugins.push({ ...yaml, id, version: '0.1.0' })
+    writeFileSync(resolve(root, `plugins/${id}-0.1.0.gplugin`), bytes)
+  }
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  const before = readFileSync(resolve(root, 'registry.json'))
+  assert.notEqual(spawnSync(process.execPath, [script, 'gamer-ai-v0.1.1', root]).status, 0)
+  assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-ai-v0.1.0', root]).status, 0)
+  const released = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  const sums = readFileSync(resolve(root, 'sha256sums.txt'), 'utf8')
+  assert.equal(released.plugins.length, 7)
+  for (const plugin of released.plugins) {
+    const name = `${plugin.id}-${plugin.version}.gplugin`
+    assert.equal(plugin.download_url, `https://github.com/jesongit/gamer-plugins/releases/download/gamer-ai-v0.1.0/${name}`)
+    assert.ok(sums.includes(`${plugin.sha256}  ${name}`))
+    assert.deepEqual(readFileSync(resolve(root, 'plugins', name)), bytes)
+  }
+  const digest = createHash('sha256').update(readFileSync(resolve(root, 'registry.json'))).digest('hex')
+  assert.ok(sums.includes(`${digest}  registry.json`))
+})
+
+test('AI release still rejects unknown plugin artifacts before modifying the catalog', () => {
+  const root = fixture()
+  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+  const yaml = registry.plugins[0]
+  const bytes = readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin'))
+  for (const id of ['gamer-ai', 'gamer-unknown']) {
+    registry.plugins.push({ ...yaml, id, version: '0.1.0' })
+    writeFileSync(resolve(root, `plugins/${id}-0.1.0.gplugin`), bytes)
+  }
+  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+  const before = readFileSync(resolve(root, 'registry.json'))
+  assert.notEqual(spawnSync(process.execPath, [script, 'gamer-ai-v0.1.0', root]).status, 0)
+  assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
+})

@@ -240,6 +240,7 @@ impl NativeYamlHost {
     /// WASM guest 的 `__fn` 后端入口（wasm_host 调用）；无 wasm-runtime
     /// feature 时仅测试使用。
     #[cfg_attr(not(feature = "wasm-runtime"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // Guest dispatch carries runtime context and both event channels.
     pub(crate) async fn call_function_json(
         host: HostApi,
         context: AppContext,
