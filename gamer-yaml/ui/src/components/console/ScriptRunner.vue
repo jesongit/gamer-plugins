@@ -267,8 +267,10 @@ async function ensureSelectedEditor() {
 }
 function retryEditor() { autoOpenRequested = true; loadError.value = ''; return ensureSelectedEditor() }
 async function selectScript(id) {
+  if (!active.value) return
   if (id === ctx.selScript && editing.value) return
   if (!await allowSwitch()) return
+  if (!active.value) return
   if (ctx.shell.hasModel) ctx.shell.reset()
   ctx.selScript = id
   if (id) await loadSelected()
@@ -278,8 +280,10 @@ async function changeFunction(event) {
   event.target.value = functionPickerValue.value
 }
 async function selectFunction(key) {
+  if (!active.value) return
   if (key === selectedFunctionKey.value && editing.value) return
   if (!await allowSwitch()) return
+  if (!active.value) return
   if (ctx.shell.hasModel) ctx.shell.reset()
   selectedFunctionKey.value = key
   if (key) await loadSelected()

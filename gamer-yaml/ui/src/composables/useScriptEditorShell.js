@@ -320,7 +320,7 @@ export function useScriptEditorShell({ api, getContext = null, refreshTemplates 
       savedFunctions = new WeakMap(submittedFunctions)
       savedName.value = rep.name ?? rep.file ?? submittedName
       conflict.value = null
-      return { ok: true, result: rep }
+      return { ok: true, result: rep, submittedYaml: yaml }
     } catch (e) {
       if (e?.savedResource) {
         resourceId.value = e.savedResource.id

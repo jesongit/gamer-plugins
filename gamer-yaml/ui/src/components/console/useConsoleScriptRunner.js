@@ -695,7 +695,7 @@ export function useConsoleScriptRunner({
     }
     const pending = Promise.resolve()
       .then(() => scriptShell.save(opts))
-      .then(result => ({ ...result, _savedSnapshot: savedSnapshot }))
+      .then(result => ({ ...result, _savedSnapshot: result.submittedYaml ?? savedSnapshot }))
     shellSaveInflight = pending
     pending.finally(() => {
       if (shellSaveInflight === pending) shellSaveInflight = null
