@@ -158,6 +158,13 @@ export const videoApi = {
   /** DELETE /api/media/:id → 204；被引用 409 `{"error":"media_referenced"}` 原样上抛。 */
   deleteMedia: async (id) => request('DELETE', `/api/media/${encodeURIComponent(requireId(id, 'media_id'))}`),
 
+  /** PATCH /api/media/:id：修改显示名称，返回更新后的 MediaMetadata。 */
+  renameMedia: async (id, name) => request(
+    'PATCH',
+    `/api/media/${encodeURIComponent(requireId(id, 'media_id'))}`,
+    { name: requireId(name, 'name') },
+  ),
+
   /** 原文件播放流 URL（`<video :src>` 用；支持 Range，不发请求）。 */
   mediaFileUrl: (id) => `/api/media/${encodeURIComponent(requireId(id, 'media_id'))}/file`,
 

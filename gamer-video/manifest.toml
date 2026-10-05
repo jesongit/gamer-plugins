@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-video"
-version = "0.1.2"
+version = "0.1.3"
 name = "视频工作台"
 description = "视频工作台：媒体素材库、设备录制与操作草稿生成"
 permissions = ["ui.host", "media.read", "media.import", "media.record", "media.write", "media.events.read"]
@@ -27,6 +27,7 @@ required = false
 [execution]
 kind = "builtin"
 builtin_id = "gamer-video"
+host_version = ">=0.2.15"
 
 [[ui.contributions]]
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端

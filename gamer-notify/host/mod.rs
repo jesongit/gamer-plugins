@@ -262,13 +262,21 @@ impl NotifyService {
         }
         let mut admitted = false;
         if record.status == "queued" {
-            admitted = self
-                .state
-                .pending
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    (n < 128).then_some(n + 1)
-                })
-                .is_ok();
+            let mut pending = self.state.pending.load(Ordering::Acquire);
+            while pending < 128 {
+                match self.state.pending.compare_exchange_weak(
+                    pending,
+                    pending + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        admitted = true;
+                        break;
+                    }
+                    Err(current) => pending = current,
+                }
+            }
             if !admitted {
                 record.status = "failed".into();
                 record.message = "通知发送队列已满".into();
