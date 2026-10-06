@@ -99,6 +99,7 @@ Execution timing settings (default visual timeout and before/after-click delays)
 are captured from the same production Settings source when the candidate is
 created. They participate in the content fingerprint, replay host and revision
 provenance. A changed global setting invalidates the report; publication checks
-and commits under the setting writer's gate. Synthetic fixtures explicitly save
-0 ms in their isolated production configuration rather than silently bypassing
-production delays in the validator.
+and commits under the setting writer's gate. The final HTTP acceptance run captures
+and asserts the actual production settings: 300 ms before-click delay, 300 ms
+after-click delay, and a 10-second default visual timeout. Its synthetic fixtures
+exercise these settings rather than bypassing production delays in the validator.
