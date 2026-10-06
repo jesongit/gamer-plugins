@@ -10,6 +10,7 @@ import ServiceSettings from './ServiceSettings.vue'
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const packageId = computed(() => workspace?.getSnapshot?.().currentPackageId || '')
 const automationRequest = pluginMessageChannel('gamer-ai:automation-context')
+const settingsRequest = pluginMessageChannel('gamer-ai:open-settings')
 const automation = ref(null), automationError = ref(''), automationScripts = ref([]), attachScript = ref('')
 let attachmentGeneration = 0
 async function refreshAutomations() {
@@ -29,7 +30,15 @@ watch(() => automationRequest.seq, () => {
 }, { immediate: true })
 
 function openSettings(section = 'settings') { gameOptions.value = chat.value?.getGameOptions(); settingsSection.value = section; page.value = 'chat' }
-async function settingsChanged() { await chat.value?.refreshSettings() }
+watch(() => settingsRequest.seq, () => {
+  if (settingsRequest.seq <= (settingsRequest.consumedSeq || 0)) return
+  settingsRequest.consumedSeq = settingsRequest.seq
+  openSettings('settings')
+}, { immediate: true })
+async function settingsChanged() {
+  await chat.value?.refreshSettings()
+  pluginMessageChannel('gamer-ai:settings-changed').seq++
+}
 async function externalSessionStarted(value) {
   if(!value?.conversation_id) return
   page.value='chat'

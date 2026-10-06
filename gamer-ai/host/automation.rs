@@ -127,6 +127,7 @@ impl State {
         Ok(
             json!({"ready":reason.is_none(),"reason":reason,"contract_version":CONTRACT_VERSION,
             "model_version":settings["version"],"model":settings["model"],"protocol":settings["protocol"],
+            "default_limits":super::Limits::default(),
             "data_scope":"仅当前选中素材图片、目标、候选脚本和验证诊断",
             "cost_source":"使用 AI 助手中保存的模型账户；按供应商实际用量计费。输入 Token 为估算，单次实际用量可能超过预估；未知用量会停止自动重试"}),
         )
@@ -436,6 +437,10 @@ mod contract_tests {
         });
         let version = configured(&ai, url).await;
         assert_eq!(ai.state.automation_readiness().unwrap()["ready"], true);
+        assert_eq!(
+            ai.state.automation_readiness().unwrap()["default_limits"],
+            serde_json::to_value(super::super::Limits::default()).unwrap()
+        );
         let response = ai
             .state
             .automation_generate(request(&version, "device-free"))

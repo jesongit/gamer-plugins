@@ -218,6 +218,7 @@ async function probeSaved() {
   const snapshot = await call('settings.get')
   const report = snapshot?.probe || result?.probe || result
   applySettings({ ...snapshot, probe: report })
+  emit('settings-changed')
   feedback.value = report?.ok ? '图片与工具闭环测试通过。' : '连接能力测试未通过，请查看检查结果。'
 }
 async function testConnection() { await operate('测试已保存的连接', probeSaved) }

@@ -12,6 +12,8 @@ import SourceYamlEditor from './SourceYamlEditor.vue'
 import CandidateTemplatePreview from './CandidateTemplatePreview.vue'
 import RunErrorLocation from './RunErrorLocation.vue'
 import { api } from '../../../../../../web/src/api'
+import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
+import { pluginMessageChannel } from '../../../../../../web/src/workspace/plugin-messages'
 const { confirm } = vi.hoisted(() => ({ confirm: Object.assign(vi.fn(async () => true), { cancel: vi.fn() }) }))
 vi.mock('../../../../../../web/src/components/ui/useConfirmDialog', () => ({ useConfirmDialog: () => confirm }))
 vi.mock('../../../../../../web/src/api', () => ({ api: { callExtension: vi.fn(), listExtensions: vi.fn(), listScripts: vi.fn(), listFunctions: vi.fn(), listPluginResources: vi.fn(), getScript: vi.fn(), updateScript: vi.fn(), createScript: vi.fn() } }))
@@ -90,6 +92,41 @@ describe('candidate revisions and validation gate', () => {
     api.listPluginResources.mockResolvedValue({ resources: [] })
     const wrapper = mount(AutomationGenerationPanel, { props: { packageId: 'pkg' } }); await flushPromises()
     try { expect(wrapper.text()).toContain('AI 插件未安装'); expect(wrapper.text()).toContain('手写源码离线验证'); expect(wrapper.findAll('button').find(button => button.text() === '开始生成并验证全部素材').attributes('disabled')).toBeDefined() } finally { wrapper.unmount() }
+  })
+  it('uses the shared AI model, opens its settings and refreshes after configuration changes', async () => {
+    let ready = false
+    api.callExtension.mockImplementation(async (_, action) => action === 'generation.readiness'
+      ? { ready, reason: ready ? null : 'model_not_configured', model: { model: 'shared-vision', default_limits: { max_turns: 40, max_seconds: 600, max_tokens: 100000, max_failures: 3 } } }
+      : { candidates: [], revisions: [], samples: [] })
+    api.listPluginResources.mockResolvedValue({ resources: [] })
+    const openPanel = vi.fn(), request = pluginMessageChannel('gamer-ai:open-settings'), before = request.seq
+    const wrapper = mount(AutomationGenerationPanel, { props: { packageId: 'pkg' }, global: { provide: { [WORKSPACE_CONTEXT_KEY]: { uiBridge: { workspace: { openPanel } } } } } }); await flushPromises()
+    try {
+      expect(wrapper.text()).toContain('AI 助手尚未保存 API 密钥')
+      expect(wrapper.text()).not.toContain('model_not_configured')
+      expect(wrapper.text()).toContain('shared-vision')
+      expect(wrapper.text()).toContain('100000 Token')
+      expect(wrapper.findAll('input[type="number"]')).toHaveLength(0)
+      await wrapper.findAll('button').find(button => button.text() === 'AI 助手模型设置').trigger('click')
+      expect(openPanel).toHaveBeenCalledWith('gamer-ai:ai'); expect(request.seq).toBe(before + 1)
+      ready = true; pluginMessageChannel('gamer-ai:settings-changed').seq++; await flushPromises()
+      expect(wrapper.text()).toContain('图片识别能力测试通过')
+    } finally { wrapper.unmount() }
+  })
+  it('lets the server inherit AI defaults instead of sending an independent generation budget', async () => {
+    api.callExtension.mockImplementation(async (_, action) => action === 'generation.readiness' ? { ready: true }
+      : action === 'sample.list' ? { samples: [{ id: 'demo', name: 'Demo' }] }
+      : { candidates: [], revisions: [] })
+    api.listPluginResources.mockResolvedValue({ resources: [] })
+    const wrapper = mount(AutomationGenerationPanel, { props: { packageId: 'pkg' } }); await flushPromises()
+    try {
+      await wrapper.get('[aria-label="生成目标"]').setValue('Done is visible')
+      await wrapper.get('.samples input[type="checkbox"]').setValue(true)
+      await wrapper.findAll('button').find(button => button.text() === '开始生成并验证全部素材').trigger('click'); await flushPromises()
+      expect(api.callExtension).toHaveBeenCalledWith('gamer-yaml', 'generation.start', {
+        package_id: 'pkg', name: 'automation.yaml', goal: 'Done is visible', samples: [{ sample_id: 'demo', plugin_id: 'gamer-video' }],
+      })
+    } finally { wrapper.unmount() }
   })
   it('produces an honest source diff with changed lines', () => { expect(sourceDiff('a\nb\nc', 'a\nd\nc')).toBe('@@ 第 2 行 @@\n- b\n+ d'); expect(sourceDiff('a', 'a')).toBe('没有源码变化') })
 })

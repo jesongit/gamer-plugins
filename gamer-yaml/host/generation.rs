@@ -49,6 +49,7 @@ pub(crate) const ACTIONS: &[&str] = &[
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Limits {
     pub max_attempts: u32,
+    pub max_failures: u32,
     pub max_seconds: u64,
     pub max_tokens: u64,
 }
@@ -56,6 +57,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_attempts: 3,
+            max_failures: 3,
             max_seconds: 180,
             max_tokens: 40000,
         }
@@ -64,12 +66,35 @@ impl Default for Limits {
 impl Limits {
     fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=10).contains(&self.max_attempts)
-                && (10..=1800).contains(&self.max_seconds)
-                && (2048..=500000).contains(&self.max_tokens),
+            (1..=500).contains(&self.max_attempts)
+                && (1..=20).contains(&self.max_failures)
+                && (10..=7200).contains(&self.max_seconds)
+                && (2048..=2_000_000).contains(&self.max_tokens),
             "invalid generation limits"
         );
         Ok(())
+    }
+
+    fn from_ai_defaults(model: &Value) -> Result<Self> {
+        let defaults = &model["default_limits"];
+        let rounds = defaults["max_turns"]
+            .as_u64()
+            .context("AI round budget missing")?;
+        let failures = defaults["max_failures"]
+            .as_u64()
+            .context("AI failure budget missing")?;
+        let limits = Self {
+            max_attempts: u32::try_from(rounds)?,
+            max_failures: u32::try_from(failures)?,
+            max_seconds: defaults["max_seconds"]
+                .as_u64()
+                .context("AI time budget missing")?,
+            max_tokens: defaults["max_tokens"]
+                .as_u64()
+                .context("AI token budget missing")?,
+        };
+        limits.validate()?;
+        Ok(limits)
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,6 +133,8 @@ pub(crate) struct Candidate {
     pub pending_proposal: Option<Value>,
     pub attempts: u32,
     pub known_tokens: u64,
+    #[serde(default)]
+    pub active_seconds: f64,
     pub unknown_usage: bool,
     pub reason: Option<String>,
     pub explanation: String,
@@ -181,7 +208,7 @@ struct Create {
     #[serde(default)]
     templates: Vec<Crop>,
     #[serde(default)]
-    limits: Limits,
+    limits: Option<Limits>,
     #[serde(default)]
     args: serde_json::Map<String, Value>,
 }
@@ -443,7 +470,9 @@ impl Inner {
             }
             "generation.start" | "generation.create" => {
                 let mut request: Create = serde_json::from_value(v)?;
-                request.limits.validate()?;
+                if let Some(limits) = &request.limits {
+                    limits.validate()?;
+                }
                 ensure!(request.yaml.len() <= 512 * 1024, "yaml exceeds512KiB");
                 ensure!(
                     serde_json::to_vec(&request.args)?.len() <= 64 * 1024,
@@ -478,6 +507,9 @@ impl Inner {
                 let model = if action == "generation.start" {
                     let model = self.ai("automation.readiness", json!({})).await?;
                     ensure!(model["ready"] == true, "AI not ready: {}", model["reason"]);
+                    if request.limits.is_none() {
+                        request.limits = Some(Limits::from_ai_defaults(&model)?);
+                    }
                     Some(required(&model, "model_version")?.to_string())
                 } else {
                     None
@@ -512,6 +544,7 @@ impl Inner {
                     pending_proposal: None,
                     attempts: 0,
                     known_tokens: 0,
+                    active_seconds: 0.0,
                     unknown_usage: false,
                     reason: None,
                     explanation: String::new(),
@@ -519,7 +552,7 @@ impl Inner {
                     model_version: model,
                     created_at: now.clone(),
                     updated_at: now,
-                    limits: request.limits,
+                    limits: request.limits.unwrap_or_default(),
                     args: request.args,
                     execution_settings: super::settings::load(self.packages.data_root())?,
                 };
@@ -837,6 +870,14 @@ impl Inner {
                 s.candidate.known_tokens < s.candidate.limits.max_tokens,
                 "generation_token_budget"
             );
+            ensure!(
+                s.candidate.attempts < s.candidate.limits.max_attempts,
+                "attempt_budget"
+            );
+            ensure!(
+                s.candidate.active_seconds < s.candidate.limits.max_seconds as f64,
+                "generation_time_budget"
+            );
         }
         ensure!(
             s.candidate.state != "saved",
@@ -860,13 +901,17 @@ impl Inner {
         let package = package.to_string();
         let id = id.to_string();
         tokio::spawn(async move {
+            let started = Instant::now();
             let result = this
                 .work(&package, &id, generate, cancel.clone(), request_id)
                 .await;
             {
                 let _guard = this.gate.lock();
-                if let Err(error) = result {
-                    if let Ok(mut s) = this.read(&package, &id) {
+                if let Ok(mut s) = this.read(&package, &id) {
+                    if generate {
+                        s.candidate.active_seconds += started.elapsed().as_secs_f64();
+                    }
+                    if let Err(ref error) = result {
                         if s.candidate.state != "cancelled" {
                             if cancel.load(Ordering::Acquire)
                                 && s.candidate.state == "generating"
@@ -882,8 +927,10 @@ impl Inner {
                             .into();
                             s.candidate.reason = Some(error.to_string());
                             s.candidate.updated_at = chrono::Utc::now().to_rfc3339();
-                            let _ = this.write(&s);
                         }
+                    }
+                    if generate || result.is_err() {
+                        let _ = this.write(&s);
                     }
                 }
                 this.jobs.lock().remove(&id);
@@ -902,8 +949,25 @@ impl Inner {
         let _activity = self.packages.acquire_activity(package)?;
         ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
         let started = Instant::now();
-        let initial = self.read(package, id)?;
+        let mut initial = self.read(package, id)?;
+        if generate && initial.candidate.model_version.is_none() {
+            let model = self.ai("automation.readiness", json!({})).await?;
+            ensure!(model["ready"] == true, "AI not ready: {}", model["reason"]);
+            initial.candidate.limits = Limits::from_ai_defaults(&model)?;
+            initial.candidate.model_version = Some(required(&model, "model_version")?.to_string());
+            let _guard = self.gate.lock();
+            ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
+            self.write(&initial)?;
+        }
         let limits = initial.candidate.limits.clone();
+        let seconds = if generate {
+            limits
+                .max_seconds
+                .saturating_sub(initial.candidate.active_seconds.ceil() as u64)
+        } else {
+            limits.max_seconds
+        };
+        ensure!(seconds > 0, "generation_time_budget");
         if generate {
             let samples = initial
                 .samples
@@ -917,7 +981,7 @@ impl Inner {
                 .collect::<Result<Vec<_>>>()?;
             let ffmpeg_path = self.ffmpeg_path.lock().clone();
             match tokio::time::timeout(
-                Duration::from_secs(limits.max_seconds),
+                Duration::from_secs(seconds),
                 offline_validation::preflight_samples(samples, cancel.clone(), ffmpeg_path),
             )
             .await
@@ -931,10 +995,17 @@ impl Inner {
         }
         let mut previous = None;
         let mut unchanged = 0u32;
-        for attempt in 0..if generate { limits.max_attempts } else { 1 } {
+        let attempts = if generate {
+            limits
+                .max_attempts
+                .saturating_sub(initial.candidate.attempts)
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
             ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
             ensure!(
-                started.elapsed().as_secs() < limits.max_seconds,
+                started.elapsed().as_secs() < seconds,
                 "generation_time_budget"
             );
             let mut s = self.read(package, id)?;
@@ -977,9 +1048,7 @@ impl Inner {
                     &s,
                     &model,
                     &request_id,
-                    limits
-                        .max_seconds
-                        .saturating_sub(started.elapsed().as_secs()),
+                    seconds.saturating_sub(started.elapsed().as_secs()),
                     limits.max_tokens - s.candidate.known_tokens,
                 )?;
                 let response = tokio::select! {result=self.model_turn(request,&request_id,&cancel)=>match result {
@@ -1029,8 +1098,7 @@ impl Inner {
                 unchanged = 0;
             }
             previous = Some(fingerprint);
-            let remaining =
-                Duration::from_secs(limits.max_seconds).saturating_sub(started.elapsed());
+            let remaining = Duration::from_secs(seconds).saturating_sub(started.elapsed());
             let ffmpeg_path = self.ffmpeg_path.lock().clone();
             let report = match tokio::time::timeout(
                 remaining,
@@ -1057,8 +1125,10 @@ impl Inner {
                 s.candidate.reason = Some(
                     if unchanged > 0 {
                         "no_progress"
-                    } else if attempt + 1 >= limits.max_attempts {
+                    } else if attempt + 1 >= attempts {
                         "attempt_budget"
+                    } else if attempt + 1 >= limits.max_failures {
+                        "failure_budget"
                     } else {
                         "validation_failed"
                     }
@@ -1070,7 +1140,7 @@ impl Inner {
                 ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
                 self.write(&s)?;
             }
-            if passed || !generate || unchanged > 0 {
+            if passed || !generate || unchanged > 0 || attempt + 1 >= limits.max_failures {
                 return Ok(());
             }
         }
@@ -1820,6 +1890,21 @@ mod tests {
             anyhow::bail!("no device leases in generation tests")
         }
     }
+    #[test]
+    fn generation_inherits_ai_conversation_defaults_and_failure_bound() {
+        let defaults = serde_json::to_value(crate::extensions::ai::Limits::default()).unwrap();
+        let mut model = json!({"default_limits":defaults});
+        let limits = Limits::from_ai_defaults(&model).unwrap();
+        assert_eq!(limits.max_seconds, 600);
+        assert_eq!(limits.max_tokens, 100_000);
+        assert_eq!(limits.max_attempts, 40);
+        assert_eq!(limits.max_failures, 3);
+        model["default_limits"]["max_turns"] = json!(2);
+        assert_eq!(Limits::from_ai_defaults(&model).unwrap().max_attempts, 2);
+        model["default_limits"]["max_seconds"] = json!(0);
+        assert!(Limits::from_ai_defaults(&model).is_err());
+    }
+
     fn fixture() -> (tempfile::TempDir, GenerationService, Value) {
         let root = tempfile::tempdir().unwrap();
         let config = crate::config::Config {
@@ -1841,6 +1926,52 @@ mod tests {
             json!({"package_id":"default","name":"test.yaml","goal":"done pattern visible","samples":inputs,"yaml":yaml,"templates":crops}),
         )
     }
+    #[tokio::test]
+    async fn exhausted_ai_budget_blocks_more_requests_but_keeps_manual_validation() {
+        let (_root, service, input) = fixture();
+        let created = service
+            .inner
+            .dispatch("generation.create", input)
+            .await
+            .unwrap();
+        let id = created["candidate"]["id"].as_str().unwrap();
+        let mut stored = service.inner.read("default", id).unwrap();
+        stored.candidate.model_version = Some("fixed-model".into());
+        stored.candidate.limits = Limits::from_ai_defaults(&json!({
+            "default_limits":crate::extensions::ai::Limits::default()
+        }))
+        .unwrap();
+        stored.candidate.attempts = 40;
+        service.inner.write(&stored).unwrap();
+        assert!(service
+            .inner
+            .launch("default", id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("attempt_budget"));
+        stored.candidate.attempts = 0;
+        stored.candidate.active_seconds = 600.0;
+        service.inner.write(&stored).unwrap();
+        assert!(service
+            .inner
+            .launch("default", id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("generation_time_budget"));
+        stored.candidate.active_seconds = 0.0;
+        stored.candidate.known_tokens = 100_000;
+        service.inner.write(&stored).unwrap();
+        assert!(service
+            .inner
+            .launch("default", id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("generation_token_budget"));
+        assert!(!service.inner.active(id));
+        service.inner.launch("default", id, false).unwrap();
+        assert_eq!(settled(&service, id).await["candidate"]["state"], "passed");
+    }
+
     async fn settled(service: &GenerationService, id: &str) -> Value {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {

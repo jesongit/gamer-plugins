@@ -44,3 +44,17 @@ it('自动化导航只附加同配置包引用，包切换立即清除', async (
     context.currentPackageId='other';await flushPromises();expect(wrapper.findComponent(Chat).props('automationContext')).toBe(null)
   } finally {wrapper.unmount();Object.assign(request,{packageId:'',automation:null,seq:request.seq+1})}
 })
+
+it('其他插件可直接打开共享模型设置，保存后通知消费者刷新', async () => {
+  const {pluginMessageChannel}=await import('../../../web/src/workspace/plugin-messages')
+  const request=pluginMessageChannel('gamer-ai:open-settings'),changed=pluginMessageChannel('gamer-ai:settings-changed'),before=changed.seq
+  const refresh=vi.fn(),Chat=defineComponent({name:'AgentConversation',setup(_, {expose}){expose({refreshSettings:refresh,getGameOptions:()=>null})},template:'<section />'})
+  const Settings=defineComponent({name:'GameSessionPane',props:['initialSection'],emits:['settings-changed'],template:'<button @click="$emit(\'settings-changed\')">保存共享模型</button>'})
+  const wrapper=mount(AiWorkspace,{global:{stubs:{AgentConversation:Chat,GameSessionPane:Settings,MemoryLibrary:true,ServiceSettings:true}}})
+  try {
+    request.seq++;await flushPromises()
+    expect(wrapper.findComponent(Settings).props('initialSection')).toBe('settings')
+    await wrapper.findAll('button').find(button=>button.text()==='保存共享模型').trigger('click');await flushPromises()
+    expect(refresh).toHaveBeenCalledOnce();expect(changed.seq).toBe(before+1)
+  } finally {wrapper.unmount()}
+})

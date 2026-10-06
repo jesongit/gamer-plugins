@@ -1,5 +1,5 @@
 <script setup>
-import { computed, inject, onBeforeUnmount, reactive, ref, toRef, watch } from 'vue'
+import { computed, inject, onActivated, onBeforeUnmount, reactive, ref, toRef, watch } from 'vue'
 import { pluginMessageChannel } from '../../../../../../web/src/workspace/plugin-messages'
 import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
 import { requestAutomationContext } from './automationAiBridge'
@@ -13,14 +13,23 @@ const props = defineProps({ packageId: { type: String, default: '' } })
 const emit = defineEmits(['editing-state'])
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const reviewRequest = pluginMessageChannel('gamer-yaml:open-generation')
+const aiSettingsChanged = pluginMessageChannel('gamer-ai:settings-changed')
 const call = (action, values) => api.callExtension('gamer-yaml', action, values)
 const state = reactive(useGenerationState(toRef(props, 'packageId'), call)), confirm = useConfirmDialog()
 const name = ref('automation.yaml'), goal = ref(''), samples = ref([]), selectedSamples = ref([]), importError = ref(''), importBusy = ref(false), mode = ref('generate')
 const manualYaml = ref('version: 2\ntargets:\n  done:\n    template: done.png\nrun:\n  - finish: done\n    timeout: 10s\n')
-const limits = reactive({ max_attempts: 3, max_seconds: 180, max_tokens: 40000 })
-const limitsValid = computed(() => Number.isInteger(limits.max_attempts) && limits.max_attempts >= 1 && limits.max_attempts <= 10 && Number.isInteger(limits.max_seconds) && limits.max_seconds >= 10 && limits.max_seconds <= 1800 && Number.isInteger(limits.max_tokens) && limits.max_tokens >= 2048 && limits.max_tokens <= 500000)
+const aiModel = computed(() => state.readiness?.model?.model || '')
+const aiBudget = computed(() => state.readiness?.model?.default_limits)
+const readinessText = computed(() => {
+  if (!state.readiness) return '正在读取 AI 助手的模型与能力状态…'
+  if (state.readiness.ready) return 'AI 已就绪 · 图片识别能力测试通过'
+  return {
+    model_not_configured: 'AI 助手尚未保存 API 密钥，请在 AI 助手中配置模型。',
+    vision_probe_required: '请在 AI 助手中测试已保存的模型，确认图片识别能力。',
+  }[state.readiness.reason] || state.readiness.reason || 'AI 助手暂不可用'
+})
 const chosen = computed(() => samples.value.filter(sample => selectedSamples.value.includes(sampleId(sample))))
-const canStart = computed(() => props.packageId && chosen.value.length && goal.value.trim() && name.value.trim() && limitsValid.value && !state.busy && !state.running && !importBusy.value && (mode.value === 'manual' || state.readiness?.ready === true))
+const canStart = computed(() => props.packageId && chosen.value.length && goal.value.trim() && name.value.trim() && !state.busy && !state.running && !importBusy.value && (mode.value === 'manual' || state.readiness?.ready === true))
 const diff = computed(() => sourceDiff(state.baseline, state.yaml))
 const candidateState = computed(() => ({ draft: '候选草稿', generating: '生成与修正中', validating: '全素材验证中', passed: '全部素材通过', failed: '验证未通过', cancelled: '已取消', saved: '已保存正式版本' }[state.candidate?.state] || ''))
 async function importFiles(event) {
@@ -59,7 +68,11 @@ async function start() {
   const pkg = props.packageId, currentId = state.candidate?.id
   if (state.dirty && !await confirm('当前候选修改尚未保存，放弃并开始新的候选？', { title: '新候选', confirmText: '放弃并继续', danger: true })) return
   if (pkg !== props.packageId || currentId !== state.candidate?.id || !canStart.value) return
-  await state.operation(mode.value === 'manual' ? 'generation.create' : 'generation.start', { name: name.value.trim(), goal: goal.value.trim(), samples: chosen.value.map(sample => sample.reference || sample), limits: { ...limits }, ...(mode.value === 'manual' ? { yaml: manualYaml.value } : {}) }, { useCandidate: false })
+  await state.operation(mode.value === 'manual' ? 'generation.create' : 'generation.start', { name: name.value.trim(), goal: goal.value.trim(), samples: chosen.value.map(sample => sample.reference || sample), ...(mode.value === 'manual' ? { yaml: manualYaml.value } : {}) }, { useCandidate: false })
+}
+async function openAiSettings() {
+  pluginMessageChannel('gamer-ai:open-settings').seq++
+  try { await workspace?.uiBridge.workspace.openPanel('gamer-ai:ai') } catch (e) { state.error = e.message }
 }
 async function selectCandidate(event) {
   const value = event.target.value, pkg = props.packageId
@@ -107,13 +120,15 @@ async function beforeTabChange() { return !state.dirty || await confirm('放弃�
 watch(() => reviewRequest.seq, () => { if (reviewRequest.packageId === props.packageId && reviewRequest.candidateId && !state.dirty) void state.select(reviewRequest.candidateId) }, { immediate: true })
 watch(() => [state.dirty, state.busy], ([dirty, saving]) => emit('editing-state', { dirty, saving }), { immediate: true, flush: 'sync' })
 onBeforeUnmount(() => emit('editing-state', { dirty: false, saving: false }))
+onActivated(() => { void state.refresh() })
+watch(() => aiSettingsChanged.seq, () => { void state.refresh() })
 defineExpose({ beforeTabChange })
 </script>
 <template>
   <section class="generation-panel" aria-label="AI 多素材生成与离线验证">
     <header><strong>多素材生成与验证</strong><button class="btn" :disabled="state.loading" @click="state.refresh">刷新能力与候选</button></header>
     <p class="hint">无需设备。只将本次选择的素材图片、目标和候选脚本发送给已配置的模型；费用与 Token 来自 AI 助手模型配置。正式保存必须由全部选中素材验证通过。</p>
-    <p class="readiness" :class="{ warning: !state.readiness?.ready }" role="status">{{ state.readiness?.ready ? 'AI 已就绪 · 视觉能力探测通过' : state.readiness?.reason || '正在检查 AI 安装、运行、配置与视觉能力…' }}</p>
+    <div class="readiness" :class="{ warning: !state.readiness?.ready }"><p role="status">{{ readinessText }}</p><p v-if="aiModel" class="hint">使用 AI 助手模型：{{ aiModel }}</p><button class="btn" @click="openAiSettings">AI 助手模型设置</button></div>
     <p v-if="state.error || importError" class="error" role="alert">{{ state.error || importError }}</p><p v-if="state.notice" class="success" role="status">{{ state.notice }}</p>
     <details :open="!state.candidate"><summary>选择素材与生成目标</summary>
       <div class="form"><label>方式<select v-model="mode" class="select" :disabled="state.running || state.busy"><option value="generate">AI 生成</option><option value="manual">手写源码离线验证（无需 AI）</option></select></label>
@@ -124,13 +139,13 @@ defineExpose({ beforeTabChange })
       <button class="btn" :disabled="state.busy || state.running" @click="refreshSamples">刷新可用素材</button>
       <ul class="samples"><li v-for="sample in samples" :key="sampleId(sample)"><label><input v-model="selectedSamples" type="checkbox" :value="sampleId(sample)" :disabled="state.running || state.busy" />{{ sample.manifest.name || sampleId(sample) }} · {{ sample.reference ? sample.reference.plugin_id : `${sample.files.length} 个资源` }}</label><p v-for="(warning,index) in sample.manifest.warnings || sample.manifest.quality_warnings || []" :key="index" class="warning">{{ typeof warning === 'string' ? warning : JSON.stringify(warning) }}</p></li></ul>
       <textarea v-if="mode === 'manual'" v-model="manualYaml" class="source" aria-label="手写候选 YAML" rows="10" spellcheck="false" />
-      <fieldset class="limits"><legend>生成与自动修正边界</legend><label>最大尝试<input v-model.number="limits.max_attempts" type="number" min="1" max="10" /></label><label>秒<input v-model.number="limits.max_seconds" type="number" min="10" max="1800" /></label><label>Token<input v-model.number="limits.max_tokens" type="number" min="2048" max="500000" /></label></fieldset>
+      <p v-if="mode === 'generate' && aiBudget" class="hint">沿用 AI 助手对话默认预算：{{ aiBudget.max_turns }} 轮、{{ aiBudget.max_seconds }} 秒、{{ aiBudget.max_tokens }} Token、连续失败 {{ aiBudget.max_failures }} 次。生成用量单独统计。</p>
       <button class="btn btn-primary" :disabled="!canStart" @click="start">{{ mode === 'manual' ? '建立候选用于验证' : '开始生成并验证全部素材' }}</button>
       </div>
     </details>
     <label class="candidate-picker">候选记录<select :value="state.candidate?.id || ''" class="select" :disabled="state.busy || state.running" @change="selectCandidate"><option value="">选择候选…</option><option v-for="item in state.candidates" :key="item.id" :value="item.id">{{ item.name }} · {{ item.state }} · {{ item.id }}</option></select></label>
     <section v-if="state.candidate" class="candidate" aria-label="候选详情">
-      <header><strong>{{ candidateState }}</strong><span>尝试 {{ state.candidate.attempts }} / {{ state.candidate.limits?.max_attempts || limits.max_attempts }} · {{ state.candidate.known_tokens }} / {{ state.candidate.limits?.max_tokens || limits.max_tokens }} Token · 最多 {{ state.candidate.limits?.max_seconds || limits.max_seconds }}s</span></header>
+      <header><strong>{{ candidateState }}</strong><span>尝试 {{ state.candidate.attempts }} / {{ state.candidate.limits?.max_attempts ?? '未知' }} · {{ state.candidate.known_tokens }} / {{ state.candidate.limits?.max_tokens ?? '未知' }} Token · 最多 {{ state.candidate.limits?.max_seconds ?? '未知' }}s</span></header>
       <p v-if="state.candidate.explanation" class="hint">{{ state.candidate.explanation }}</p><p v-if="state.candidate.unknown_usage" class="warning">部分模型 Token 用量未知，预算不能视为精确计费</p>
       <p v-if="state.candidate.reason" class="warning">{{ state.candidate.reason }}</p><p class="hint">{{ state.candidate.name }} · r{{ state.candidate.revision }} · 固定素材：{{ state.candidate.sample_ids.join(', ') }}</p>
       <section v-if="state.candidate.pending_proposal" class="proposal" aria-label="待审核 AI 修改建议"><strong>待审核建议（尚未修改当前源码）</strong><p>{{ state.candidate.pending_proposal.proposal.explanation }}</p><pre>{{ sourceDiff(state.candidate.yaml, state.candidate.pending_proposal.proposal.yaml) }}</pre><details><summary>提议的完整 YAML 与模板</summary><pre>{{ state.candidate.pending_proposal.proposal.yaml }}</pre><ul><li v-for="template in state.candidate.pending_proposal.proposal.templates || []" :key="template.name">{{ template.name }} · {{ template.sample_id }} / {{ template.frame_id }} · {{ template.rect?.join(', ') }}<CandidateTemplatePreview :package-id="packageId" :candidate-id="state.candidate.id" :revision="state.candidate.revision" :proposal-id="state.candidate.pending_proposal.id" :name="template.name" /></li></ul></details><button class="btn" :disabled="state.busy || state.running || state.dirty || state.candidate.pending_proposal.base_revision !== state.candidate.revision" @click="applyProposal">审核并应用到候选</button><p v-if="state.candidate.pending_proposal.base_revision !== state.candidate.revision" class="warning">建议所依据的候选版本已变化，请重新分析</p></section>
