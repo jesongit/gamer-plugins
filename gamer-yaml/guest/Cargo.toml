@@ -1,5 +1,5 @@
 # gamer-yaml 官方产品 guest（ADR-12/13 扩展生态）：WASM Component 解释执行
-# YAML V1 程序。由两端消费：
+# YAML V2 降线程序。由两端消费：
 #   - tools/build-plugins.ps1 打包免签名 gamer-yaml-<ver>.gplugin（官方市场）
 #   - yaml_extension.rs 测试链路现场构建（server/target/yaml-guest）
 # 本 crate 独立于 server workspace，不随 server 编译；wit 路径相对本目录

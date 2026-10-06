@@ -1,8 +1,8 @@
-//! YAML V1 纯数据前端（计划 Phase 1/2：解析 → 校验 → 解释器 wire）。
+//! YAML V2 视觉语法前端：解析 → 校验 → 统一解释器 wire。
 //!
 //! 本模块故意不依赖任何设备实现或存储视图。职责：
 //!
-//! - `parse_script` / `parse_function_library`：V1 surface 解析与结构校验
+//! - `parse_script` / `parse_function_library`：显式 version: 2 的源文档解析与校验
 //!   （顶层 `name/params/vars/run`；步骤 = 函数调用 / `if` / `repeat` /
 //!   `return`；表达式 = 字面量 / `$name.field`）；
 //! - `build_program`：surface → [`yaml_interp`] wire 程序（步路径 + 中文
@@ -15,6 +15,7 @@
 
 mod break_control;
 mod match_templates;
+mod visual;
 use match_templates::TemplateCase;
 
 use std::collections::BTreeSet;
@@ -24,8 +25,8 @@ use serde::Serialize;
 use serde_json::{json, Map as JsonMap, Value};
 use serde_yaml::{Mapping, Value as YamlValue};
 
-/// 当前唯一支持的语法版本标识（文档/草稿来源标注用；V1 源内没有 version 字段）。
-pub const SYNTAX_V1: u64 = 1;
+/// 当前唯一支持的源文档版本，必须显式声明 `version: 2`。
+pub const SYNTAX_V1: u64 = 2;
 
 /// 用户可见的解析/校验诊断。路径用稳定点号形态（`run[0].then[1]`），前端
 /// raw/visual 编辑器展示同一诊断。
@@ -303,6 +304,8 @@ impl SurfaceStep {
 /// 脚本文档（`automations/`）。
 #[derive(Clone, Debug)]
 pub struct Script {
+    pub(crate) original: Option<YamlValue>,
+    pub(crate) source_map: std::collections::BTreeMap<String, visual::SourceLocation>,
     pub name: Option<String>,
     pub params: Vec<ParamDecl>,
     /// vars：字面量表（不做引用解析）。
@@ -313,6 +316,9 @@ pub struct Script {
 /// 函数定义（`automations/_function*.yaml` 函数库内单个函数，简化计划 Phase 1）。
 #[derive(Clone, Debug)]
 pub struct FunctionDef {
+    pub(crate) targets: Mapping,
+    pub(crate) original: Option<YamlValue>,
+    pub(crate) source_map: std::collections::BTreeMap<String, visual::SourceLocation>,
     pub description: Option<String>,
     pub params: Vec<ParamDecl>,
     pub vars: Vec<(String, Value)>,
@@ -348,6 +354,9 @@ impl FunctionDef {
 pub type FunctionLibrary = Vec<(String, FunctionDef)>;
 
 impl Script {
+    pub(crate) fn remap_diagnostics(&self, diagnostics: &mut [Diagnostic]) {
+        visual::remap_diagnostics(diagnostics, &self.source_map);
+    }
     /// 收集脚本调用的全部函数名。
     pub fn called_functions(&self) -> BTreeSet<String> {
         let mut calls = BTreeSet::new();
@@ -370,6 +379,9 @@ impl Script {
 }
 
 impl FunctionDef {
+    pub(crate) fn remap_diagnostics(&self, diagnostics: &mut [Diagnostic]) {
+        visual::remap_diagnostics(diagnostics, &self.source_map);
+    }
     pub fn called_functions(&self) -> BTreeSet<String> {
         let mut calls = BTreeSet::new();
         let mut refs = BTreeSet::new();
@@ -390,6 +402,83 @@ fn yaml_to_diagnostic(error: serde_yaml::Error) -> Vec<Diagnostic> {
         "",
         format!("YAML 解析失败: {error}"),
     )]
+}
+
+/// Validate all literal native arguments before branch selection, using the
+/// authoritative registry. Optional absence must not hide malformed child calls.
+fn validate_native_literals(
+    name: &str,
+    args: &SurfaceExpr,
+    path: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    let Some(function) = super::native_funcs::native_function(name) else {
+        return Ok(());
+    };
+    fn literal(expr: &SurfaceExpr) -> Option<Value> {
+        Some(match expr {
+            SurfaceExpr::Lit(v) => v.clone(),
+            SurfaceExpr::Ref(_) => return None,
+            SurfaceExpr::List(v) => {
+                Value::Array(v.iter().map(literal).collect::<Option<Vec<_>>>()?)
+            }
+            SurfaceExpr::Map(v) => Value::Object(
+                v.iter()
+                    .map(|(k, v)| Some((k.clone(), literal(v)?)))
+                    .collect::<Option<JsonMap<_, _>>>()?,
+            ),
+        })
+    }
+    if let SurfaceExpr::Map(entries) = args {
+        for (key, _) in entries {
+            if !function.params.iter().any(|p| p.name == key) {
+                return Err(one_diagnostic(
+                    "yaml.args.unknown",
+                    path,
+                    format!("函数 {name} 没有参数 {key}"),
+                ));
+            }
+        }
+    }
+    for (index, param) in function.params.iter().enumerate() {
+        let value = match args {
+            SurfaceExpr::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| k == param.name)
+                .map(|(_, v)| v),
+            _ if index == 0 => Some(args),
+            _ => None,
+        };
+        if value.is_none() && param.required && param.default.is_none() {
+            return Err(one_diagnostic(
+                "yaml.args.required",
+                path,
+                format!("函数 {name} 缺少参数 {}", param.name),
+            ));
+        }
+        if let Some(value) = value.and_then(literal) {
+            check_type(param.ty, &value).map_err(|message| {
+                one_diagnostic(
+                    "yaml.args.type",
+                    path,
+                    format!("{} 应为 {}，{message}", param.name, param.ty.canonical()),
+                )
+            })?;
+            if let Some(ty) = param.item_type {
+                if let Some(items) = value.as_array() {
+                    for item in items {
+                        check_type(ty, item).map_err(|message| {
+                            one_diagnostic(
+                                "yaml.args.type",
+                                path,
+                                format!("{} 列表项应为 {}，{message}", param.name, ty.canonical()),
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 参数名、变量名：小写字母/下划线开头，仅小写字母、数字、下划线。
@@ -418,7 +507,7 @@ pub fn is_function_name(name: &str) -> bool {
 const RESERVED_WORDS: &[&str] = &["if", "repeat", "return", "match_templates", "break"];
 
 pub fn is_reserved(name: &str) -> bool {
-    RESERVED_WORDS.contains(&name)
+    RESERVED_WORDS.contains(&name) || matches!(name, "wait" | "optional")
 }
 
 fn valid_ref_path(path: &str) -> bool {
@@ -448,7 +537,7 @@ fn expr_from_yaml(value: &YamlValue, path: &str) -> Result<SurfaceExpr, Vec<Diag
                 return Err(one_diagnostic(
                     "yaml.expr.invalid",
                     path,
-                    format!("非法变量引用 {text:?}——V1 只支持 $name 与 $name.field（$name 段为小写标识符）；字面量 $ 用 $$ 转义"),
+                    format!("非法变量引用 {text:?}——表达式只支持 $name 与 $name.field（$name 段为小写标识符）；字面量 $ 用 $$ 转义"),
                 ));
             }
             Ok(SurfaceExpr::Ref(rest.to_string()))
@@ -779,6 +868,7 @@ fn parse_step(step: &YamlValue, path: &str) -> Result<SurfaceStep, Vec<Diagnosti
                     }
                 }
             }
+            validate_native_literals(&name, &args, path)?;
             Ok(SurfaceStep::Call {
                 name,
                 args,
@@ -958,7 +1048,7 @@ fn parse_vars(value: &YamlValue, path: &str) -> Result<Vec<(String, Value)>, Vec
 }
 
 /// 脚本解析：顶层 `name?` / `params?` / `vars?` / `run`。
-pub fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
+fn parse_lowered_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
     let doc: YamlValue = serde_yaml::from_str(source).map_err(yaml_to_diagnostic)?;
     let YamlValue::Mapping(mapping) = &doc else {
         return Err(one_diagnostic(
@@ -1020,6 +1110,8 @@ pub fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
     let run = run.unwrap_or_default();
     break_control::validate(&run, "run", false)?;
     Ok(Script {
+        original: None,
+        source_map: Default::default(),
         name,
         params,
         vars,
@@ -1029,7 +1121,7 @@ pub fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
 
 /// 函数库文件解析：顶层 `functions: {<名>: {description?, params?, vars?,
 /// returns?, run}}`。
-pub fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
+fn parse_lowered_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
     let doc: YamlValue = serde_yaml::from_str(source).map_err(yaml_to_diagnostic)?;
     let YamlValue::Mapping(mapping) = &doc else {
         return Err(one_diagnostic(
@@ -1159,6 +1251,9 @@ pub fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagn
         out.push((
             name.to_string(),
             FunctionDef {
+                targets: Mapping::new(),
+                original: None,
+                source_map: Default::default(),
                 description,
                 params,
                 vars,
@@ -1168,6 +1263,13 @@ pub fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagn
         ));
     }
     Ok(out)
+}
+
+pub fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
+    visual::parse_script(source)
+}
+pub fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
+    visual::parse_library(source)
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,14 +1532,45 @@ pub fn build_program(
                 json!({
                     "params": param_decls_wire(&def.call_params(name)),
                     "vars": vars_wire(&def.vars),
-                    "run": wire_steps(&def.run, &format!("{name}.run"), functions),
+                    "run": visual::function_wire_steps(name, def, functions),
                 }),
             )
         })
         .collect();
+    let start_index = if let Some(source) = &script.original {
+        let count = source
+            .get("run")
+            .and_then(YamlValue::as_sequence)
+            .map_or(0, Vec::len);
+        if start_index == count {
+            script.run.len()
+        } else if start_index > count {
+            script.run.len() + 1
+        } else {
+            script
+                .source_map
+                .iter()
+                .filter_map(|(wire, location)| {
+                    if location.path != format!("run[{start_index}]") {
+                        return None;
+                    }
+                    wire.strip_prefix("run[")?
+                        .strip_suffix(']')?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .min()
+                .unwrap_or(start_index)
+        }
+    } else {
+        start_index
+    };
+    let mut run = Value::Array(wire_steps(&script.run, "run", functions));
+    visual::apply_source_map(&mut run, &script.source_map);
     json!({
+        "require_goal": script.original.is_some(),
         "vars": Value::Object(initial_vars),
-        "run": wire_steps(&script.run, "run", functions),
+        "run": run,
         "functions": Value::Object(functions_wire),
         "start_index": start_index,
     })
@@ -1470,12 +1603,12 @@ pub fn build_function_program(
         json!({
             "params": param_decls_wire(&def.call_params(name)),
             "vars": vars_wire(&def.vars),
-            "run": wire_steps(&def.run, &format!("{name}.run"), functions),
+            "run": visual::function_wire_steps(name, def, functions),
         }),
     );
     json!({
         "vars": Value::Object(initial_vars),
-        "run": wire_steps(&def.run, &format!("{name}.run"), functions),
+        "run": visual::function_wire_steps(name, def, functions),
         "functions": Value::Object(functions_wire),
         "start_index": start_index,
     })
@@ -1596,6 +1729,9 @@ pub fn rename_template_source(
     new_name: &str,
     new_short: &str,
 ) -> Result<Option<(String, bool)>, Vec<Diagnostic>> {
+    if let Some(result) = visual::rename_source(source, old_name, old_short, new_short)? {
+        return Ok(Some((result, true)));
+    }
     let mut script = parse_script(source)?;
     let mut changed = false;
     for step in &mut script.run {
@@ -1615,6 +1751,9 @@ pub fn rename_template_in_function_library(
     new_name: &str,
     new_short: &str,
 ) -> Result<Option<(String, bool)>, Vec<Diagnostic>> {
+    if let Some(result) = visual::rename_source(source, old_name, old_short, new_short)? {
+        return Ok(Some((result, true)));
+    }
     let mut library = parse_function_library(source)?;
     let mut changed = false;
     for (_, def) in &mut library {
@@ -1849,7 +1988,10 @@ fn vars_yaml_lines(vars: &[(String, Value)], indent: usize, out: &mut Vec<String
 
 /// 脚本 → 确定性 YAML 文本（保存/改写落盘统一形态）。
 pub fn serialize_script(script: &Script) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    if let Some(source) = &script.original {
+        return serde_yaml::to_string(source).expect("valid YAML source");
+    }
+    let mut lines: Vec<String> = vec!["version: 2".into()];
     if let Some(name) = &script.name {
         lines.push(format!("name: {}", yaml_quote(name)));
     }
@@ -1870,8 +2012,32 @@ pub fn serialize_script(script: &Script) -> String {
 /// 函数库文件 → 确定性 YAML 文本。
 pub fn serialize_function_library(library: &FunctionLibrary) -> String {
     let mut lines: Vec<String> = Vec::new();
+    lines.push("version: 2".into());
+    let mut targets = Mapping::new();
+    for (_, def) in library {
+        targets.extend(def.targets.clone());
+    }
+    if !targets.is_empty() {
+        lines.push("targets:".into());
+        lines.extend(
+            serde_yaml::to_string(&targets)
+                .unwrap()
+                .lines()
+                .map(|line| format!("  {line}")),
+        );
+    }
     lines.push("functions:".into());
     for (name, def) in library {
+        if let Some(original) = &def.original {
+            lines.push(format!("  {name}:"));
+            lines.extend(
+                serde_yaml::to_string(original)
+                    .unwrap()
+                    .lines()
+                    .map(|line| format!("    {line}")),
+            );
+            continue;
+        }
         lines.push(format!("  {name}:"));
         if let Some(description) = &def.description {
             lines.push(format!("    description: {}", yaml_quote(description)));
@@ -1905,6 +2071,41 @@ pub fn serialize_function_library(library: &FunctionLibrary) -> String {
 mod tests {
     use super::*;
 
+    // These unit fixtures exercise the unchanged expression/control-flow IR;
+    // upgrade their source version explicitly, while public version rejection
+    // is covered by visual::tests. Completion goals are tested end-to-end.
+    fn source_v2(source: &str) -> String {
+        if source.trim_start().starts_with("version:") {
+            source.into()
+        } else {
+            format!("version: 2\n{source}")
+        }
+    }
+    fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
+        super::parse_script(&source_v2(source))
+    }
+    fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
+        super::parse_function_library(&source_v2(source))
+    }
+    fn rename_template_source(
+        source: &str,
+        a: &str,
+        b: &str,
+        c: &str,
+        d: &str,
+    ) -> Result<Option<(String, bool)>, Vec<Diagnostic>> {
+        super::rename_template_source(&source_v2(source), a, b, c, d)
+    }
+    fn rename_template_in_function_library(
+        source: &str,
+        a: &str,
+        b: &str,
+        c: &str,
+        d: &str,
+    ) -> Result<Option<(String, bool)>, Vec<Diagnostic>> {
+        super::rename_template_in_function_library(&source_v2(source), a, b, c, d)
+    }
+
     #[test]
     fn obstacle_template_rename_updates_literals_but_preserves_references() {
         let source = "run:\n  - wait_find:\n      template: target.png\n      obstacles: [old.png, other.png, $closing]\n";
@@ -1934,7 +2135,9 @@ mod tests {
         let script = parse_script(source).map_err(|diagnostics| diagnostics[0].to_string())?;
         let library = parse_function_library("functions: {}\n").unwrap();
         let initial: serde_json::Map<String, Value> = script.vars.iter().cloned().collect();
-        let wire = build_program(&script, &library, initial, 0);
+        let mut wire = build_program(&script, &library, initial, 0);
+        wire["require_goal"] = json!(false); // isolated IR fixture, not a completed task
+
         let program: yaml_interp::Program =
             serde_json::from_value(wire).map_err(|error| error.to_string())?;
         yaml_interp::run(&program, &NullHost, None)
@@ -1962,7 +2165,8 @@ mod tests {
             wire["run"][3]["args"]["value"]["value"]["value"],
             "简写实参"
         );
-        let program: yaml_interp::Program = serde_json::from_value(wire).unwrap();
+        let mut program: yaml_interp::Program = serde_json::from_value(wire).unwrap();
+        program.require_goal = false; // unit fixture exercises function return, not task completion
         assert_eq!(
             yaml_interp::run(&program, &NullHost, None).unwrap(),
             json!(["每日领奖", "领取奖励"])
@@ -2022,10 +2226,10 @@ run:
     #[test]
     fn version_field_is_rejected_with_migration_hint() {
         let diagnostics = parse_script("version: 3\nrun: []\n").unwrap_err();
-        assert_eq!(diagnostics[0].code, "yaml.version.removed");
+        assert_eq!(diagnostics[0].code, "yaml.version.unsupported");
         let legacy = parse_script("version: 3\nparams: []\ndefaults: {}\nsteps:\n  - log: hi\n")
             .unwrap_err();
-        assert_eq!(legacy[0].code, "yaml.version.removed");
+        assert_eq!(legacy[0].code, "yaml.version.unsupported");
     }
 
     #[test]

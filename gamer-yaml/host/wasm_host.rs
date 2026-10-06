@@ -27,7 +27,7 @@ use crate::core::events::{RuntimeEvent, RuntimeEventKind};
 use crate::extensions::host_api::HostApi;
 use crate::extensions::wit;
 
-/// Request/response Component runtime for YAML V1. Unlike the generic
+/// Request/response Component runtime for YAML V2. Unlike the generic
 /// lifecycle runtime this invokes a supplied lowered program and does not
 /// compile the interpreter source into the host process.
 ///
@@ -157,6 +157,9 @@ impl crate::core::events::EventSink for TracedSink {
 }
 
 struct YamlHostState {
+    contract_ready: bool,
+    contract_deadline: Option<Instant>,
+    run_state: Arc<super::yaml_extension::YamlRunState>,
     notification: Option<super::notification::Sender>,
     current_trace: Option<serde_json::Value>,
     settings: super::settings::Settings,
@@ -174,6 +177,9 @@ impl YamlHostState {
         sink: Option<Arc<dyn crate::core::events::EventSink>>,
     ) -> Self {
         Self {
+            contract_ready: false,
+            contract_deadline: None,
+            run_state: Arc::new(super::yaml_extension::YamlRunState::new()),
             notification: None,
             current_trace: None,
             host,
@@ -200,9 +206,14 @@ impl YamlHostState {
                     .or_else(|| value.get("data").and_then(|d| d.get("path")))
                 {
                     trace["path"] = path.clone();
+                    if let Some(id) = value.get("source_id") {
+                        trace["source_id"] = id.clone();
+                    }
                 }
             }
         }
+        *self.run_state.trace_context.write().unwrap() =
+            self.current_trace.clone().unwrap_or(serde_json::json!({}));
         let sink = self.sink.clone();
         let context = self.app_context.clone();
         let args_json = args_json.to_string();
@@ -250,6 +261,17 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
         capability: String,
         args_json: String,
     ) -> Result<String, wit::yaml::gamer::host::types::HostError> {
+        // Before semantic-contract attestation, an old/unknown guest is never
+        // allowed to resolve a target, emit a misleading run, or invoke input.
+        if !self.contract_ready {
+            if capability == EVENT_CAPABILITY {
+                return Ok("{}".into());
+            }
+            return Err(yaml_error(
+                wit::yaml::gamer::host::types::HostErrorKind::Denied,
+                "YAML_GUEST_UPGRADE_REQUIRED: runtime contract handshake not complete",
+            ));
+        }
         // 私有事件通道：不进 CapabilityRegistry、不做权限校验
         if capability == EVENT_CAPABILITY {
             return self.emit_run_event(&args_json);
@@ -267,6 +289,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
             });
             let settings = self.settings.clone();
             let notification = self.notification.clone();
+            let run_state = self.run_state.clone();
             let result = block_on_yaml(async move {
                 let context =
                     context.ok_or_else(|| anyhow::anyhow!("capability.invoke 需要 AppContext"))?;
@@ -294,6 +317,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     (&name, &serde_json::to_string(&args)?),
                     settings,
                     notification,
+                    run_state,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&value)?)
@@ -367,9 +391,20 @@ pub(crate) fn yaml_capability_error_for_test(
     yaml_capability_error(error)
 }
 
+fn validate_contract_response(response: &str) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_str(response)
+        .map_err(|_| anyhow::anyhow!("YAML_GUEST_UPGRADE_REQUIRED: 无效运行契约响应"))?;
+    anyhow::ensure!(
+        value["runtime_contract"].as_str() == Some(yaml_interp::RUNTIME_CONTRACT),
+        "YAML_GUEST_UPGRADE_REQUIRED: 当前自动化执行组件不支持视觉V2语义，请升级插件后再运行"
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
     async fn run(&self, request: YamlWasmRunRequest) -> Result<YamlWasmRunResult, anyhow::Error> {
+        let require_goal = request.program["require_goal"].as_bool().unwrap_or(false);
         let mut digest = [0u8; 32];
         digest.copy_from_slice(Sha256::digest(&request.wasm).as_slice());
         let component = {
@@ -401,6 +436,29 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
             request.sink.clone(),
         );
         state.notification = request.notification;
+        *state.run_state.trace_context.write().unwrap() = request
+            .program
+            .get("trace")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        state.run_state.enforce_template_versions.store(
+            request.program.get("_template_versions").is_some(),
+            Ordering::Relaxed,
+        );
+        *state.run_state.template_versions.write().unwrap() = request
+            .program
+            .get("_template_versions")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(frames) = state.host.registry().frame() {
+            if let Some(run_id) = request.program["trace"]["run_id"].as_str() {
+                let _ = frames
+                    .trace_snapshot(run_id.to_string(), request.program.clone())
+                    .await;
+            }
+        }
         state.settings = request
             .program
             .get("_native_settings")
@@ -416,6 +474,15 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(
             |context: StoreContextMut<'_, YamlHostState>| -> wasmtime::Result<UpdateDeadline> {
+                if context
+                    .data()
+                    .contract_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(wasmtime::Error::msg(
+                        "YAML_GUEST_UPGRADE_REQUIRED: runtime contract handshake timed out",
+                    ));
+                }
                 if context.data().cancelled.load(Ordering::Relaxed) {
                     return Err(wasmtime::Error::msg(
                         "CANCELLED: 宿主取消（stop 标志已置位，epoch 中断）",
@@ -424,8 +491,38 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
                 Ok(UpdateDeadline::Continue(1))
             },
         );
-        let instance = wit::yaml::YamlExtensionHost::instantiate(&mut store, &component, &linker)
-            .map_err(|error| anyhow::anyhow!("YAML 组件实例化失败: {error}"))?;
+        store.data_mut().contract_deadline = Some(Instant::now() + Duration::from_secs(5));
+        let instance = {
+            let ticker = self.ticker();
+            ticker.enter();
+            let _guard = TickerGuard(ticker);
+            wit::yaml::YamlExtensionHost::instantiate(&mut store, &component, &linker).map_err(
+                |error| {
+                    anyhow::anyhow!("YAML_GUEST_UPGRADE_REQUIRED: 组件实例化/契约准备失败: {error}")
+                },
+            )?
+        };
+        store.data_mut().contract_deadline = Some(Instant::now() + Duration::from_secs(5));
+        let ticker = self.ticker();
+        ticker.enter();
+        let contract_response = {
+            let _guard = TickerGuard(ticker);
+            instance
+                .gamer_host_automation()
+                .func_run()
+                .call(&mut store, ("{\"_runtime_contract_probe\":true}",))
+        }
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "YAML_GUEST_UPGRADE_REQUIRED: 请升级自动化插件执行组件，运行契约握手失败: {error}"
+            )
+        })?;
+        let (contract_response,) = contract_response;
+        let contract_response = contract_response
+            .map_err(|error| anyhow::anyhow!("YAML_GUEST_UPGRADE_REQUIRED: {error}"))?;
+        validate_contract_response(&contract_response)?;
+        store.data_mut().contract_ready = true;
+        store.data_mut().contract_deadline = None;
         let mut wire_program = request.program;
         if let Some(object) = wire_program.as_object_mut() {
             object.remove("_native_settings");
@@ -442,6 +539,22 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
                 .func_run()
                 .call(&mut store, (&program,))
         };
+        if call_result
+            .as_ref()
+            .map_or(true, |(result,)| result.is_err())
+        {
+            let data = store.data();
+            if let (Some(frames), Some(context)) =
+                (data.host.registry().frame(), data.app_context.as_ref())
+            {
+                let device = crate::capabilities::DeviceHandle::new(
+                    crate::capabilities::DeviceId::new(context.device_id.as_str()),
+                );
+                let _ = frames
+                    .trace_capture(&device, data.run_state.metadata("error_fresh"), true)
+                    .await;
+            }
+        }
         let (result,) = match call_result {
             Ok(result) => result,
             Err(error) => {
@@ -455,6 +568,10 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
             }
         };
         let result = result.map_err(|error| anyhow::anyhow!("YAML guest 返回错误: {error}"))?;
+        anyhow::ensure!(
+            !require_goal || store.data().run_state.goal_verified.load(Ordering::Relaxed),
+            "GOAL_NOT_REACHED: 宿主未确认最后一次输入后的完成画面"
+        );
         let value = serde_json::from_str::<serde_json::Value>(&result)
             .map_err(|error| anyhow::anyhow!("YAML guest 返回值不是 JSON: {error}"))?;
         Ok(YamlWasmRunResult { value })
@@ -462,5 +579,23 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
 
     fn is_available(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn legacy_empty_run_response_cannot_claim_current_contract() {
+        for response in ["null", "true", "{}", "{\"runtime_contract\":\"v1\"}"] {
+            assert!(validate_contract_response(response)
+                .unwrap_err()
+                .to_string()
+                .contains("YAML_GUEST_UPGRADE_REQUIRED"));
+        }
+        assert!(validate_contract_response(
+            &serde_json::json!({"runtime_contract":yaml_interp::RUNTIME_CONTRACT}).to_string()
+        )
+        .is_ok());
     }
 }

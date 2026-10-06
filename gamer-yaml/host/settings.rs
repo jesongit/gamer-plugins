@@ -86,6 +86,21 @@ pub fn dispatch(action: &str, values: &Value, data_dir: &Path) -> anyhow::Result
     Ok(view(request.settings))
 }
 
+/// Publication and default-setting edits share one short synchronous gate.
+/// This never holds a lock across a model/media await.
+pub(crate) fn with_snapshot<T>(
+    data_dir: &Path,
+    expected: &Settings,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = SAVE_LOCK.lock().unwrap();
+    anyhow::ensure!(
+        &load(data_dir)? == expected,
+        "settings_version_conflict: 自动化执行设置已变更，请重新建立候选并验证"
+    );
+    action()
+}
+
 fn view(settings: Settings) -> Value {
     json!({
         "title": "自动化", "values": settings,

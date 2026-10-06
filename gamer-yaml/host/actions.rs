@@ -30,8 +30,8 @@ use crate::resources::{PackageStore, SaveBinaryValidation, SaveValidation};
 /// 模板创建动作（§10.2）：从视频确定帧裁出的 PNG + 相对搜索区域 → 存为
 /// 当前 Package 的 gamer-yaml 模板（灰度归一化经资源字节钩子自动生效）。
 pub(crate) const TEMPLATE_CREATE_FROM_FRAME: &str = "template.create_from_frame";
-/// 草稿保存动作（§10.3）：V1 草稿文本 → 存为当前 Package 的 automations 脚本
-///（保存经 V1 校验钩子，非法源结构化拒绝）。
+/// 草稿保存动作（§10.3）：v2 未验证草稿文本 → 存为当前 Package 的 automations 脚本
+///（保存经 v2 校验钩子，非法源结构化拒绝）。
 pub(crate) const AUTOMATION_SAVE_DRAFT: &str = "automation.save_draft";
 /// 模板离线测试：与 `POST /api/capabilities/vision/test`（media_id+pts_us/frame_index
 /// 离线寻址）同能力 —— **复用 REST 不重复实现**；清单内只登记映射关系。
@@ -77,6 +77,186 @@ pub(crate) struct PublicAction {
 
 /// gamer-yaml 公开动作清单（唯一声明点；顺序即文档顺序）。
 pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
+    PublicAction {
+        name: "generation.template",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "Preview one candidate template cropped from selected evidence",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &["candidate_id", "name", "pending?"],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.apply_proposal",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "User-approved application of a staged AI candidate proposal",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &["candidate_id", "expected_revision", "proposal_id"],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.readiness",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &[],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.create",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.start",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.get",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.list",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.edit",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.validate",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.retry",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.cancel",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.save",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.history",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "generation.rollback",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
+    PublicAction {
+        name: "automation.validate_source",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "AI generation candidate and offline validation management",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &[],
+        mapping: "",
+    },
     PublicAction {
         name: super::settings::GET_SETTINGS,
         version: 1,
@@ -142,7 +322,7 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         name: AUTOMATION_CREATE_DRAFT,
         version: 1,
         surface: ActionSurface::Native,
-        summary: "录制操作事件 → YAML V1 草稿文本（不落盘不执行；不可映射事件进诊断）",
+        summary: "录制操作事件 → YAML v2 草稿文本（不落盘不执行；不可映射事件进诊断）",
         caller: "gamer-video",
         required_permissions: &[],
         caller_permissions: &[Permission::MediaEventsRead],
@@ -154,7 +334,7 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         name: AUTOMATION_SAVE_DRAFT,
         version: 1,
         surface: ActionSurface::Native,
-        summary: "V1 草稿文本保存为当前 Package 的 automations 脚本（保存边界 V1 校验）",
+        summary: "v2 未验证草稿文本保存为当前 Package 的 automations 脚本（保存边界 v2 校验）",
         caller: "gamer-video",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -339,9 +519,11 @@ struct SaveDraftRequest {
     yaml: String,
     #[serde(default)]
     overwrite: bool,
+    #[serde(default)]
+    expected_version: Option<String>,
 }
 
-/// `automation.save_draft`：草稿文本 → `automations/<name>.yaml`（V1 保存钩子
+/// `automation.save_draft`：草稿文本 → `automations/<name>.yaml`（v2 保存钩子
 /// 强制校验；非法结构结构化拒绝）。`overwrite=false` 且目标已存在 → 名字冲突。
 fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
     let request: SaveDraftRequest = serde_json::from_value(values.clone()).map_err(|error| {
@@ -364,7 +546,7 @@ fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
     let rel = validate_relative_name(&with_ext, "name")?;
     let path = format!("automations/{rel}");
     let store = store_for(data_dir)?;
-    // 保存边界 V1 校验（与 REST PUT 同一钩子）；诊断原样回传（结构化数组）。
+    // 保存边界 v2 校验（与 REST PUT 同一钩子）；诊断原样回传（结构化数组）。
     store
         .validate_save(SaveValidation {
             package: &package_id,
@@ -375,7 +557,7 @@ fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
         })
         .map_err(|diagnostics| {
             rejected(format!(
-                "草稿未通过 YAML V1 校验: {}",
+                "草稿未通过 YAML v2 校验: {}",
                 serde_json::to_string(&diagnostics).unwrap_or_default()
             ))
         })?;
@@ -394,8 +576,8 @@ fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
             YAML_EXTENSION_ID,
             &path,
             &request.yaml,
-            None,
-            request.overwrite,
+            request.expected_version.as_deref(),
+            false,
         )
         .map_err(|error| rejected(format!("保存脚本失败: {error:#}")))?;
     Ok(json!({
@@ -404,7 +586,7 @@ fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
         "id": format!("{package_id}/{with_ext}"),
         "path": entry.path,
         "package_id": package_id,
-        "content_version": entry.meta.get("version").cloned().unwrap_or(Value::Null),
+        "content_version": entry.version(),
     }))
 }
 
@@ -693,7 +875,8 @@ mod tests {
         ];
         for name in &native_in_catalog {
             assert!(
-                dispatch_branches.contains(name),
+                (dispatch_branches.contains(name)
+                    || super::super::generation::ACTIONS.contains(name)),
                 "清单声明 Native 但无分发分支: {name}"
             );
         }
@@ -961,11 +1144,11 @@ mod tests {
         );
     }
 
-    /// save_draft：V1 直存、非法结构拒绝、重名需 overwrite、覆盖成功、id 组装。
+    /// save_draft：v2 直存、非法结构拒绝、重名需 overwrite、覆盖成功、id 组装。
     #[test]
-    fn save_draft_validates_v1_and_enforces_name_conflict() {
+    fn save_draft_validates_v2_and_enforces_name_conflict() {
         let (_store, dir) = temp_store("draft-ok");
-        let v1 = "run:\n  - log: 草稿\n";
+        let v1 = "version: 2\nrun:\n  - log: 草稿\n";
         let values = json!({ "package_id": "draft-ok", "name": "daily", "yaml": v1 });
         let result = native_call_action(
             YAML_EXTENSION_ID,
@@ -997,7 +1180,8 @@ mod tests {
         assert!(error.to_string().contains("已存在"), "{error}");
         let mut overwrite = values.clone();
         overwrite["overwrite"] = json!(true);
-        overwrite["yaml"] = json!("run:\n  - log: 第二版\n");
+        overwrite["expected_version"] = json!(crate::core::fs::content_version(v1));
+        overwrite["yaml"] = json!("version: 2\nrun:\n  - log: 第二版\n");
         native_call_action(
             YAML_EXTENSION_ID,
             AUTOMATION_SAVE_DRAFT,
@@ -1022,10 +1206,7 @@ mod tests {
         )
         .unwrap()
         .unwrap_err();
-        assert!(
-            error.to_string().contains("yaml.version.removed"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("yaml.version"), "{error}");
 
         // 非法路径段
         let mut evil = values.clone();

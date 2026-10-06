@@ -1,4 +1,5 @@
 //! AI gameplay and MCP are plugin business; target I/O and ownership remain Core mechanisms.
+pub(crate) mod automation;
 mod conversation;
 pub mod mcp;
 mod memory;
@@ -53,6 +54,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 pub const ID: &str = "gamer-ai";
 pub const ACTIONS: &[&str] = &[
+    "automation.readiness",
+    "automation.generate",
+    "automation.result",
+    "automation.cancel",
     "prompts.get",
     "prompts.save",
     "prompts.reset",
@@ -96,7 +101,8 @@ pub fn accepts(id: &str, action: &str) -> bool {
 }
 pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
     accepts(id, action).then_some(match action {
-        "connection.probe"
+        "automation.generate"
+        | "connection.probe"
         | "settings.save"
         | "services.save"
         | "prompts.save"
@@ -105,6 +111,31 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         "session.start" => &[Permission::DeviceRead, Permission::UiHost],
         _ => &[Permission::UiHost],
     })
+}
+
+/// Optional, narrowly declared YAML caller; configuration and secrets remain AI-owned.
+pub(crate) fn expected_caller(id: &str, action: &str) -> Option<&'static str> {
+    (id == ID
+        && matches!(
+            action,
+            "automation.readiness"
+                | "automation.generate"
+                | "automation.result"
+                | "automation.cancel"
+        ))
+    .then_some("gamer-yaml")
+}
+pub(crate) fn caller_permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
+    expected_caller(id, action).map(|_| {
+        if action == "automation.generate" {
+            &[Permission::AiConnect][..]
+        } else {
+            &[][..]
+        }
+    })
+}
+pub(crate) fn requires_package_context(_id: &str, _action: &str) -> bool {
+    false
 }
 
 #[derive(Clone)]
@@ -158,6 +189,7 @@ impl crate::resources::ResourceHandler for MemoryArchiveHandler {
         Ok(())
     }
 }
+type AutomationJob = (Arc<AtomicBool>, Option<Value>);
 pub(crate) struct State {
     runtime: Runtime,
     settings: settings::Settings,
@@ -168,6 +200,8 @@ pub(crate) struct State {
     memory_checkpoint_gate: AsyncMutex<()>,
     checkpoint_errors: Mutex<std::collections::BTreeSet<String>>,
     external_requests: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    automation: Mutex<Option<Weak<dyn automation::AutomationBridge>>>,
+    automation_jobs: Mutex<BTreeMap<String, AutomationJob>>,
     extensions: Mutex<Weak<ExtensionService>>,
     enabled: AtomicBool,
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
@@ -511,6 +545,8 @@ impl AiService {
                 memory_checkpoint_gate: AsyncMutex::new(()),
                 checkpoint_errors: Mutex::new(Default::default()),
                 external_requests: Mutex::new(BTreeMap::new()),
+                automation: Mutex::new(None),
+                automation_jobs: Mutex::new(BTreeMap::new()),
                 settings: settings::Settings::new(
                     root.join("extension-data/gamer-ai/private/connection.dat"),
                 ),
@@ -530,6 +566,21 @@ impl AiService {
     pub fn attach(&self, extensions: &Arc<ExtensionService>) {
         *self.state.extensions.lock() = Arc::downgrade(extensions);
     }
+    pub(crate) fn attach_automation<T: automation::AutomationBridge + 'static>(
+        &self,
+        bridge: &Arc<T>,
+    ) {
+        let bridge: Arc<dyn automation::AutomationBridge> = bridge.clone();
+        *self.state.automation.lock() = Some(Arc::downgrade(&bridge));
+    }
+    pub(crate) fn automation_canceller(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let state = Arc::downgrade(&self.state);
+        Arc::new(move |id| {
+            if let Some(state) = state.upgrade() {
+                let _ = state.automation_cancel(&json!({"request_id":id}));
+            }
+        })
+    }
     pub fn executor(&self) -> Arc<dyn RunExecutor> {
         Arc::new(AiExecutor(Arc::downgrade(&self.state)))
     }
@@ -538,6 +589,10 @@ impl AiService {
     }
     async fn dispatch(&self, action: &str, values: Value) -> Result<Value> {
         match action {
+            "automation.readiness" => self.state.automation_readiness(),
+            "automation.generate" => self.state.automation_begin(values),
+            "automation.result" => self.state.automation_result(&values),
+            "automation.cancel" => self.state.automation_cancel(&values),
             "services.get" => self.state.settings.services_read(),
             "services.save" => self.state.settings.services_save(values),
             "conversation.create" => {
@@ -1424,6 +1479,9 @@ impl State {
         self.conversations.cancel_all();
         self.background_cancel.lock().store(true, Ordering::Release);
         for cancel in self.external_requests.lock().values() {
+            cancel.store(true, Ordering::Release);
+        }
+        for (cancel, _) in self.automation_jobs.lock().values() {
             cancel.store(true, Ordering::Release);
         }
         let sessions = self.sessions.lock().values().cloned().collect::<Vec<_>>();

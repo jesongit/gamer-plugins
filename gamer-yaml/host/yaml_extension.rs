@@ -13,9 +13,9 @@
 //! 依赖方向：本模块 → Core（capabilities / device / matcher）单向；Core 不得
 //! import 本目录符号（架构守卫测试锁定）。
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -117,7 +117,47 @@ impl YamlWasmRuntime for NoYamlWasmRuntime {
 ///
 /// 权限：每个函数声明所需权限，派发前逐项 `HostApi::authorize`——函数调用
 /// 不能绕过插件权限（计划 Phase 3.2）。
+#[derive(Default)]
+pub(crate) struct YamlRunState {
+    pub(crate) trace_enabled: AtomicBool,
+    pub(crate) goal_verified: AtomicBool,
+    pub(crate) enforce_template_versions: AtomicBool,
+    pub(crate) trace_context: RwLock<Value>,
+    pub(crate) template_versions: RwLock<std::collections::BTreeMap<String, String>>,
+    cleanup_registry: std::sync::Mutex<Option<CapabilityRegistry>>,
+    templates:
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::capabilities::ResourceHandle>>,
+}
+impl Drop for YamlRunState {
+    fn drop(&mut self) {
+        if let Ok(registry) = self.cleanup_registry.get_mut() {
+            if let Some(resources) = registry.as_ref().and_then(|r| r.resource()) {
+                for handle in self.templates.get_mut().values() {
+                    resources.release_frozen(*handle);
+                }
+            }
+        }
+    }
+}
+impl YamlRunState {
+    pub(crate) fn new() -> Self {
+        let state = Self::default();
+        state.trace_enabled.store(true, Ordering::Relaxed);
+        state
+    }
+    pub(crate) fn metadata(&self, kind: &str) -> Value {
+        let mut value = self.trace_context.read().unwrap().clone();
+        if !value.is_object() {
+            value = json!({});
+        }
+        value["kind"] = json!(kind);
+        value["trace_enabled"] = json!(self.trace_enabled.load(Ordering::Relaxed));
+        value
+    }
+}
+
 pub(crate) struct NativeYamlHost {
+    pub(crate) run_state: Arc<YamlRunState>,
     notification: Option<super::notification::Sender>,
     settings: super::settings::Settings,
     host: HostApi,
@@ -128,6 +168,7 @@ pub(crate) struct NativeYamlHost {
     /// 设备坐标系（相对坐标 ⇄ 像素）：capture 后以真实帧分辨率刷新。
     screen: RwLock<FrameSize>,
     frame_stamp: RwLock<Option<crate::capabilities::FrameStamp>>,
+    observed_at_ms: RwLock<Option<u64>>,
     sink: Option<Arc<dyn EventSink>>,
 }
 
@@ -249,11 +290,13 @@ impl NativeYamlHost {
         function: (&str, &str),
         settings: super::settings::Settings,
         notification: Option<super::notification::Sender>,
+        run_state: Arc<YamlRunState>,
     ) -> Result<Value> {
         let (name, args_json) = function;
         let args: Value = serde_json::from_str(args_json)
             .map_err(|error| anyhow!("函数 {name} 参数不是合法 JSON: {error}"))?;
         let mut host = Self::new(host, context, stop, sink).await?;
+        host.run_state = run_state;
         host.settings = settings;
         host.notification = notification;
         // 录制输入来源标注：guest 实例线程内执行点（task-local 不跨线程），
@@ -281,6 +324,7 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Self {
+            run_state: Arc::new(YamlRunState::new()),
             notification: None,
             settings: super::settings::Settings::default(),
             host,
@@ -290,12 +334,23 @@ impl NativeYamlHost {
             runtime: Arc::new(crate::capabilities::adapters::RuntimeAdapter::new(stop)),
             screen: RwLock::new(FrameSize::new(0, 0)),
             frame_stamp: RwLock::new(None),
+            observed_at_ms: RwLock::new(None),
             sink,
         })
     }
 
+    pub(crate) fn with_runtime(mut self, runtime: Arc<dyn RuntimeService>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+    pub(crate) fn with_settings(mut self, settings: super::settings::Settings) -> Self {
+        self.settings = settings;
+        self
+    }
+
     /// 函数派发：查注册表 → 权限 → Schema 绑定 → handler。
     pub(crate) async fn call_function(&self, name: &str, args: Value) -> Result<Value> {
+        let args = super::settings::bind_timeout(name, args, self.settings.default_timeout_secs);
         let Some(func) = native_function(name) else {
             bail!("未知函数: {name}");
         };
@@ -318,6 +373,9 @@ impl NativeYamlHost {
                     if let Some(stamp) = position.get("_frame") {
                         center["_frame"] = stamp.clone();
                     }
+                    if let Some(time) = position.get("_observed_at_ms") {
+                        center["_observed_at_ms"] = time.clone();
+                    }
                     *position = center;
                 }
             }
@@ -328,7 +386,32 @@ impl NativeYamlHost {
             data: json!({"function":name,"args":bound.values}),
         })
         .await;
+        if matches!(
+            name,
+            "tap" | "swipe" | "key" | "input_text" | "launch" | "stop_app" | "tap_template"
+        ) {
+            self.run_state.goal_verified.store(false, Ordering::Relaxed);
+        }
         match name {
+            "observe" | "finish" => self.observe(&bound, name == "finish").await,
+            "trace" => {
+                let enabled = bound.values["enabled"].as_bool().expect("validated bool");
+                self.run_state
+                    .trace_enabled
+                    .store(enabled, Ordering::Relaxed);
+                if let Some(frames) = self.registry.frame() {
+                    let _ = frames
+                        .trace_capture(
+                            &self.device,
+                            self.run_state
+                                .metadata(if enabled { "trace_on" } else { "trace_off" }),
+                            true,
+                        )
+                        .await;
+                }
+                Ok(Value::Null)
+            }
+            "fail" => bail!("GOAL_FAILED: {}", bound.string("message")?),
             "notify" => self.notify(&bound).await,
             "tap" => self.tap(&bound).await,
             "swipe" => self.swipe(&bound).await,
@@ -414,6 +497,16 @@ impl NativeYamlHost {
     async fn tap(&self, args: &BoundArgs) -> Result<Value> {
         self.refresh_input_screen().await?;
         let point = self.touch_point(args.point("position")?)?;
+        *self.observed_at_ms.write().unwrap() = args
+            .values
+            .get("position")
+            .and_then(|p| p.get("_observed_at_ms"))
+            .and_then(Value::as_u64);
+        if let Some(observed) = *self.observed_at_ms.read().unwrap() {
+            if self.runtime.now_ms().saturating_sub(observed) > 5_000 {
+                bail!("STALE_OBSERVATION: 点击目标超过 5 秒，须重新观察");
+            }
+        }
         let stamp = args.values.get("position").and_then(|p| p.get("_frame"));
         if let Some(stamp) = stamp {
             *self.frame_stamp.write().unwrap() = Some(serde_json::from_value(stamp.clone())?);
@@ -423,9 +516,29 @@ impl NativeYamlHost {
     }
 
     /// All automation clicks pass here once; manual input keeps its existing behavior.
+    async fn action_boundary(&self, kind: &str) {
+        if self.run_state.trace_enabled.load(Ordering::Relaxed) {
+            if let Some(frames) = self.registry.frame() {
+                let _ = frames
+                    .trace_capture(&self.device, self.run_state.metadata(kind), false)
+                    .await;
+            }
+        }
+    }
+
     async fn click_point(&self, point: TouchPoint) -> Result<()> {
+        self.run_state.goal_verified.store(false, Ordering::Relaxed);
+        self.action_boundary("action_before").await;
         self.input_delay("click_delay", "before", self.settings.before_click_ms)
             .await?;
+        if self
+            .observed_at_ms
+            .read()
+            .unwrap()
+            .is_some_and(|observed| self.runtime.now_ms().saturating_sub(observed) > 5_000)
+        {
+            bail!("STALE_OBSERVATION: 动作延迟后目标已过期，须重新观察");
+        }
         let stamp = self.frame_stamp.read().unwrap().clone();
         self.registry
             .input()
@@ -433,6 +546,7 @@ impl NativeYamlHost {
             .tap_from_frame(&self.device, point, stamp.as_ref())
             .await
             .map_err(anyhow::Error::new)?;
+        self.action_boundary("action_after").await;
         self.emit_event(RuntimeEventKind::Tap {
             x: point.x(),
             y: point.y(),
@@ -482,6 +596,7 @@ impl NativeYamlHost {
             bail!("滑动起止点来自不同画面")
         }
         let current_stamp = self.frame_stamp.read().unwrap().clone();
+        self.action_boundary("action_before").await;
         self.registry
             .input()
             .ok_or_else(|| anyhow!("input capability 未注册"))?
@@ -492,6 +607,7 @@ impl NativeYamlHost {
             )
             .await
             .map_err(anyhow::Error::new)?;
+        self.action_boundary("action_after").await;
         self.emit_event(RuntimeEventKind::Swipe {
             x1: from.x(),
             y1: from.y(),
@@ -511,6 +627,7 @@ impl NativeYamlHost {
             value if value == "press" => KeyAction::Press,
             other => bail!("未知 key action: {other}"),
         };
+        self.action_boundary("action_before").await;
         self.input_delay("key_delay", "before", self.settings.before_click_ms)
             .await?;
         self.registry
@@ -519,6 +636,7 @@ impl NativeYamlHost {
             .key_named(&self.device, &key, action)
             .await
             .map_err(anyhow::Error::new)?;
+        self.action_boundary("action_after").await;
         self.input_delay("key_delay", "after", self.settings.after_click_ms)
             .await?;
         Ok(Value::Null)
@@ -627,6 +745,32 @@ impl NativeYamlHost {
         })
     }
 
+    async fn observe(&self, args: &BoundArgs, finish: bool) -> Result<Value> {
+        let timeout = args.duration_ms("timeout")?;
+        if timeout > MAX_SLEEP_MS {
+            bail!("等待超出有限预算 3600000ms");
+        }
+        let threshold = args.number("threshold")?.unwrap_or(0.8);
+        if !(0.0..=1.0).contains(&threshold) {
+            bail!("threshold 必须在 0..1");
+        }
+        let result = self.poll_match(args, timeout, "observe").await?;
+        match result {
+            Some(value) => {
+                if finish {
+                    self.run_state.goal_verified.store(true, Ordering::Relaxed);
+                }
+                Ok(value)
+            }
+            None if finish || args.values["required"].as_bool().unwrap_or(true) => bail!(
+                "VISUAL_TIMEOUT: 必需视觉目标 {} 在 {}ms 内未出现",
+                args.string("template")?,
+                timeout
+            ),
+            None => Ok(Value::Null),
+        }
+    }
+
     async fn wait_find(&self, args: &BoundArgs) -> Result<Value> {
         let click = args.values.get("click").and_then(Value::as_bool) == Some(true);
         if click
@@ -642,6 +786,9 @@ impl NativeYamlHost {
                 .map_err(anyhow::Error::new)?;
         }
         let timeout = args.duration_ms("timeout")?;
+        if timeout > MAX_SLEEP_MS {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        }
         let Some(matched) = self.poll_match(args, timeout, "wait_find").await? else {
             return Ok(Value::Null);
         };
@@ -653,6 +800,9 @@ impl NativeYamlHost {
 
     async fn tap_template(&self, args: &BoundArgs) -> Result<Value> {
         let timeout = args.duration_ms("timeout")?;
+        if timeout > MAX_SLEEP_MS {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        }
         let Some(matched) = self.poll_match(args, timeout, "tap_template").await? else {
             return Ok(Value::Null);
         };
@@ -669,19 +819,24 @@ impl NativeYamlHost {
 
     async fn wait_disappear(&self, args: &BoundArgs) -> Result<Value> {
         let timeout = args.duration_ms("timeout")?;
+        if timeout > MAX_SLEEP_MS {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        }
         let interval = args.duration_ms("interval")?.max(MIN_POLL_INTERVAL_MS);
-        let started = Instant::now();
+        let started = self.runtime.now_ms();
         loop {
             let (outcome, _) = self.match_once(args).await?;
             let found = matches!(outcome, MatchOutcome::Found(_));
             if !found {
                 return Ok(Value::Bool(true));
             }
-            if started.elapsed().as_millis() as u64 >= timeout {
+            if self.runtime.now_ms().saturating_sub(started) >= timeout {
                 return Ok(Value::Bool(false));
             }
             self.runtime
-                .sleep(Duration::from_millis(interval.min(MAX_SLEEP_MS)))
+                .sleep(Duration::from_millis(interval.min(MAX_SLEEP_MS).min(
+                    timeout.saturating_sub(self.runtime.now_ms().saturating_sub(started)),
+                )))
                 .await
                 .map_err(anyhow::Error::new)?;
         }
@@ -718,6 +873,22 @@ impl NativeYamlHost {
     }
 
     async fn match_on_frame(
+        &self,
+        args: &BoundArgs,
+        frame: crate::capabilities::FrameHandle,
+    ) -> Result<(MatchOutcome, Option<[u32; 4]>)> {
+        let outcome = self.match_on_frame_inner(args, frame).await;
+        if let Some(frames) = self.registry.frame() {
+            let mut metadata = self.run_state.metadata("consumed");
+            if let Err(error) = &outcome {
+                metadata["error"] = json!(error.to_string());
+            }
+            let _ = frames.trace_frame(frame, metadata, false).await;
+        }
+        outcome
+    }
+
+    async fn match_on_frame_inner(
         &self,
         args: &BoundArgs,
         frame: crate::capabilities::FrameHandle,
@@ -806,7 +977,7 @@ impl NativeYamlHost {
     ) -> Result<Option<Value>> {
         let interval = args.duration_ms("interval")?.max(MIN_POLL_INTERVAL_MS);
         let template_name = args.string("template")?;
-        let started = Instant::now();
+        let started = self.runtime.now_ms();
         let obstacles = args
             .values
             .get("obstacles")
@@ -842,7 +1013,7 @@ impl NativeYamlHost {
                     cleared = true;
                     break;
                 }
-                if timeout_ms > 0 && started.elapsed().as_millis() as u64 >= timeout_ms {
+                if timeout_ms > 0 && self.runtime.now_ms().saturating_sub(started) >= timeout_ms {
                     return Ok(None);
                 }
                 if self.runtime.cancelled() {
@@ -863,18 +1034,17 @@ impl NativeYamlHost {
             if let MatchOutcome::Found(_) = outcome {
                 return Ok(Some(self.match_value(outcome, region, self.screen())));
             }
-            if started.elapsed().as_millis() as u64 >= timeout_ms {
+            if self.runtime.now_ms().saturating_sub(started) >= timeout_ms {
                 return Ok(None);
             }
             self.runtime
                 .sleep(Duration::from_millis(interval.min(MAX_SLEEP_MS).min(
-                    timeout_ms.saturating_sub(started.elapsed().as_millis() as u64),
+                    timeout_ms.saturating_sub(self.runtime.now_ms().saturating_sub(started)),
                 )))
                 .await
                 .map_err(anyhow::Error::new)?;
-            if started.elapsed().as_millis() as u64 >= timeout_ms {
-                return Ok(None);
-            }
+            // Observe at the deadline as well; only a failed observation at
+            // that time is a timeout. All time comes from the runtime clock.
         }
     }
 
@@ -928,6 +1098,10 @@ impl NativeYamlHost {
             .content_package
             .as_ref()
             .ok_or_else(|| anyhow!("当前上下文没有 content package"))?;
+        let mut cache = self.run_state.templates.lock().await;
+        if let Some(handle) = cache.get(name) {
+            return Ok(*handle);
+        }
         let resource = self
             .registry
             .resource()
@@ -942,6 +1116,35 @@ impl NativeYamlHost {
             )
             .await
             .map_err(anyhow::Error::new)?;
+        let resources = self.registry.resource().unwrap();
+        let expected = self.run_state.template_versions.read().unwrap().clone();
+        let resource = if !self
+            .run_state
+            .enforce_template_versions
+            .load(Ordering::Relaxed)
+        {
+            resource
+        } else {
+            let frozen = resources
+                .freeze(resource)
+                .await
+                .map_err(anyhow::Error::new)?;
+            let filename = resources
+                .resolved_path(frozen)
+                .await
+                .map_err(anyhow::Error::new)?;
+            let digest = resources
+                .fingerprint(frozen)
+                .await
+                .map_err(anyhow::Error::new)?;
+            if expected.get(&filename) != Some(&digest) {
+                resources.release_frozen(frozen);
+                bail!("RESOURCE_CHANGED: 模板 {name} 在运行开始后变化，或未包含在冻结版本中");
+            }
+            frozen
+        };
+        *self.run_state.cleanup_registry.lock().unwrap() = Some(self.registry.clone());
+        cache.insert(name.to_string(), resource);
         Ok(resource)
     }
 
@@ -1017,6 +1220,7 @@ impl NativeYamlHost {
     fn match_value(&self, outcome: MatchOutcome, region: Value, screen: FrameSize) -> Value {
         match outcome {
             MatchOutcome::Found(found) => {
+                *self.observed_at_ms.write().unwrap() = Some(self.runtime.now_ms());
                 let center = [
                     (found.x + found.width / 2) as f64 / screen.width as f64,
                     (found.y + found.height / 2) as f64 / screen.height as f64,
@@ -1033,6 +1237,8 @@ impl NativeYamlHost {
                 if let Some(stamp) = self.frame_stamp.read().unwrap().clone() {
                     value["_frame"] = json!(stamp);
                     value["center"]["_frame"] = json!(stamp);
+                    value["_observed_at_ms"] = json!(self.runtime.now_ms());
+                    value["center"]["_observed_at_ms"] = json!(self.runtime.now_ms());
                 }
                 value
             }
@@ -1773,12 +1979,58 @@ log = "^1.0"
     }
 
     #[test]
-    fn wait_find_click_defaults_true_and_false_only_waits() {
+    fn required_visual_observations_fail_optional_absence_only_and_explicit_failure() {
+        let trace = Arc::new(Trace::default());
+        let vision = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(
+            trace.clone(),
+            &vision,
+            LogTrace::new(),
+            &["vision.match", "resource.read", "runtime.sleep"],
+        );
+        assert_eq!(
+            call(
+                "observe",
+                json!({"template":"home","timeout":"0ms","required":false}),
+                &host
+            )
+            .unwrap(),
+            Value::Null
+        );
+        for function in ["observe", "finish"] {
+            assert!(
+                call(function, json!({"template":"home","timeout":"0ms"}), &host)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("VISUAL_TIMEOUT")
+            );
+        }
+        assert!(call(
+            "finish",
+            json!({"template":"home","timeout":"0ms","required":false}),
+            &host
+        )
+        .is_err());
+        assert!(call(
+            "observe",
+            json!({"template":"home","timeout":"0ms","required":false,"threshold":"invalid"}),
+            &host
+        )
+        .is_err());
+        assert!(call("fail", json!("deliberate failure"), &host)
+            .unwrap_err()
+            .to_string()
+            .contains("GOAL_FAILED"));
+        assert!(trace.taps.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_find_defaults_to_observation_and_click_is_explicit() {
         for click in [None, Some(true), Some(false)] {
             let trace = Arc::new(Trace::default());
             let stub = VisionStub::new(FrameSize::new(1000, 1000));
             stub.push_outcome(stub_outcome());
-            let permissions = if click == Some(false) {
+            let permissions = if click != Some(true) {
                 vec!["vision.match", "resource.read"]
             } else {
                 vec!["vision.match", "resource.read", "input.tap"]
@@ -1790,7 +2042,7 @@ log = "^1.0"
             }
             let matched = call("wait_find", args.clone(), &host).unwrap();
             assert_eq!(matched["center"], json!({"x": 0.11, "y": 0.07}));
-            let expected_taps = if click == Some(false) {
+            let expected_taps = if click != Some(true) {
                 vec![]
             } else {
                 vec![[110, 70]]
@@ -1811,7 +2063,12 @@ log = "^1.0"
             LogTrace::new(),
             &["vision.match", "resource.read"],
         );
-        let error = call("wait_find", json!({"template": "home"}), &host).unwrap_err();
+        let error = call(
+            "wait_find",
+            json!({"template": "home", "click":true}),
+            &host,
+        )
+        .unwrap_err();
         let text = error.to_string();
         assert!(text.contains("denied") || text.contains("权限"), "{text}");
         let error = call(
@@ -2028,6 +2285,10 @@ log = "^1.0"
                     "wait_find",
                     json!({"template":"home","obstacles":["close"],"click":false,"timeout":"0ms"}),
                 ),
+                "wait_find" => (
+                    name,
+                    json!({"template":"home","timeout":"0ms","click":true}),
+                ),
                 _ => (name, json!({"template":"home","timeout":"0ms"})),
             };
             native.call_function(function, args).await.unwrap();
@@ -2216,7 +2477,7 @@ log = "^1.0"
             .unwrap()["data"]["args"];
         assert_eq!(args["template"], "home");
         assert_eq!(args["timeout"], "0ms");
-        assert_eq!(args["click"], true);
+        assert_eq!(args["click"], false);
         assert!(args["threshold"].is_number());
         assert!(args.get("interval").is_some());
     }
@@ -2242,9 +2503,34 @@ mod wasm_tests {
     use super::super::wasm_host::LazyYamlWasmtimeRuntime;
     use super::tests;
     use super::*;
-    use crate::extensions::gamer_yaml::syntax::{
-        build_program, parse_function_library, parse_script,
-    };
+    use crate::extensions::gamer_yaml::syntax;
+    fn v2_fixture(source: &str) -> String {
+        if source.lines().any(|line| line.starts_with("version:")) {
+            source.into()
+        } else {
+            format!("version: 2\n{source}")
+        }
+    }
+    fn parse_script(source: &str) -> Result<syntax::Script, Vec<syntax::Diagnostic>> {
+        syntax::parse_script(&v2_fixture(source))
+    }
+    fn parse_function_library(
+        source: &str,
+    ) -> Result<syntax::FunctionLibrary, Vec<syntax::Diagnostic>> {
+        syntax::parse_function_library(&v2_fixture(source))
+    }
+    fn build_program(
+        script: &syntax::Script,
+        library: &syntax::FunctionLibrary,
+        vars: JsonMap<String, Value>,
+        start: usize,
+    ) -> Value {
+        let mut program = syntax::build_program(script, library, vars, start);
+        // These fixtures test isolated native/control-flow instructions. Full
+        // visual completion stays mandatory at production build_program.
+        program["require_goal"] = json!(false);
+        program
+    }
     use async_trait::async_trait;
     use std::fs;
     use std::io::Write as _;
@@ -2575,6 +2861,70 @@ runtime = "^1.0"
             .unwrap();
         let taps = trace.taps.lock().unwrap();
         assert_eq!(*taps, vec![[350, 871]; 3]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires an explicit pre-upgrade component in GAMER_OLD_YAML_COMPONENT"]
+    async fn old_yaml_component_is_rejected_before_any_host_input() {
+        let old =
+            std::env::var("GAMER_OLD_YAML_COMPONENT").expect("provide preserved old component");
+        let trace = Arc::new(tests::Trace::default());
+        let events = tests::EventCollect::new();
+        let mut request = run_request(
+            wire("run: [{input_text: must_not_send}]"),
+            host_with_permissions(trace.clone(), &["device.read", "input.text"]),
+            Arc::new(AtomicBool::new(false)),
+            Some(events.clone()),
+        );
+        request.wasm = std::fs::read(old).unwrap();
+        let error = LazyYamlWasmtimeRuntime::new()
+            .run(request)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("YAML_GUEST_UPGRADE_REQUIRED"),
+            "{error}"
+        );
+        assert!(trace.text.lock().unwrap().is_empty());
+        assert!(trace.taps.lock().unwrap().is_empty());
+        assert!(trace.keys.lock().unwrap().is_empty());
+        assert!(
+            events.of("run_start").is_empty(),
+            "the probe must not emit a misleading run"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_v2_observes_once_taps_once_and_checks_goal() {
+        let trace = Arc::new(tests::Trace::default());
+        let vision = tests::VisionStub::new(FrameSize::new(1000, 1000));
+        vision.push_outcome(tests::stub_outcome());
+        vision.push_outcome(tests::stub_outcome());
+        let host = tests::vision_host(
+            trace.clone(),
+            &vision,
+            tests::LogTrace::new(),
+            &[
+                "device.read",
+                "vision.match",
+                "resource.read",
+                "input.tap",
+                "runtime.sleep",
+            ],
+        );
+        let script = syntax::parse_script("version: 2\ntargets: {button: {template: button.png}, done: {template: done.png}}\nrun: [{trace: false}, {wait: button, then: [{tap: button}]}, {trace: true}, {finish: done}]\n").unwrap();
+        let program = syntax::build_program(&script, &vec![], Default::default(), 0);
+        let result = LazyYamlWasmtimeRuntime::new()
+            .run(run_request(
+                program,
+                host,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            ))
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(trace.taps.lock().unwrap().len(), 1);
+        assert_eq!(vision.match_calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

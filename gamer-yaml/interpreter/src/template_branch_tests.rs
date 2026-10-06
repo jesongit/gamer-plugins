@@ -82,6 +82,7 @@ fn first_branch_only_local_binding_and_return_propagate() {
     cases[1].body = vec![Step {
         path: "run[0].cases[1].do[0]".into(),
         desc: String::new(),
+        source_id: None,
         kind: StepKind::Return {
             value: Expr::Ref {
                 path: "__return.template".into(),
@@ -130,6 +131,7 @@ fn nested_actions_keep_event_paths_and_step_budget() {
     cases[1].body = vec![Step {
         path: "run[0].cases[1].do[0]".into(),
         desc: "循环".into(),
+        source_id: None,
         kind: StepKind::Repeat {
             times: Expr::Lit {
                 value: json!(MAX_STEPS),
@@ -251,11 +253,13 @@ fn polling_break_is_local_and_single_shot_break_still_exits_outer_repeat() {
         cases[0].body = vec![Step {
             path: "break".into(),
             desc: String::new(),
+            source_id: None,
             kind: StepKind::Break,
         }];
         let after = Step {
             path: "after".into(),
             desc: String::new(),
+            source_id: None,
             kind: StepKind::Fn {
                 name: "log".into(),
                 args: Some(Expr::Lit {
@@ -269,6 +273,7 @@ fn polling_break_is_local_and_single_shot_break_still_exits_outer_repeat() {
             Step {
                 path: "outer".into(),
                 desc: String::new(),
+                source_id: None,
                 kind: StepKind::Repeat {
                     times: Expr::Lit { value: json!(2) },
                     body: vec![branch, after],
@@ -296,6 +301,7 @@ fn polling_return_and_errors_do_not_retry_or_wait() {
     cases[0].body = vec![Step {
         path: "return".into(),
         desc: String::new(),
+        source_id: None,
         kind: StepKind::Return {
             value: Expr::Lit {
                 value: json!("done"),

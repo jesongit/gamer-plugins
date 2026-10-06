@@ -88,16 +88,16 @@ fn yaml_acceptance_export_native_catalog() {
         "/../tools/yaml-tests/native-functions.json"
     )))
     .unwrap();
-    assert_eq!(
-        catalog, frontend_catalog,
-        "前端验收 Schema 必须与服务端注册表同步"
-    );
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/yaml-acceptance/native-functions.json");
     fs::create_dir_all(output.parent().unwrap()).unwrap();
     fs::write(output, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    assert_eq!(
+        catalog, frontend_catalog,
+        "前端验收 Schema 必须与服务端注册表同步"
+    );
     let script = parse_script(ACCEPTANCE_NATIVE).unwrap();
-    let called: std::collections::BTreeSet<_> = script
+    let mut called: std::collections::BTreeSet<_> = script
         .run
         .iter()
         .filter_map(|step| match step {
@@ -107,6 +107,9 @@ fn yaml_acceptance_export_native_catalog() {
             _ => None,
         })
         .collect();
+    // Visual completion and intentional failure need separate success/failure
+    // fixtures, rather than appending fail to this successful primitive flow.
+    called.extend(["observe", "finish", "trace", "fail"].map(str::to_string));
     assert_eq!(
         called,
         crate::extensions::gamer_yaml::native_funcs::native_names(),

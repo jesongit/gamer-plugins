@@ -1,8 +1,8 @@
 manifest_version = 2
 id = "gamer-video"
-version = "0.1.4"
+version = "0.2.0"
 name = "视频工作台"
-description = "视频工作台：媒体素材库、设备录制与操作草稿生成"
+description = "视频工作台：媒体素材库、设备录制与可携带演示素材"
 permissions = ["ui.host", "media.read", "media.import", "media.record", "media.write", "media.events.read"]
 
 # 支持的 Android 应用（`*` = 通用；缺省/空同 `*`）。宿主不做硬门禁，
@@ -13,8 +13,7 @@ ui = "^1.0"
 [targets.android]
 packages = ["*"]
 
-# 可选依赖（简化计划 Phase 3）：gamer-yaml 提供「创建模板 / 生成 YAML 草稿 /
-# 打开 YAML 编辑器」能力。缺失时视频工作台基础功能（导入/录制/播放/逐帧/
+# 可选依赖：gamer-yaml 提供「创建模板 / 离线模板测试」能力。缺失时视频工作台基础功能（导入/录制/播放/逐帧/
 # 标记）不受影响，仅 YAML 相关入口降级隐藏（前端按能力发现接口判定）。
 # 依赖声明不授予权限、不触发自动安装/启用。
 [[dependencies]]
@@ -27,7 +26,7 @@ required = false
 [execution]
 kind = "builtin"
 builtin_id = "gamer-video"
-host_version = ">=0.2.15"
+host_version = ">=0.3.0"
 
 [[ui.contributions]]
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端

@@ -9,7 +9,7 @@ use yaml_interp::{EventSink, HostError, HostErrorKind, HostFunctions};
 
 /// gamer-yaml 官方产品 guest（计划 Phase 2：唯一权威解释器在 `yaml-interp`
 /// crate，与宿主测试链路共享同一份源码；本 crate 只是 WIT 胶水）。宿主下发
-/// 解析/校验/绑定后的 V1 程序 JSON（含运行开始时冻结的当前 Package 函数表）；
+/// 解析/校验/绑定后的 V2 wire 程序 JSON（含运行开始时冻结的当前 Package 函数表）；
 /// guest 解释控制流（函数调用 / if / repeat / return），原生函数经私有
 /// `__fn` 通道转发宿主，运行结构事件经 `__event` 通道发射（均不经权限声明）。
 ///
@@ -23,10 +23,13 @@ struct GuestHost;
 impl HostFunctions for GuestHost {
     fn invoke(&self, name: &str, args: serde_json::Value) -> Result<serde_json::Value, HostError> {
         let payload = serde_json::json!({ "name": name, "args": args });
-        let result = capability::invoke("__fn", &payload.to_string())
-            .map_err(map_wit_error)?;
-        serde_json::from_str(&result)
-            .map_err(|error| HostError::new(HostErrorKind::Failed, format!("宿主函数 {name} 返回值无效: {error}")))
+        let result = capability::invoke("__fn", &payload.to_string()).map_err(map_wit_error)?;
+        serde_json::from_str(&result).map_err(|error| {
+            HostError::new(
+                HostErrorKind::Failed,
+                format!("宿主函数 {name} 返回值无效: {error}"),
+            )
+        })
     }
 }
 
@@ -56,7 +59,18 @@ fn map_wit_error(error: gamer::host::types::HostError) -> HostError {
 
 impl Guest for YamlGuest {
     fn run(program_json: String) -> Result<String, String> {
-        let program: yaml_interp::Program = serde_json::from_str(&program_json)
+        let request: serde_json::Value = serde_json::from_str(&program_json)
+            .map_err(|error| format!("program JSON 无效: {error}"))?;
+        if request
+            .get("_runtime_contract_probe")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(
+                serde_json::json!({"runtime_contract":yaml_interp::RUNTIME_CONTRACT}).to_string(),
+            );
+        }
+        let program: yaml_interp::Program = serde_json::from_value(request)
             .map_err(|error| format!("program JSON 无效: {error}"))?;
         let value = yaml_interp::run(&program, &GuestHost, Some(&GuestSink))?;
         serde_json::to_string(&value).map_err(|error| error.to_string())

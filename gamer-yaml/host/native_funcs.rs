@@ -1,4 +1,4 @@
-//! gamer-yaml 原生（插件）函数注册表——V1 函数库两种来源之一（计划 Phase 3.2）。
+//! gamer-yaml 原生（插件）函数注册表——V2 函数库两种来源之一（计划 Phase 3.2）。
 //!
 //! 原生函数在宿主（扩展边界）内以 Rust 实现，组合 Core capability 原语；
 //! 解释器经 `__fn` 通道按名派发（`tap`、`find`、`sleep` 等不是语法关键字）。
@@ -60,6 +60,28 @@ const RETURN_BOOL: &str = "boolean";
 pub(crate) fn native_functions() -> &'static [NativeFunction] {
     static FUNCTIONS: std::sync::LazyLock<Vec<NativeFunction>> = std::sync::LazyLock::new(|| {
         let mut functions = vec![
+            NativeFunction {
+                name: "trace",
+                display_name: "图片记录",
+                description: "开关自动图片采集；边界和异常仍保留证据",
+                params: vec![p(
+                    "enabled",
+                    ParamType::Boolean,
+                    true,
+                    None,
+                    "是否启用自动图片",
+                )],
+                returns: RETURN_NULL,
+                permissions: &[],
+            },
+            NativeFunction {
+                name: "fail",
+                display_name: "明确失败",
+                description: "立即失败并记录原因",
+                params: vec![p("message", ParamType::String, true, None, "失败原因")],
+                returns: RETURN_NULL,
+                permissions: &[],
+            },
             NativeFunction {
                 name: "tap",
                 display_name: "点击",
@@ -236,7 +258,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             NativeFunction {
                 name: "wait_find",
                 display_name: "等待模板出现",
-                description: "等待模板出现，默认点击命中中心（click: false 仅等待）；超时返回 null",
+                description: "等待模板出现，默认仅观察（click: true 才点击）；超时返回 null",
                 params: vec![
                     p("template", ParamType::Template, true, None, "模板短名"),
                     ParamSchema {
@@ -253,7 +275,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                         "click",
                         ParamType::Boolean,
                         false,
-                        Some(json!(true)),
+                        Some(json!(false)),
                         "命中后是否点击模板中心（前后延迟使用自动化设置）",
                     ),
                     p(
@@ -459,6 +481,55 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             returns: "object",
             permissions: &[],
         });
+        for name in ["observe", "finish"] {
+            functions.push(NativeFunction {
+                name,
+                display_name: if name == "finish" {
+                    "验证完成画面"
+                } else {
+                    "观察视觉目标"
+                },
+                description: "只观察，不自动点击；必需目标超时明确失败，可选缺失返回 null",
+                params: vec![
+                    p("template", ParamType::Template, true, None, "模板"),
+                    p(
+                        "threshold",
+                        ParamType::Number,
+                        false,
+                        Some(json!(0.8)),
+                        "匹配阈值 0..1",
+                    ),
+                    p("region", ParamType::List, false, None, "相对区域 [x,y,w,h]"),
+                    p(
+                        "timeout",
+                        ParamType::Duration,
+                        false,
+                        Some(json!("10s")),
+                        "最长等待时间",
+                    ),
+                    p(
+                        "interval",
+                        ParamType::Duration,
+                        false,
+                        Some(json!("250ms")),
+                        "轮询间隔",
+                    ),
+                    p(
+                        "required",
+                        ParamType::Boolean,
+                        false,
+                        Some(json!(true)),
+                        "未命中是否失败",
+                    ),
+                ],
+                returns: RETURN_MATCH,
+                permissions: &[
+                    Permission::VisionMatch,
+                    Permission::ResourceRead,
+                    Permission::RuntimeSleep,
+                ],
+            });
+        }
         for func in &mut functions {
             func.params.push(p(
                 "name",
@@ -534,6 +605,6 @@ mod tests {
                 timeouts += 1;
             }
         }
-        assert_eq!(timeouts, 3);
+        assert_eq!(timeouts, 5);
     }
 }

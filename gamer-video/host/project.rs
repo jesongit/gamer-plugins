@@ -496,11 +496,50 @@ fn is_project_path(path: &str) -> bool {
 pub struct VideoProjectResourceHandler;
 
 impl crate::resources::ResourceHandler for VideoProjectResourceHandler {
+    fn max_upload_bytes(&self, path: &str) -> usize {
+        if path.starts_with("samples/")
+            && path.ends_with(".gamersample")
+            && path.split('/').count() == 2
+        {
+            super::sample::MAX_ARCHIVE_BYTES
+        } else {
+            16 * 1024 * 1024
+        }
+    }
+    fn validate_save_binary<'a>(
+        &self,
+        req: crate::resources::SaveBinaryValidation<'a>,
+    ) -> Result<std::borrow::Cow<'a, [u8]>, Value> {
+        super::sample::validate_resource(req.path, req.bytes)?;
+        Ok(std::borrow::Cow::Borrowed(req.bytes))
+    }
+
     fn validate_save(&self, req: crate::resources::SaveValidation<'_>) -> Result<(), Value> {
+        if req.path.starts_with("samples/") {
+            return Err(
+                serde_json::json!([{"code":"sample.binary_required","message":"演示素材必须通过二进制归档导入","path":req.path}]),
+            );
+        }
         if !is_project_path(req.path) {
             return Ok(());
         }
         validate_project_content(req.content, req.package, req.path)
+    }
+
+    fn before_rename(
+        &self,
+        _store: &crate::resources::PackageStore,
+        _package: &str,
+        _plugin: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !(old_path.starts_with("samples/") || new_path.starts_with("samples/"))
+                || old_path == new_path,
+            "sample ID/path is immutable; import a separately identified sample instead"
+        );
+        Ok(())
     }
 
     /// 列表/读取注记：项目条目附 schema 摘要；解析失败标 `project_valid:false`

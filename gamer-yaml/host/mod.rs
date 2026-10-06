@@ -3,12 +3,12 @@
 //! 本目录物理收编 YAML 自动化栈的全部内容语义：
 //!
 //! - [`error`]：扩展侧 REST 结构化诊断载体（五元组）；
-//! - [`syntax`]：V1 纯数据前端（surface 解析/校验 + wire 降线 + 模板引用
+//! - [`syntax`]：V2 视觉语法前端（surface 解析/校验 + wire 降线 + 模板引用
 //!   改写 + 确定性序列化）；
 //! - [`native_funcs`]：原生（插件）函数注册表（Schema 唯一声明点）；
 //! - [`yaml_extension`]：原生函数宿主（`__fn` 后端）、WASM runtime 契约与
 //!   官方 manifest 常量；
-//! - [`runner_adapter`]：V1 执行器（EngineExecutor）——运行前组合函数注册表
+//! - [`runner_adapter`]：V2 执行器（EngineExecutor）——运行前组合函数注册表
 //!   （原生 + 当前 Package）并绑定参数；
 //! - [`timer_yaml`]：Timer Core 的 gamer-yaml runner + 扩展生命周期注册器；
 //! - [`task_params`]：任务/手动运行参数绑定（按当前 Schema 重绑，无签名门禁）；
@@ -24,10 +24,13 @@
 
 pub(crate) mod actions;
 pub(crate) mod error;
+pub(crate) mod generation;
 pub(crate) mod native_funcs;
 pub(crate) mod notification;
+pub(crate) mod offline_validation;
 mod reference_types;
 pub(crate) mod resources;
+pub(crate) mod revisions;
 pub(crate) mod run_target;
 pub(crate) mod runner_adapter;
 pub(crate) mod settings;
@@ -94,7 +97,7 @@ pub(crate) fn yaml_runtime() -> std::sync::Arc<dyn yaml_extension::YamlWasmRunti
     }
 }
 
-/// Execute a lowered YAML V1 program in the installed `gamer-yaml` Component
+/// Execute a lowered YAML V2 program in the installed `gamer-yaml` Component
 /// guest. Extension → Core direction only: the guest bytes and host API come
 /// from the generic [`crate::extensions::ExtensionService`] lookup; the YAML
 /// runtime itself lives behind this boundary.

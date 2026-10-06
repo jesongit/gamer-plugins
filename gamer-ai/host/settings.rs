@@ -456,6 +456,26 @@ impl Settings {
         })
     }
 
+    /// A single locked snapshot binds automation requests to their tested configuration.
+    pub(super) fn automation_snapshot(&self) -> Result<(Value, ConnectionConfig)> {
+        let _guard = self.gate.lock();
+        let settings = self.load()?;
+        validate_config(&settings.config)?;
+        ensure!(!settings.api_key.is_empty(), "请先保存 AI API 密钥");
+        Ok((
+            settings.public(),
+            ConnectionConfig {
+                base_url: settings.config.base_url,
+                model: settings.config.model,
+                protocol: settings.config.protocol,
+                request_timeout_secs: settings.config.request_timeout_secs,
+                api_key: settings.api_key,
+                public_reasoning_content: settings.config.public_reasoning_content,
+                max_output_tokens: settings.config.max_output_tokens,
+            },
+        ))
+    }
+
     fn load(&self) -> Result<PrivateSettings> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,

@@ -2,7 +2,7 @@
 //!
 //! `action = "automation.create_draft"`（经现有 `POST /api/extensions/:id/call`
 //! 通路，不新增 REST 路由）：把录制会话的操作事件（`crate::recording`
-//! 的 [`crate::recording::InputEventRecord`]）映射为 **YAML V1 草稿文本**。
+//! 的 [`crate::recording::InputEventRecord`]）映射为 **YAML V2 未验证草稿文本**。
 //!
 //! 映射口径（V1 语法）：
 //! - `tap` → `- tap: [相对坐标]`（device-display 像素按事件自带 `display_size`
@@ -105,6 +105,8 @@ pub(crate) fn build_draft(
         "# 等待与滑动时长均为建议值；运行前需人工补充模板判断、状态等待、分支与异常恢复，".to_string(),
         "# 再保存到当前 Package 的 automations/。草稿只返回文本，不会被自动执行。".to_string(),
     ];
+    document.push("# 尚未定义 finish 目标；此草稿不能声明任务完成。".to_string());
+    document.push("version: 2".to_string());
     document.push(if step_lines.is_empty() {
         "run: []".to_string()
     } else {
@@ -399,7 +401,7 @@ mod tests {
     }
 
     /// 全词表夹具：tap →（1.2s 间隔）swipe → key（命名）→ key（未命名码）
-    /// → wait。生成物必须通过 V1 parse，且映射/建议值正确。
+    /// → wait。生成物必须通过 V2 parse，且映射/建议值正确。
     #[test]
     fn draft_maps_tap_swipe_key_and_passes_v1_parse() {
         let events = vec![
@@ -422,8 +424,8 @@ mod tests {
         let result = build_draft("rec-test", None, None, &events);
         assert!(diagnostics_of(&result).is_empty(), "{result}");
         let yaml = result["yaml"].as_str().unwrap();
-        // 生成物必须通过 V1 parse（自证；否则草稿不可保存/运行）。
-        crate::extensions::gamer_yaml::syntax::parse_script(yaml).expect("草稿必须通过 V1 parse");
+        // 生成物必须通过 V2 parse（自证；否则草稿不可保存/运行）。
+        crate::extensions::gamer_yaml::syntax::parse_script(yaml).expect("草稿必须通过 V2 parse");
         assert!(yaml.starts_with("# 草稿："), "{yaml}");
         assert!(
             yaml.contains("- tap: [0.4271, 0.4259] # evt-1 tap"),
@@ -499,7 +501,7 @@ mod tests {
         let result = build_draft("rec-test", None, None, &[broken]);
         assert_eq!(
             result["yaml"].as_str().unwrap(),
-            "# 草稿：由录制会话 rec-test 的操作事件生成（gamer-yaml automation.create_draft）。\n# 等待与滑动时长均为建议值；运行前需人工补充模板判断、状态等待、分支与异常恢复，\n# 再保存到当前 Package 的 automations/。草稿只返回文本，不会被自动执行。\nrun: []\n"
+            "# 草稿：由录制会话 rec-test 的操作事件生成（gamer-yaml automation.create_draft）。\n# 等待与滑动时长均为建议值；运行前需人工补充模板判断、状态等待、分支与异常恢复，\n# 再保存到当前 Package 的 automations/。草稿只返回文本，不会被自动执行。\n# 尚未定义 finish 目标；此草稿不能声明任务完成。\nversion: 2\nrun: []\n"
         );
         assert_eq!(diagnostics_of(&result).len(), 1);
     }
@@ -668,7 +670,7 @@ mod tests {
         let result = build_draft("rec-test", None, Some(&comments), &events);
         let yaml = result["yaml"].as_str().unwrap();
         crate::extensions::gamer_yaml::syntax::parse_script(yaml)
-            .expect("带注释草稿必须通过 V1 parse");
+            .expect("带注释草稿必须通过 V2 parse");
         assert!(
             yaml.contains(
                 "  # 打开背包后 点第一格

@@ -50,7 +50,12 @@ pub(crate) fn is_removed_functions_dir(path: &str) -> bool {
 
 /// 注册 gamer-yaml 的资源内容钩子（组合根引导期调用）。
 pub fn register_resource_handlers(store: &PackageStore) {
-    store.register_handler(YAML_EXTENSION_ID, Arc::new(YamlResourceHandler));
+    store.register_handler(
+        YAML_EXTENSION_ID,
+        Arc::new(YamlResourceHandler {
+            data_root: store.data_root().to_path_buf(),
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +311,38 @@ fn collect_removed_call_locations(
 }
 
 /// gamer-yaml 插件资源的统一内容钩子：按路径前缀分发到 V1 校验器。
-struct YamlResourceHandler;
+struct YamlResourceHandler {
+    data_root: std::path::PathBuf,
+}
 
 impl ResourceHandler for YamlResourceHandler {
+    fn after_package_delete(&self, package: &str) -> anyhow::Result<()> {
+        crate::resources::validate_scope_id("package id", package)?;
+        for area in ["candidates", "revisions"] {
+            let path = self
+                .data_root
+                .join("extension-data/gamer-yaml")
+                .join(area)
+                .join(package);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => std::fs::remove_file(&path)?,
+                Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)?,
+                Ok(_) => std::fs::remove_file(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn max_upload_bytes(&self, path: &str) -> usize {
+        if path.starts_with("samples/") && path.ends_with(".gamersample") {
+            128 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        }
+    }
+
     fn validate_save(&self, req: SaveValidation<'_>) -> Result<(), serde_json::Value> {
         if let Some(rel) = req.path.strip_prefix("automations/") {
             // 前缀识别（Phase 1）：`_function*.yaml` = 函数库（functions: 包装），
@@ -337,6 +371,10 @@ impl ResourceHandler for YamlResourceHandler {
         &self,
         req: SaveBinaryValidation<'a>,
     ) -> Result<Cow<'a, [u8]>, serde_json::Value> {
+        if req.path.starts_with("samples/") {
+            crate::extensions::video::sample::validate_resource(req.path, req.bytes)?;
+            return Ok(Cow::Borrowed(req.bytes));
+        }
         // 普通模板归一化为灰度；#1 模板保留 RGB/RGBA，供匹配时颜色复核。
         // 非法图片字节报结构化诊断（HTTP 400）。其余路径不解释。
         if req.path.strip_prefix("templates/").is_some() {
@@ -535,7 +573,12 @@ mod rename_tests {
             .unwrap();
         // 与生产组合根一致：注册 gamer-yaml 的内容钩子（rename_resource 经
         // handler.before_rename 改写模板引用）
-        store.register_handler(YAML_EXTENSION_ID, Arc::new(YamlResourceHandler));
+        store.register_handler(
+            YAML_EXTENSION_ID,
+            Arc::new(YamlResourceHandler {
+                data_root: store.data_root().to_path_buf(),
+            }),
+        );
         (store, dir)
     }
 
@@ -556,7 +599,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/main.yaml",
-                "run:\n  - find:\n      template: old.png\n      region: [0, 0, 1, 1]\n    as: hit\n  - log: old.png 文本不应改\n",
+                "version: 2\nrun:\n  - find:\n      template: old.png\n      region: [0, 0, 1, 1]\n    as: hit\n  - log: old.png 文本不应改\n",
                 None,
                 false,
             )
@@ -566,7 +609,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "functions:\n  login:\n    run:\n      - wait_find: old.png\n",
+                "version: 2\nfunctions:\n  login:\n    run:\n      - wait_find: old.png\n",
                 None,
                 false,
             )
@@ -622,14 +665,14 @@ mod rename_tests {
         assert!(legacy.contains("old.png"), "不可解析的存量源保持原样");
     }
 
-    /// 保存边界：V1 直存；旧 v3 源报 yaml.version.removed；automations/ 内
+    /// 保存边界：V1 直存；旧 v3 源报 yaml.version.unsupported；automations/ 内
     /// `_function*.yaml` 按函数库（functions: 包装）校验；旧 functions/ 目录
     /// 显式拒绝。
     #[test]
     fn saves_check_reference_types_and_preserve_existing_content_on_error() {
         let (store, _dir) = temp_store("reference-types");
         let path = "automations/_function.yaml";
-        let good = "functions:\n  daily:\n    run:\n      - match_templates:\n          cases:\n            - template: reward.png\n              as: hit\n              do:\n                - tap: $hit\n";
+        let good = "version: 2\nfunctions:\n  daily:\n    run:\n      - match_templates:\n          cases:\n            - template: reward.png\n              as: hit\n              do:\n                - tap: $hit\n";
         let original = store
             .write_text("com.test.app", YAML_EXTENSION_ID, path, good, None, false)
             .unwrap();
@@ -664,7 +707,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "automations/daily.yaml",
-                content: "run:\n  - log: ok\n",
+                content: "version: 2\nrun:\n  - log: ok\n",
                 store: &store,
             })
             .expect("V1 脚本必须通过");
@@ -677,7 +720,7 @@ mod rename_tests {
                 store: &store,
             })
             .unwrap_err();
-        assert_eq!(err[0]["code"], "yaml.version.removed");
+        assert_eq!(err[0]["code"], "yaml.version.unsupported");
 
         // _function 前缀 → 函数库校验（必须有 functions: 包装）
         let err = store
@@ -685,7 +728,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "automations/_function.yaml",
-                content: "greet:\n  run: []\n",
+                content: "version: 2\ngreet:\n  run: []\n",
                 store: &store,
             })
             .unwrap_err();
@@ -697,7 +740,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "functions/lib.yaml",
-                content: "functions:\n  greet:\n    run: []\n",
+                content: "version: 2\nfunctions:\n  greet:\n    run: []\n",
                 store: &store,
             })
             .unwrap_err();
@@ -709,7 +752,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "functions:\n  greet:\n    run:\n      - return: true\n",
+                "version: 2\nfunctions:\n  greet:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -729,7 +772,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "run:\n  - log: ok\n",
+                "version: 2\nrun:\n  - log: ok\n",
                 None,
                 false,
             )
@@ -752,7 +795,12 @@ mod rename_tests {
     #[test]
     fn binary_hook_normalizes_templates_to_grayscale_and_rejects_garbage() {
         let (store, _dir) = temp_store("binary-hook");
-        store.register_handler(YAML_EXTENSION_ID, Arc::new(YamlResourceHandler));
+        store.register_handler(
+            YAML_EXTENSION_ID,
+            Arc::new(YamlResourceHandler {
+                data_root: store.data_root().to_path_buf(),
+            }),
+        );
 
         // 彩色 PNG（非灰度）夹具
         let mut color = image::RgbaImage::new(4, 3);

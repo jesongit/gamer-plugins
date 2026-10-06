@@ -2,7 +2,7 @@
 //!
 //! This module is deliberately the only place that translates a
 //! [`RunTarget`] and raw parameter overrides into `core::RunRequest` payload
-//! data, and the single V1 execution entry: it composes the run-scoped
+//! data, and the single V2 execution entry: it composes the run-scoped
 //! function registry (native plugin functions + current Package functions),
 //! validates call targets, binds entry args, lowers to the interpreter wire
 //! program and executes it through the WASM guest. Parse/binding failures
@@ -66,7 +66,7 @@ pub fn yaml_start_request(
     })
 }
 
-/// Production executor: YAML decoding and V1 execution stay at the execution
+/// Production executor: YAML decoding and V2 execution stay at the execution
 /// boundary; RunManager only sees generic core values.
 pub struct EngineExecutor {
     devices: Arc<DeviceManager>,
@@ -169,7 +169,7 @@ impl RunExecutor for EngineExecutor {
                 .read()
                 .expect("YAML vNext adapter lock poisoned")
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("YAML V1 运行适配器未装配"))?;
+                .ok_or_else(|| anyhow::anyhow!("YAML 运行适配器未装配"))?;
             // 录制输入来源标注（合同 §2.1 / Phase 9 矩阵）：gamer-yaml runner
             // 经能力适配器注入的输入标记为 "runner"。guest 实例线程经
             // block_on_yaml 派生线程，task-local 不跨线程，由
@@ -262,7 +262,7 @@ fn compose_function_snapshot(
             sources.insert(
                 name.clone(),
                 json!({ "package_id": package, "plugin_id": YAML_EXTENSION_ID,
-                "path": file.path, "version": file.version, "function": name }),
+                "path": file.path, "version": file.version, "function": name, "source_yaml": content }),
             );
             registry.push((name, def));
         }
@@ -286,6 +286,37 @@ fn script_errors_text(errors: &[ScriptError]) -> String {
         .join("；")
 }
 
+fn template_snapshot(
+    store: &crate::resources::PackageStore,
+    package: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut template_versions = std::collections::BTreeMap::new();
+    use sha2::{Digest, Sha256};
+    for file in store.list(package, YAML_EXTENSION_ID, "templates")? {
+        if !file.path.to_ascii_lowercase().ends_with(".png") {
+            continue;
+        }
+        let bytes = store
+            .read_binary(package, YAML_EXTENSION_ID, &file.path)?
+            .ok_or_else(|| anyhow::anyhow!("RESOURCE_CHANGED: 模板 {} 不再可读", file.path))?;
+        let filename = file.path.clone();
+        if template_versions
+            .insert(filename.clone(), format!("{:x}", Sha256::digest(&bytes)))
+            .is_some()
+        {
+            anyhow::bail!("模板冻结版本存在重名文件: {filename}");
+        }
+    }
+    Ok(template_versions)
+}
+
+type FrozenRunInputs = (
+    Entry,
+    FunctionLibrary,
+    JsonMap<String, Value>,
+    std::collections::BTreeMap<String, String>,
+);
+
 struct YamlRunAdapter {
     scripts: Arc<crate::resources::PackageStore>,
     extensions: Weak<crate::extensions::ExtensionService>,
@@ -305,8 +336,11 @@ impl YamlRunAdapter {
         let defaults = super::settings::load(self.scripts.data_root())?;
         let scripts = self.scripts.clone();
         let target = spec.target.clone();
-        let (entry, library, sources) =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(Entry, FunctionLibrary, JsonMap<String, Value>)> {
+        let (entry, library, sources, template_versions) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<FrozenRunInputs> {
+                // Script, functions, and template versions form one atomic snapshot.
+                let _snapshot = scripts.snapshot_barrier();
+                let template_versions = template_snapshot(&scripts, target.pkg())?;
                 let (library, sources) = compose_function_snapshot(&scripts, target.pkg())?;
                 let entry = match &target {
                     RunTarget::Script { script_id, .. } => {
@@ -318,7 +352,7 @@ impl YamlRunAdapter {
                         let resource = resources::script_entry(&scripts, script_id)?
                             .ok_or_else(|| anyhow::anyhow!("脚本不存在: {script_id}"))?;
                         let source = json!({ "package_id": target.pkg(), "plugin_id": YAML_EXTENSION_ID,
-                            "path": format!("automations/{rel}"), "version": resource.version() });
+                            "path": format!("automations/{rel}"), "version": resource.version(), "source_yaml": resource.content });
                         let content = resource.content;
                         let script = parse_script(&content).map_err(|diagnostics| {
                             anyhow::anyhow!("脚本无效: {}", diagnostics_text(&diagnostics))
@@ -355,7 +389,7 @@ impl YamlRunAdapter {
                         }
                     }
                 };
-                Ok((entry, library, sources))
+                Ok((entry, library, sources, template_versions))
             })
             .await
             .map_err(|error| anyhow::anyhow!("读取 YAML 资源失败: {error}"))??;
@@ -431,11 +465,30 @@ impl YamlRunAdapter {
                 build_function_program(name, def, &library, initial, spec.target.start_index())
             }
         };
-        let source = match &entry {
+        let mut sources = sources;
+        let mut source = match &entry {
             Entry::Script { source, .. } => source.clone(),
             Entry::Function { name, .. } => sources.get(name).cloned().unwrap_or(Value::Null),
         };
+        program["_template_versions"] = serde_json::to_value(template_versions)?;
         program["_native_settings"] = serde_json::to_value(&defaults)?;
+        let mut source_files = serde_json::Map::new();
+        for item in std::iter::once(&source).chain(sources.values()) {
+            if let (Some(path), Some(content)) =
+                (item["path"].as_str(), item["source_yaml"].as_str())
+            {
+                source_files.insert(path.to_string(), json!(content));
+            }
+        }
+        if let Some(object) = source.as_object_mut() {
+            object.remove("source_yaml");
+        }
+        for item in sources.values_mut() {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("source_yaml");
+            }
+        }
+        program["_source_files"] = Value::Object(source_files);
         program["trace"] = json!({ "run_id": spec.context.run_id.as_str(), "entry": source, "functions": sources });
         run_yaml_program(
             &extensions,
@@ -505,7 +558,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "functions:\n  greet:\n    run:\n      - log: hi\n",
+                "version: 2\nfunctions:\n  greet:\n    run:\n      - log: hi\n",
                 None,
                 false,
             )
@@ -515,7 +568,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_battle.yaml",
-                "functions:\n  claim:\n    run:\n      - greet: {}\n",
+                "version: 2\nfunctions:\n  claim:\n    run:\n      - greet: {}\n",
                 None,
                 false,
             )
@@ -526,7 +579,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "run:\n  - log: daily\n",
+                "version: 2\nrun:\n  - log: daily\n",
                 None,
                 false,
             )
@@ -546,7 +599,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "functions:\n  tap:\n    run: []\n",
+                "version: 2\nfunctions:\n  tap:\n    run: []\n",
                 None,
                 false,
             )
@@ -563,7 +616,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "functions:\n  greet:\n    run: []\n",
+                "version: 2\nfunctions:\n  greet:\n    run: []\n",
                 None,
                 true,
             )
@@ -577,7 +630,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "functions:\n  if:\n    run: []\n",
+                "version: 2\nfunctions:\n  if:\n    run: []\n",
                 None,
                 true,
             )
@@ -635,7 +688,7 @@ mod tests {
                 "com.a",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "functions:\n  a_fn:\n    run: []\n",
+                "version: 2\nfunctions:\n  a_fn:\n    run: []\n",
                 None,
                 false,
             )
@@ -668,7 +721,7 @@ mod tests {
                 "com.stable",
                 YAML_EXTENSION_ID,
                 "automations/_function_daily.yaml",
-                "functions:\n  claim:\n    run:\n      - return: true\n",
+                "version: 2\nfunctions:\n  claim:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -738,7 +791,7 @@ mod tests {
                 "com.archive",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "functions:\n  claim:\n    run:\n      - return: true\n",
+                "version: 2\nfunctions:\n  claim:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -748,7 +801,7 @@ mod tests {
                 "com.archive",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "run:\n  - claim: {}\n",
+                "version: 2\nrun:\n  - claim: {}\n",
                 None,
                 false,
             )

@@ -1,14 +1,14 @@
-//! Gamer YAML V1 权威解释器（Phase 1/2，`docs/plans/gamer_v1_simplification_plan.md`）。
+//! Gamer YAML V2 权威解释器（Phase 1/2，`docs/plans/gamer_v1_simplification_plan.md`）。
 //!
 //! 全仓只有这一份 YAML 执行逻辑：
 //!
 //! - 生产执行：`gamer-yaml` 官方 guest（`plugins/gamer-yaml/guest`，WASM
 //!   Component）链接本 crate，经 `capability.invoke("__fn", …)` 调宿主函数、
 //!   `capability.invoke("__event", …)` 发运行事件；
-//! - 测试执行：server 侧以 dev-dependency 原生编译本 crate，用假 HostFunctions
-//!   直接驱动同一解释器（计划 Phase 2：不重新编写参考解释器）。
+//! - 离线验证：server 原生链接本 crate，以只读素材回放 HostFunctions 驱动
+//!   同一解释器；测试也复用此入口，不另写参考执行器。
 //!
-//! 解释器只认识 V1 最小语法（计划 §1.1）：`run` 步骤 = 函数调用 / `if` /
+//! 视觉 V2 在源端降线为统一 wire；`run` 指令包括函数调用 / `if` /
 //! `repeat` / `return`；`tap`、`find`、`sleep` 等都不是语法关键字，而是宿主
 //! 注册的函数。表达式只有字面量与 `$name.field` 引用，无算术、无插值、无 eval。
 //!
@@ -32,6 +32,9 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use serde_json::Value;
+
+/// Wire/semantic contract checked before a host permits guest side effects.
+pub const RUNTIME_CONTRACT: &str = "gamer-yaml.visual.v2/2";
 
 /// 步数预算：每个逻辑步（顶层、分支体、repeat 体每轮每子步、函数体全计）
 /// 执行前 +1，超限即终止。
@@ -120,6 +123,8 @@ pub trait EventSink: Send + Sync {
 #[derive(Debug, Deserialize)]
 pub struct Program {
     #[serde(default)]
+    pub require_goal: bool,
+    #[serde(default)]
     pub trace: Value,
     /// 入口帧初始值（已绑定参数 + vars 字面量，宿主绑定产出）。
     #[serde(default)]
@@ -161,6 +166,8 @@ pub struct Step {
     pub path: String,
     #[serde(default)]
     pub desc: String,
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,6 +255,8 @@ enum Flow {
     Continue,
     Break,
     Return(Value),
+    /// Explicit visual completion terminates the entire task, even in a function.
+    Finish(Value),
 }
 
 // ---------------------------------------------------------------------------
@@ -293,11 +302,13 @@ pub fn run(
         next_frame_id: 0,
         parent_frame_id: None,
         function: None,
+        goal_reached: false,
     };
     interp.run(program)
 }
 
 struct Interpreter<'a> {
+    goal_reached: bool,
     host: &'a dyn HostFunctions,
     events: Option<&'a dyn EventSink>,
     functions: BTreeMap<String, FunctionDef>,
@@ -328,13 +339,16 @@ impl<'a> Interpreter<'a> {
                 Flow::Break => {
                     Err("yaml.break.outside_loop: break 只能在当前函数的循环内使用".into())
                 }
+                _ if program.require_goal && !self.goal_reached => {
+                    Err("GOAL_NOT_REACHED: 脚本未在最后一次动作后验证 finish 目标".into())
+                }
                 flow => Ok(flow),
             });
         match outcome {
             Ok(flow) => {
                 self.emit(serde_json::json!({ "ev": "run_end", "ok": true }));
                 Ok(match flow {
-                    Flow::Return(value) => value,
+                    Flow::Return(value) | Flow::Finish(value) => value,
                     Flow::Break => unreachable!("break is rejected above"),
                     Flow::Continue => values.remove(RETURN_KEY).unwrap_or(Value::Null),
                 })
@@ -382,13 +396,13 @@ impl<'a> Interpreter<'a> {
             _ => None,
         };
         self.emit(serde_json::json!({
-            "ev": "step_start", "path": step.path, "desc": display_name.as_deref().unwrap_or(&step.desc),
+            "ev": "step_start", "path": step.path, "source_id":step.source_id, "desc": display_name.as_deref().unwrap_or(&step.desc),
         }));
     }
 
     fn emit_step_end(&self, step: &Step, ok: bool, error: Option<&str>) {
         let mut event = serde_json::json!({
-            "ev": "step_end", "path": step.path, "ok": ok,
+            "ev": "step_end", "path": step.path, "source_id":step.source_id, "ok": ok,
         });
         if let (Some(error), Some(object)) = (error, event.as_object_mut()) {
             object.insert("error".into(), Value::from(error));
@@ -424,7 +438,13 @@ impl<'a> Interpreter<'a> {
                 Ok(_) => self.emit_step_end(step, true, None),
                 Err(error) => self.emit_step_end(step, false, Some(error)),
             }
-            match outcome? {
+            match outcome.map_err(|error| {
+                if error.contains(" [source:") {
+                    error
+                } else {
+                    format!("{error} [source:{}]", step.path)
+                }
+            })? {
                 Flow::Continue => {}
                 flow => return Ok(flow),
             }
@@ -595,10 +615,31 @@ impl<'a> Interpreter<'a> {
             .host
             .invoke(name, args)
             .map_err(|error| error.to_string())?;
+        if name == "finish" {
+            self.goal_reached = !result.is_null() && result != Value::Bool(false);
+            if !self.goal_reached {
+                return Err("GOAL_NOT_REACHED: finish 没有返回已观察完成目标".into());
+            }
+        } else if matches!(
+            name,
+            "tap"
+                | "swipe"
+                | "key"
+                | "input_text"
+                | "launch"
+                | "stop_app"
+                | "tap_template"
+                | "wait_find"
+        ) {
+            self.goal_reached = false;
+        }
         self.detail(
             "result",
             serde_json::json!({"function":name,"value":result,"as":save_as}),
         );
+        if name == "finish" {
+            return Ok(Flow::Finish(result));
+        }
         if let Some(save_as) = save_as {
             values.insert(save_as.clone(), result);
         }
@@ -675,6 +716,7 @@ impl<'a> Interpreter<'a> {
         );
         let return_value = match self.run_steps(&def.run, &mut frame)? {
             Flow::Return(value) => value,
+            Flow::Finish(value) => return Ok(Flow::Finish(value)),
             Flow::Continue => Value::Null,
             Flow::Break => return Err("yaml.break.outside_loop: break 不能跳出调用方的循环".into()),
         };
@@ -809,11 +851,13 @@ mod tests {
             },
             path: path.to_string(),
             desc: String::new(),
+            source_id: None,
         }
     }
 
     fn program(run: Vec<Step>) -> Program {
         Program {
+            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run,
@@ -890,6 +934,7 @@ mod tests {
                 },
                 path: "run[1]".into(),
                 desc: String::new(),
+                source_id: None,
             },
         ]);
         let value = run(&program, &host, None).unwrap();
@@ -924,6 +969,7 @@ mod tests {
     fn if_takes_bool_and_null_only() {
         let host = FakeHost::default();
         let program = Program {
+            require_goal: false,
             trace: Value::Null,
             vars: serde_json::Map::from_iter([
                 ("flag".into(), Value::Bool(true)),
@@ -943,6 +989,7 @@ mod tests {
                     },
                     path: "run[0]".into(),
                     desc: String::new(),
+                    source_id: None,
                 },
                 Step {
                     kind: StepKind::If {
@@ -962,6 +1009,7 @@ mod tests {
                     },
                     path: "run[1]".into(),
                     desc: String::new(),
+                    source_id: None,
                 },
             ],
             functions: Default::default(),
@@ -989,6 +1037,7 @@ mod tests {
             },
             path: "run[0]".into(),
             desc: String::new(),
+            source_id: None,
         }]);
         run(&program, &host, None).unwrap();
         assert_eq!(host.calls.lock().unwrap().len(), 3);
@@ -1004,6 +1053,7 @@ mod tests {
             },
             path: "run[0]".into(),
             desc: String::new(),
+            source_id: None,
         }]);
         let error = run(&big, &host, None).unwrap_err();
         assert!(error.starts_with("STEP_BUDGET_EXCEEDED"), "{error}");
@@ -1019,6 +1069,7 @@ mod tests {
             },
             path: "run[0]".into(),
             desc: String::new(),
+            source_id: None,
         }]);
         let error = run(&program, &host, None).unwrap_err();
         assert!(error.contains("repeat"), "{error}");
@@ -1046,6 +1097,7 @@ mod tests {
             }),
         );
         let program = Program {
+            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![
@@ -1061,6 +1113,7 @@ mod tests {
                     },
                     path: "run[1]".into(),
                     desc: String::new(),
+                    source_id: None,
                 },
             ],
             functions,
@@ -1089,6 +1142,7 @@ mod tests {
             }),
         );
         let program = Program {
+            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![fn_step(
@@ -1117,6 +1171,7 @@ mod tests {
             }),
         );
         let program = Program {
+            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![fn_step("loop", None, None, "run[0]")],
@@ -1163,6 +1218,7 @@ mod tests {
                 },
                 path: "run[1]".into(),
                 desc: String::new(),
+                source_id: None,
             },
             fn_step(
                 "log",
@@ -1226,5 +1282,21 @@ mod tests {
         assert_eq!(last["ev"], "run_end");
         assert_eq!(last["ok"], false);
         assert_eq!(last["error"], error);
+    }
+    #[test]
+    fn finish_terminates_entire_task_through_nested_functions_branches_and_loops() {
+        let program:Program=serde_json::from_value(serde_json::json!({
+            "require_goal":true,
+            "functions":{"complete":{"run":[{"op":"if","cond":{"expr":"lit","value":true},"path":"complete.run[0]","then":[{"op":"repeat","times":{"expr":"lit","value":3},"path":"complete.run[0].then[0]","do":[{"op":"fn","fn":"finish","path":"complete.finish"},{"op":"fn","fn":"tap","path":"complete.must_not_tap"}]}]},{"op":"fn","fn":"fail","path":"complete.must_not_fail"}]}},
+            "run":[{"op":"fn","fn":"complete","path":"run[0]"},{"op":"fn","fn":"tap","path":"run[1]"}]
+        })).unwrap();
+        let host = FakeHost::with("finish", serde_json::json!({"goal":true}));
+        assert_eq!(
+            run(&program, &host, None).unwrap(),
+            serde_json::json!({"goal":true})
+        );
+        let calls = host.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "finish");
     }
 }

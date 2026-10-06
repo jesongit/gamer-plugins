@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn defaults_fill_missing_and_overrides_validate() {
         let decls = decls(
-            "params:\n  retry:\n    type: integer\n    default: 3\n  tag:\n    type: string\n    default: \"\"\nrun: []\n",
+            "version: 2\nparams:\n  retry:\n    type: integer\n    default: 3\n  tag:\n    type: string\n    default: \"\"\nrun: []\n",
         );
         let resolved = bind(&decls, json!({"retry": 5})).unwrap();
         assert_eq!(resolved["retry"], json!(5));
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn unknown_args_strict_for_manual_and_lenient_for_tasks() {
-        let decls = decls("params:\n  a:\n    type: string\nrun: []\n");
+        let decls = decls("version: 2\nparams:\n  a:\n    type: string\nrun: []\n");
         let errors = bind(&decls, json!({"ghost": 1})).unwrap_err();
         assert_eq!(errors[0].code, PARAM_ARGS_UNKNOWN);
         // 宽松（任务重绑）：未知键丢弃
@@ -165,7 +165,8 @@ mod tests {
 
     #[test]
     fn required_missing_reports_structured_diagnostic() {
-        let decls = decls("params:\n  who:\n    type: string\n    required: true\nrun: []\n");
+        let decls =
+            decls("version: 2\nparams:\n  who:\n    type: string\n    required: true\nrun: []\n");
         let errors = bind(&decls, json!({})).unwrap_err();
         assert_eq!(errors[0].code, PARAM_ARGS_MISSING_REQUIRED);
         assert_eq!(errors[0].field_str(), "who");
@@ -174,7 +175,7 @@ mod tests {
     #[test]
     fn domain_types_accept_both_raw_forms() {
         let decls = decls(
-            "params:\n  wait:\n    type: duration\n  at:\n    type: point\n  key:\n    type: key\nrun: []\n",
+            "version: 2\nparams:\n  wait:\n    type: duration\n  at:\n    type: point\n  key:\n    type: key\nrun: []\n",
         );
         let resolved = bind(
             &decls,

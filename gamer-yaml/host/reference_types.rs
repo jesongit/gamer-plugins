@@ -333,6 +333,7 @@ pub(super) fn script(script: &Script, library: &FunctionLibrary) -> Vec<Diagnost
         library,
         &mut out,
     );
+    script.remap_diagnostics(&mut out);
     out
 }
 
@@ -347,6 +348,9 @@ pub(super) fn functions(functions: &FunctionLibrary, library: &FunctionLibrary) 
             &mut out,
         );
     }
+    for (_, function) in functions {
+        function.remap_diagnostics(&mut out);
+    }
     out
 }
 
@@ -358,7 +362,8 @@ mod tests {
         let fixtures: Value =
             serde_json::from_str(include_str!("../tests/reference-types.json")).unwrap();
         for fixture in fixtures.as_array().unwrap() {
-            let source = fixture["source"].as_str().unwrap();
+            let source = format!("version: 2\n{}", fixture["source"].as_str().unwrap());
+            let source = source.as_str();
             let diagnostics = if fixture["kind"] == "function_library" {
                 let library = super::super::syntax::parse_function_library(source).unwrap();
                 functions(&library, &library)

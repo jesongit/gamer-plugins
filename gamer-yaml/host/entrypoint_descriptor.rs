@@ -241,7 +241,7 @@ mod tests {
             &cfg,
             "automations",
             "daily.yaml",
-            "params:\n  retry:\n    type: integer\n    default: 3\n    desc: 重试次数\nrun:\n  - log: hi\n",
+            "version: 2\nparams:\n  retry:\n    type: integer\n    default: 3\n    desc: 重试次数\nrun:\n  - log: hi\n",
         );
         let store = PackageStore::open(&cfg).unwrap();
         let payload = describe_entrypoint(&store, "com.test.app/daily.yaml").unwrap();
@@ -264,7 +264,7 @@ mod tests {
         match error {
             DescribeError::Invalid { diagnostics } => {
                 assert!(
-                    diagnostics.to_string().contains("yaml.version.removed"),
+                    diagnostics.to_string().contains("yaml.version.unsupported"),
                     "{diagnostics}"
                 );
             }
@@ -277,12 +277,12 @@ mod tests {
         use crate::scheduler::EntrypointDescriber;
         use serde_json::{json, Map};
         let (cfg, _dir) = store_dir("bind");
-        write(&cfg, "automations", "_function.yaml", "functions:\n  claim:\n    params:\n      count:\n        type: integer\n        default: 3\n    run:\n      - log: hi\n");
+        write(&cfg, "automations", "_function.yaml", "version: 2\nfunctions:\n  claim:\n    params:\n      count:\n        type: integer\n        default: 3\n    run:\n      - log: hi\n");
         write(
             &cfg,
             "automations",
             "daily.yaml",
-            "params:\n  who:\n    type: string\n    required: true\nrun:\n  - log: hi\n",
+            "version: 2\nparams:\n  who:\n    type: string\n    required: true\nrun:\n  - log: hi\n",
         );
         let describer = StoreEntrypointDescriber::new(Arc::new(PackageStore::open(&cfg).unwrap()));
         assert_eq!(
@@ -324,7 +324,7 @@ mod tests {
             &cfg,
             "automations",
             "_function.yaml",
-            "functions:\n  claim:\n    params:\n      timeout:\n        type: duration\n        default: 5s\n    run:\n      - log: hi\n",
+            "version: 2\nfunctions:\n  claim:\n    params:\n      timeout:\n        type: duration\n        default: 5s\n    run:\n      - log: hi\n",
         );
         let store = PackageStore::open(&cfg).unwrap();
         let payload = describe_entrypoint(&store, "com.test.app#claim").unwrap();
@@ -336,7 +336,7 @@ mod tests {
             &cfg,
             "automations",
             "_function_battle.yaml",
-            "functions:\n  attack:\n    run:\n      - return: true\n",
+            "version: 2\nfunctions:\n  attack:\n    run:\n      - return: true\n",
         );
         let payload = describe_entrypoint(&store, "com.test.app#attack").unwrap();
         assert_eq!(payload["kind"], "function");

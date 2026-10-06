@@ -211,6 +211,23 @@ pub(super) fn yaml_lines(
 mod tests {
     use super::*;
 
+    fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
+        let source = if source.trim_start().starts_with("version:") {
+            source.to_string()
+        } else {
+            format!("version: 2\n{source}")
+        };
+        super::super::parse_script(&source)
+    }
+    fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
+        let source = if source.trim_start().starts_with("version:") {
+            source.to_string()
+        } else {
+            format!("version: 2\n{source}")
+        };
+        super::super::parse_function_library(&source)
+    }
+
     const SOURCE: &str = "run:\n  - match_templates:\n      cases:\n        - template: old.png\n          as: hit\n          do:\n            - tap: $hit.center\n        - template: $other\n          do: []\n      else:\n        - log: missing\n";
 
     #[test]
@@ -230,10 +247,16 @@ mod tests {
             calls,
             BTreeSet::from(["find_any".into(), "tap".into(), "log".into()])
         );
-        let renamed = rename_template_source(SOURCE, "old.png", "old.png", "new.png", "new.png")
-            .unwrap()
-            .unwrap()
-            .0;
+        let renamed = rename_template_source(
+            &format!("version: 2\n{SOURCE}"),
+            "old.png",
+            "old.png",
+            "new.png",
+            "new.png",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         assert!(renamed.contains("new.png") && renamed.contains("$other"));
         assert!(parse_script(&renamed).is_ok());
         let library = format!(

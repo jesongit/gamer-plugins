@@ -23,7 +23,7 @@ fn split_libraries_reject_duplicate_names_and_removed_references() {
             "qa",
             YAML_EXTENSION_ID,
             file,
-            "functions:\n  helper:\n    run: []\n",
+            "version: 2\nfunctions:\n  helper:\n    run: []\n",
             None,
             false,
         )
@@ -33,12 +33,13 @@ fn split_libraries_reject_duplicate_names_and_removed_references() {
             "qa",
             YAML_EXTENSION_ID,
             "automations/main.yaml",
-            "run:\n  - helper: {}\n",
+            "version: 2\nrun:\n  - helper: {}\n",
             None,
             false,
         )
         .unwrap();
-    let error = validate_function_library_file(&store, "qa", file, "functions: {}\n").unwrap_err();
+    let error = validate_function_library_file(&store, "qa", file, "version: 2\nfunctions: {}\n")
+        .unwrap_err();
     assert_eq!(error[0]["code"], "yaml.functions.referenced");
     assert!(error[0]["message"].as_str().unwrap().contains("main.yaml"));
     assert!(error[0]["message"]
@@ -49,14 +50,16 @@ fn split_libraries_reject_duplicate_names_and_removed_references() {
         &store,
         "qa",
         "automations/_function.yaml",
-        "functions:\n  helper:\n    run: []\n",
+        "version: 2\nfunctions:\n  helper:\n    run: []\n",
     )
     .unwrap_err();
     assert_eq!(duplicate[0]["code"], "yaml.fn.duplicate");
     store
         .delete_resource("qa", YAML_EXTENSION_ID, "automations/main.yaml")
         .unwrap();
-    assert!(validate_function_library_file(&store, "qa", file, "functions: {}\n").is_ok());
+    assert!(
+        validate_function_library_file(&store, "qa", file, "version: 2\nfunctions: {}\n").is_ok()
+    );
 }
 
 #[test]
@@ -75,7 +78,8 @@ fn removed_function_references_identify_callers_and_nested_steps() {
         })
         .unwrap();
     let file = "automations/_function.yaml";
-    let remaining = r#"functions:
+    let remaining = r#"version: 2
+functions:
   账号日常:
     run:
       - log: start
@@ -105,7 +109,7 @@ fn removed_function_references_identify_callers_and_nested_steps() {
             "qa",
             YAML_EXTENSION_ID,
             "automations/_function_extra.yaml",
-            "functions:\n  另一个函数:\n    run:\n      - 账号登录: {}\n",
+            "version: 2\nfunctions:\n  另一个函数:\n    run:\n      - 账号登录: {}\n",
             None,
             false,
         )
@@ -115,7 +119,7 @@ fn removed_function_references_identify_callers_and_nested_steps() {
             "qa",
             YAML_EXTENSION_ID,
             "automations/daily.yaml",
-            "name: 每日自动化\nrun:\n  - 账号登录: {}\n",
+            "version: 2\nname: 每日自动化\nrun:\n  - 账号登录: {}\n",
             None,
             false,
         )

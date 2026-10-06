@@ -47,6 +47,23 @@ pub(super) fn validate(
 mod tests {
     use super::*;
 
+    fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
+        let source = if source.trim_start().starts_with("version:") {
+            source.to_string()
+        } else {
+            format!("version: 2\n{source}")
+        };
+        super::super::parse_script(&source)
+    }
+    fn parse_function_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnostic>> {
+        let source = if source.trim_start().starts_with("version:") {
+            source.to_string()
+        } else {
+            format!("version: 2\n{source}")
+        };
+        super::super::parse_function_library(&source)
+    }
+
     #[test]
     fn break_roundtrip_and_scope() {
         let source = "run:\n  - repeat: 3\n    do:\n      - if: true\n        then:\n          - break: {}\n";
