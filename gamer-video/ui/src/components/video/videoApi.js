@@ -1,8 +1,7 @@
 // 视频工作台 REST 封装（实施合同：docs/plans/gamer_video_workbench_contracts.md §1/§2/§6）。
 //
 // 合同 §4：为解除与 api.js（C 属地）的并行时序耦合，D2 在本目录自建 fetch 直调封装；
-// 端点形态逐字对齐合同 §1（媒体）/§2（录制），草稿走既有扩展调用通路
-// POST /api/extensions/gamer-yaml/call（action = automation.create_draft，合同 §5）。
+// 媒体/录制复用 Core REST；素材制作走 gamer-video 公开动作，模板制作走 gamer-yaml 公开动作。
 // 同源 Cookie 鉴权默认携带（SameSite=Strict，不设 credentials、不引 CSRF token，
 // 与 api.js/auth.js 同一口径）；401 交给 auth.js 全站拦截。
 // 集成者后续可决定是否把本封装收编进 api.js。
@@ -295,41 +294,21 @@ export const videoApi = {
     return Array.isArray(rep?.events) ? rep.events : []
   },
 
-  /**
-   * 生成 YAML 草稿（合同 §5 + Phase 7 §10.3）：走动作清单缝
-   * POST /api/extensions/gamer-yaml/call，action = automation.create_draft；
-   * `comments` = 事件 id → 注释文本（服务端渲染为步骤上方注释行）。
-   * 返回数据取 guest 结果的 `data` 字段
-   * `{yaml, diagnostics:[{event_id,reason}], source:{recording_id,events}}`
-   * （结果未包 data 信封时按原结果兜底）。草稿只是文本返回：不落盘、不执行。
-   */
-  createVideoDraft: async (recordingId, eventIds, comments = null) => {
-    const values = {
-      recording_id: requireId(recordingId, 'recording_id'),
-      event_ids: (Array.isArray(eventIds) ? eventIds : []).map(id => String(id)),
-    }
-    if (comments && typeof comments === 'object') {
-      values.comments = Object.fromEntries(
-        Object.entries(comments).map(([id, text]) => [String(id), String(text ?? '')]),
-      )
-    }
-    return callGamerYamlAction('automation.create_draft', values)
+  // Samples are video-owned evidence. Script generation belongs to automation.
+  listSamples: async packageId => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.list', values: { package_id: requireId(packageId, 'package_id') } })
+    return (result?.data || result)?.samples || []
   },
-
-  /**
-   * 保存草稿为 automations 脚本（Phase 7 §10.3，动作清单 automation.save_draft）：
-   * 服务端 v3 保存钩子校验（非 v3 结构化拒绝）+ 重名需 overwrite。
-   * 返回 `{id:"<pkg>/<name>.yaml", path, package_id}`。
-   */
-  saveDraft: async ({ packageId, name, yaml, overwrite = false }) => callGamerYamlAction(
-    'automation.save_draft',
-    {
-      package_id: requireId(packageId, 'package_id'),
-      name: requireId(name, 'name'),
-      yaml: String(yaml ?? ''),
-      overwrite: overwrite === true,
-    },
-  ),
+  createSample: async values => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.create', values })
+    return result?.data || result
+  },
+  readSample: async (packageId, sampleId) => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.read', values: { package_id: requireId(packageId, 'package_id'), sample_id: requireId(sampleId, 'sample_id') } })
+    return result?.data || result
+  },
+  sampleUrl: (packageId, sampleId) => `/api/packages/${encodeURIComponent(requireId(packageId, 'package_id'))}/plugins/${GAMER_VIDEO_PLUGIN_ID}/resources/samples/${encodeURIComponent(requireId(sampleId, 'sample_id'))}.gamersample`,
+  importSample: async (packageId, sampleId, bytes) => request('PUT', `/api/packages/${encodeURIComponent(requireId(packageId, 'package_id'))}/plugins/${GAMER_VIDEO_PLUGIN_ID}/resources/samples/${encodeURIComponent(requireId(sampleId, 'sample_id'))}.gamersample`, bytes, { raw: true, contentType: 'application/octet-stream' }),
 
   /**
    * 从确定帧创建模板（Phase 7 §10.2，动作清单 template.create_from_frame）：

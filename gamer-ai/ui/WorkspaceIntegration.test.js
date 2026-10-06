@@ -30,3 +30,17 @@ it('只有主对话，设置抽屉不会另建游玩输入，记忆引用与包�
     expect(wrapper.findComponent(Chat).props('packageId')).toBe('other')
   } finally {wrapper.unmount()}
 })
+
+it('自动化导航只附加同配置包引用，包切换立即清除', async () => {
+  const {pluginMessageChannel}=await import('../../../web/src/workspace/plugin-messages')
+  const request=pluginMessageChannel('gamer-ai:automation-context'),context=reactive({currentPackageId:'default'})
+  const Chat=defineComponent({name:'AgentConversation',props:['automationContext','packageId'],template:'<section />'})
+  Object.assign(request,{packageId:'default',automation:{script_id:'daily.yaml',run_id:'run-1'},seq:request.seq+1})
+  const wrapper=mount(AiWorkspace,{global:{provide:{[WORKSPACE_CONTEXT_KEY]:{getSnapshot:()=>context}},stubs:{AgentConversation:Chat,GameSessionPane:true,MemoryLibrary:true,ServiceSettings:true}}})
+  try {
+    expect(wrapper.findComponent(Chat).props('automationContext')).toEqual({script_id:'daily.yaml',run_id:'run-1'})
+    Object.assign(request,{packageId:'foreign',automation:{script_id:'secret.yaml'},seq:request.seq+1});await flushPromises()
+    expect(wrapper.findComponent(Chat).props('automationContext').script_id).toBe('daily.yaml')
+    context.currentPackageId='other';await flushPromises();expect(wrapper.findComponent(Chat).props('automationContext')).toBe(null)
+  } finally {wrapper.unmount();Object.assign(request,{packageId:'',automation:null,seq:request.seq+1})}
+})

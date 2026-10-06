@@ -2,6 +2,7 @@ import type { ParamDecl } from './model'
 
 /** 离线预览的中文名称；与原生目录 name 参数默认值由契约测试校验。 */
 export const NATIVE_CALL_NAMES: Record<string, string> = {
+  trace: '图片记录', fail: '明确失败', observe: '观察视觉目标', finish: '验证完成画面',
   tap: '点击', swipe: '滑动', key: '按键', input_text: '输入文本',
   launch: '启动应用', stop_app: '停止应用', sleep: '等待', log: '日志',
   find: '查找模板', find_any: '查找首个模板', wait_find: '等待模板出现', tap_template: '点击模板',

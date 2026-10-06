@@ -11,6 +11,10 @@
       <span v-if="target && target !== journal.record.entrypoint" class="other-target">此记录来自其他脚本或函数</span>
       <div class="run-counts"><span>{{ steps.length }} 个执行动作</span><span>成功 {{ counts.success }}</span><span v-if="counts.running">运行中 {{ counts.running }}</span><span v-if="counts.failed" class="failed">失败 {{ counts.failed }}</span><span v-if="counts.cancelled">停止 {{ counts.cancelled }}</span></div>
     </div>
+    <div class="trace-toolbar"><button class="btn btn-sm" :disabled="!journal.record" @click="showTrace = !showTrace">图像证据 ({{ trace.images.length }})</button><button class="btn btn-sm" :disabled="!journal.record || !aiAvailable || sendingContext" :title="aiAvailable ? '附上当前运行供 AI 只读分析' : 'AI 助手未运行'" @click="sendToAi">交给 AI 分析</button><button class="btn btn-sm" :disabled="!journal.record?.finished_at || !trace.images.length || trace.status === 'retained' || retaining" @click="retainTrace">{{ trace.status === 'retained' ? '证据已保留' : '长期保留证据' }}</button><span v-if="trace.status === 'expired'">证据已过期</span><span v-else-if="!trace.enabled">Trace 关闭</span><span v-if="trace.gaps.length">{{ trace.gaps.length }} 处证据缺口</span></div>
+    <RunTraceImages v-if="showTrace" class="run-trace" :run-id="journal.selected" :images="trace.images" :status="trace.status" :enabled="trace.enabled" :gaps="trace.gaps" />
+    <p v-if="trace.error" class="failure-text">{{ trace.error }}</p>
+    <button v-if="showTrace && trace.hasMore" class="btn btn-sm" :disabled="trace.loading" @click="trace.refresh">加载更多图像</button>
     <div v-if="journal.error" class="failure-text" role="alert">{{ journal.error }}</div>
     <div v-if="journal.record?.error" class="failure-text">{{ journal.record.error }}</div>
     <div class="timeline-toolbar">
@@ -28,19 +32,49 @@
       <p v-if="!visibleRows.length" class="empty">{{ rows.length ? '没有符合筛选条件的记录。' : journal.loading ? '正在读取运行详情…' : journal.record?.state === 'starting' ? '正在准备设备与执行环境…' : journal.record ? '本次运行没有步骤记录。' : '运行脚本后在这里查看步骤、匹配结果和日志。' }}</p>
       <p v-if="journal.hasMore" class="empty">正在读取后续记录…</p>
     </div>
-    <RunJournalInspector v-if="selectedRow" :key="journal.selected" :row="selectedRow" :now="clock" @close="selectedEvent = null" @locate="$emit('locate', $event)" />
+    <RunJournalInspector v-if="selectedRow" :key="journal.selected" :row="selectedRow" :now="clock" :run-id="journal.selected" :images="trace.images" :trace-status="trace.status" :trace-enabled="trace.enabled" :trace-gaps="trace.gaps" @close="selectedEvent = null" @locate="$emit('locate', trace.snapshot ? { ...$event, source_snapshot: trace.snapshot } : $event)" />
     <div class="details-footer"><span :title="journal.selected">已加载 {{ journal.events.length }} 条事件{{ journal.hasMore ? ' · 继续加载中' : ' · 服务端保存' }}</span><button class="btn btn-sm" @click="scrollStart">查看开头</button><button class="btn btn-sm" @click="resumeFollow">{{ follow && !filtering ? '正在跟随最新记录' : '回到最新' }}</button></div>
   </section>
 </template>
 <script setup>
-import { computed, nextTick, onScopeDispose, reactive, ref, toRef, watch } from 'vue'
+import { computed, inject, nextTick, onScopeDispose, reactive, ref, toRef, watch } from 'vue'
 import { useRunJournal } from './useRunJournal'
 import { actionRunRows, buildRunTree, filterRunRows, flattenRunTree, stateText } from './run-journal'
+import { api } from '../../../../../../web/src/api'
+import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
+import { requestAutomationContext } from './automationAiBridge'
+import { useRunTrace } from './useRunTrace'
+import RunTraceImages from './RunTraceImages.vue'
 import RunJournalRow from './RunJournalRow.vue'
 import RunJournalInspector from './RunJournalInspector.vue'
 const props = defineProps({ deviceId: String, target: String, liveRun: String, visible: { type: Boolean, default: true } })
 defineEmits(['edit', 'locate'])
 const journal = reactive(useRunJournal(toRef(props, 'deviceId'), toRef(props, 'liveRun'), toRef(props, 'visible')))
+const trace = reactive(useRunTrace(toRef(journal, 'selected'), toRef(props, 'visible')))
+const retaining = ref(false)
+async function retainTrace() {
+  const id = journal.selected; retaining.value = true
+  try { await api.retainRunTrace(id); if (id === journal.selected) await trace.refresh() } catch (e) { if (id === journal.selected) journal.error = e.message } finally { retaining.value = false }
+}
+const showTrace = ref(false), aiAvailable = ref(false), sendingContext = ref(false), workspace = inject(WORKSPACE_CONTEXT_KEY, null)
+let aiCheck = 0
+watch(() => props.visible, async visible => {
+  if (!visible) return
+  const request = ++aiCheck
+  try { const list = await api.listExtensions(); if (request === aiCheck) aiAvailable.value = (Array.isArray(list) ? list : list.extensions || []).some(item => item.id === 'gamer-ai' && item.state === 'running') } catch { if (request === aiCheck) aiAvailable.value = false }
+}, { immediate: true })
+onScopeDispose(() => { aiCheck++ })
+async function sendToAi() {
+  const record = journal.record
+  if (!record || !aiAvailable.value) return
+  const entrypoint = String(record.entrypoint || '')
+  const pkg = record.content_package || (record.runner_id === 'gamer-yaml' ? entrypoint.split('/')[0] : '')
+  if (!pkg) { journal.error = '该运行不属于可分析的 YAML 自动化'; return }
+  if (!entrypoint.startsWith(`${pkg}/`)) { journal.error = '请选择脚本运行记录以附加自动化上下文'; return }
+  if (workspace?.getSnapshot?.().currentPackageId !== pkg) { journal.error = `请先切换到运行所属配置包 ${pkg}，避免跨包分析`; return }
+  sendingContext.value = true
+  try { requestAutomationContext(pkg, { script_id: entrypoint.slice(pkg.length + 1), run_id: record.run_id }); await workspace?.uiBridge.workspace.openPanel('gamer-ai:ai') } catch (e) { journal.error = e.message } finally { sendingContext.value = false }
+}
 const tree = computed(() => buildRunTree(journal.events, journal.hasMore ? null : journal.record))
 const rows = computed(() => flattenRunTree(tree.value))
 const steps = computed(() => actionRunRows(rows.value).filter(row => row.node.kind === 'step'))
@@ -70,6 +104,6 @@ async function copy() {
 }
 </script>
 <style scoped>
-.run-details-view{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;gap:8px}.details-toolbar,.details-footer,.run-summary,.timeline-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.details-toolbar .select{flex:1;min-width:140px;max-width:100%}.details-stream{flex:1;min-height:0;overflow:auto;overflow-anchor:none;border:1px solid var(--border);border-radius:4px}.run-summary{font-size:13px;padding:10px;background:var(--bg-0);border-radius:6px}.run-target{flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.other-target{flex-basis:100%;font-size:12px;color:var(--text-2)}.run-counts{display:flex;gap:12px;flex-basis:100%;font-size:12px;color:var(--text-2);flex-wrap:wrap}.failed,.failure-text{color:var(--danger)}.success{color:var(--ok)}.running,.starting{color:var(--accent)}.failure-text{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:100px;overflow:auto}.log-search{flex:1;min-width:160px;width:0}.issue-filter{display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;cursor:pointer}.issue-filter input{accent-color:var(--accent)}.timeline-hint,.details-footer{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--text-2)}.empty{color:var(--text-2);padding:16px;font-size:13px}
+.trace-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--text-2)}.run-trace{max-height:45%;overflow:auto;padding:8px;border:1px solid var(--border)}.run-details-view{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;gap:8px}.details-toolbar,.details-footer,.run-summary,.timeline-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.details-toolbar .select{flex:1;min-width:140px;max-width:100%}.details-stream{flex:1;min-height:0;overflow:auto;overflow-anchor:none;border:1px solid var(--border);border-radius:4px}.run-summary{font-size:13px;padding:10px;background:var(--bg-0);border-radius:6px}.run-target{flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.other-target{flex-basis:100%;font-size:12px;color:var(--text-2)}.run-counts{display:flex;gap:12px;flex-basis:100%;font-size:12px;color:var(--text-2);flex-wrap:wrap}.failed,.failure-text{color:var(--danger)}.success{color:var(--ok)}.running,.starting{color:var(--accent)}.failure-text{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:100px;overflow:auto}.log-search{flex:1;min-width:160px;width:0}.issue-filter{display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;cursor:pointer}.issue-filter input{accent-color:var(--accent)}.timeline-hint,.details-footer{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--text-2)}.empty{color:var(--text-2);padding:16px;font-size:13px}
 .journal-table{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0}.time-column{width:76px}.state-column{width:62px}.duration-column{width:58px}.journal-table th{position:sticky;top:0;z-index:1;text-align:left;background:var(--bg-2);border-bottom:1px solid var(--border);font-weight:500;font-size:12px;color:var(--text-2);padding:8px}.journal-table .duration-heading{text-align:right}.view-switch{display:flex;flex:none;border:1px solid var(--border);border-radius:4px;overflow:hidden}.view-switch button{font:inherit;font-size:12px;cursor:pointer;border:0;padding:5px 9px;background:var(--bg-0);color:var(--text-2)}.view-switch button.active{background:var(--bg-3);color:var(--accent)}.view-switch button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}.details-footer>span{margin-right:auto}.timeline-hint>span:last-child{flex:none}.timeline-hint>span:first-child{min-width:0}@container(max-width:420px){.time-column{width:68px}.state-column{width:54px}.duration-column{width:48px}}.run-details-view{container-type:inline-size}
 </style>

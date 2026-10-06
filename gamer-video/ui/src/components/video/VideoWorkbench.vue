@@ -124,8 +124,8 @@
             data-testid="project-save"
             @click="saveProject"
           >{{ saving ? '保存中…' : '保存项目' }}</button>
-          <button v-if="projectRecording?.recording_id" class="btn btn-sm" type="button" data-testid="project-open-draft" :disabled="!projectCanDraft" :title="projectCanDraft ? '' : '录制未结束、没有操作记录或记录已丢失'" @click="openDraft">
-            生成脚本
+          <button v-if="projectRecording?.recording_id" class="btn btn-sm" type="button" data-testid="project-open-sample" :disabled="!projectCanSample" :title="projectCanSample ? '' : '录制未结束、没有操作记录或记录已丢失'" @click="openSample">
+            制作素材包
           </button>
         </div>
 
@@ -145,16 +145,13 @@
       <div v-else class="zone-empty" data-testid="project-detail-empty">选择一个项目进行制作（打开项目会联动左侧画面来源）</div>
     </template>
 
-    <div v-if="draftVisited" v-show="activeTab === 'draft'">
-      <VideoDraft
-        :active="activeTab === 'draft'"
+    <div v-if="sampleVisited" v-show="activeTab === 'sample'">
+      <VideoSamples
+        :active="activeTab === 'sample'"
         :recordings="recordings"
         :recordings-error="recordingsError"
-        :recording-id="draftRecordingId"
+        :recording-id="sampleRecordingId"
         :package-id="packageId"
-        :device-id="draftDeviceId"
-        :android-package-name="draftAndroidPackageName"
-        :yaml-ready="yamlReady"
         @update:recording-id="onRecordingIdUpdate"
         @refresh-recordings="loadRecordings"
         @open-library="activeTab = 'library'"
@@ -178,7 +175,7 @@
 <script setup>
 import { useOperationStatus } from '../../../../../../web/src/components/ui/useOperationStatus'
 // 视频工作台宿主（gamer-video core 面板，Phase 6 重组）：
-// - 子导航「素材库 | 项目 | 草稿」——按真实职责拆分，不新增 Core 永久页签；
+// - 子导航「素材库 | 项目 | 演示素材」——按真实职责拆分，不新增 Core 永久页签；
 // - 项目 = Package 资源（projects/<id>.json），乐观并发保存；损坏项目可诊断；
 // - 打开项目联动左侧舞台切到主媒体（requestStageMedia：只动舞台来源，
 //   不改 deviceId/androidPackageName/currentPackageId 四 Context）；
@@ -187,13 +184,13 @@ import { useOperationStatus } from '../../../../../../web/src/components/ui/useO
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import MediaLibrary from './MediaLibrary.vue'
 import TemplateStudio from './TemplateStudio.vue'
-import VideoDraft from './VideoDraft.vue'
+import VideoSamples from './VideoSamples.vue'
 import VideoProjects from './VideoProjects.vue'
 import VideoTimeline from './VideoTimeline.vue'
 import { requestStageMedia } from '../../../../../../web/src/components/console/useConsoleStage'
 import { STAGE_MEDIA_CONTROLLER_KEY } from '../../../../../../web/src/workspace/context'
 import { api } from '../../../../../../web/src/api'
-import { devicesData, store, templatesData } from '../../../../../../web/src/store'
+import { devicesData, templatesData } from '../../../../../../web/src/store'
 import { packageStore, selectPackage } from '../../../../../../web/src/package-store'
 import { GAMER_VIDEO_PLUGIN_ID } from '../../../../../../web/src/gamer-plugin-ids'
 import { videoApi } from './videoApi'
@@ -203,7 +200,7 @@ import { assetStatus, newProject, parseProject, projectMediaIds, projectIdFromPa
 const TABS = [
   { key: 'library', label: '素材库' },
   { key: 'projects', label: '项目' },
-  { key: 'draft', label: '草稿' },
+  { key: 'sample', label: '演示素材' },
 ]
 
 // 当前 Package（数据上下文，plan §39）：面板自取（registry 契约 = 自包含组件，
@@ -212,34 +209,16 @@ const packageId = computed(() => packageStore.currentPackageId)
 
 // Device/App 是运行上下文，不从 Package 或项目资源 id 推导。录制来源若带有
 // 真实 device_id，则优先沿用该设备；否则仅使用当前控制台设备的实际配置 pkg。
-const currentDevice = computed(() => devicesData.value.find(device => (
-  String(device?.id || '') === String(store.deviceId || '')
-)) || null)
-const currentDeviceId = computed(() => String(store.deviceId || '').trim())
-const currentAndroidPackageName = computed(() => String(currentDevice.value?.pkg || '').trim())
 const recordingContext = ref(null) // { recordingId, deviceId, androidPackageName }
-const draftDeviceId = computed(() => {
-  const source = recordingContext.value
-  return source?.recordingId === recordingId.value && source.deviceId
-    ? source.deviceId
-    : currentDeviceId.value
-})
-const draftAndroidPackageName = computed(() => {
-  const source = recordingContext.value
-  return source?.recordingId === recordingId.value && source.deviceId
-    ? source.androidPackageName
-    : currentAndroidPackageName.value
-})
-
 const activeTab = ref('library')
 const sharedStage = inject(STAGE_MEDIA_CONTROLLER_KEY, null)
-const draftVisited = ref(false)
+const sampleVisited = ref(false)
 const projectsPanel = ref(null)
 const recordings = ref([])
 const recordingsError = ref('')
 let recordingRequestSeq = 0
 watch(activeTab, tab => {
-  if (tab === 'draft') { draftVisited.value = true; void loadRecordings() }
+  if (tab === 'sample') { sampleVisited.value = true; void loadRecordings() }
 })
 const mediaList = ref([])
 const loading = ref(false)
@@ -247,7 +226,7 @@ const mediaLoadError = ref('')
 let mediaRequestSeq = 0
 const selectedId = ref('')
 const recordingId = ref('')
-const draftRecordingId = ref('')
+const sampleRecordingId = ref('')
 
 // ---- 项目状态 ----
 const projectsLoading = ref(false)
@@ -278,7 +257,7 @@ let lastAssetEvent = null
 let restoringPackage = false
 
 // ---------- gamer-yaml 依赖门禁（§10.1）+ 模板工作台（§10.2） ----------
-// gamer-yaml 未 Running：模板创建/离线测试/草稿生成保存禁用并提示依赖；
+// gamer-yaml 未 Running：模板创建/离线测试/演示素材生成保存禁用并提示依赖；
 // 视频导入/录制/播放/标记/项目/校准不受影响。
 const { ready: yamlReady, start: startYamlWatch, stop: stopYamlWatch } = useYamlCapability()
 const studio = ref(null) // {media, frame:{frameIndex, ptsUs}}
@@ -307,7 +286,7 @@ const primaryAssetId = computed(() => openAsset.value?.media_id || '')
 const primaryMedia = computed(() => mediaList.value.find(media => media.id === primaryAssetId.value) || null)
 const primaryMissing = computed(() => !!openProject.value && !primaryMedia.value)
 const projectRecording = computed(() => openProject.value?.recording || recordingForMedia(primaryAssetId.value))
-const projectCanDraft = computed(() => {
+const projectCanSample = computed(() => {
   const record = recordings.value.find(row => row.id === projectRecording.value?.recording_id)
   return !!record && record.event_count > 0 && record.events_available !== false && !['recording', 'finalizing'].includes(record.state)
 })
@@ -384,9 +363,9 @@ function onRecordingSelected(record) {
   // MediaLibrary 只有在后端确实返回 session id 时才发出该事件；不在这里
   // 根据 media_id 或名称拼造 recording id。
   if (!id) return
-  // 先让草稿处理未保存保护；只有它接受来源并回传后才切换设备上下文。
-  draftRecordingId.value = id
-  activeTab.value = 'draft'
+  // 先让演示素材处理未保存保护；只有它接受来源并回传后才切换设备上下文。
+  sampleRecordingId.value = id
+  activeTab.value = 'sample'
 }
 
 function setRecordingSource(id, meta = {}) {
@@ -399,13 +378,13 @@ function setRecordingSource(id, meta = {}) {
     androidPackageName: normalizeId(device?.pkg || previous?.androidPackageName),
   }
   recordingId.value = id
-  draftRecordingId.value = id
+  sampleRecordingId.value = id
 }
 
 function onRecordingIdUpdate(value) {
   const next = normalizeId(value)
   recordingId.value = next
-  draftRecordingId.value = next
+  sampleRecordingId.value = next
   if (recordingContext.value?.recordingId !== next) {
     setRecordingSource(next, recordings.value.find(record => record.id === next))
   }
@@ -896,8 +875,8 @@ function onSaveCalibration(next) {
   projectDirty.value = true
 }
 
-function openDraft() {
-  if (projectRecording.value?.recording_id && projectCanDraft.value) {
+function openSample() {
+  if (projectRecording.value?.recording_id && projectCanSample.value) {
     onRecordingSelected(recordings.value.find(record => record.id === projectRecording.value.recording_id))
   }
 }

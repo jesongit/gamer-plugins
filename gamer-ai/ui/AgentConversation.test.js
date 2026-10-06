@@ -485,3 +485,15 @@ it('当前设备变化仅更新消息上下文，攻略不被其他设备或外�
   expect(wrapper.emitted('settings').at(-1)).toEqual(['mcp'])
   expect(mocks.call.mock.calls.some(call=>call[1]==='session.start'||call[1]==='session.resume')).toBe(false)
 })
+
+it('附加自动化在有设备时仍只发送限定上下文，不启动或恢复游玩', async()=>{
+  const wrapper=await create({automationContext:{script_id:'daily.yaml',run_id:'trace-1',candidate_id:'candidate-1'}})
+  await wrapper.get('[aria-label="Agent 消息"]').setValue('先读取脚本和失败证据，解释原因，修改请先提出候选')
+  await wrapper.get('.composer form').trigger('submit');await flushPromises()
+  expect(mocks.call).toHaveBeenCalledWith('gamer-ai','conversation.message',expect.objectContaining({
+    device_id:'',automation:{script_id:'daily.yaml',run_id:'trace-1',candidate_id:'candidate-1'},
+  }))
+  expect(wrapper.text()).toContain('候选修改需审核后保存')
+  expect(mocks.call.mock.calls.some(call=>['session.start','session.resume','generation.save','generation.rollback'].includes(call[1]))).toBe(false)
+  await button(wrapper,'移除').trigger('click');expect(wrapper.emitted('detach-automation')).toHaveLength(1)
+})

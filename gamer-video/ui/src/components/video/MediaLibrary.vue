@@ -142,11 +142,11 @@
           <span class="tag" :class="stateTagClass(record.state)">{{ stateLabel(record.state) }}</span>
           <span class="row-actions">
             <button class="mini-btn" type="button" data-testid="recording-history-select" @click.stop="selectHistory(record)">详情</button>
-            <button class="mini-btn" type="button" data-testid="recording-history-draft" :disabled="!canDraft(record.session)" :title="draftReason(record.session)" @click.stop="$emit('recording-selected', record.session)">生成脚本</button>
+            <button class="mini-btn" type="button" data-testid="recording-history-sample" :disabled="!canSample(record.session)" :title="sampleReason(record.session)" @click.stop="$emit('recording-selected', record.session)">制作素材包</button>
             <button class="mini-btn danger" type="button" data-testid="recording-history-delete" :disabled="!canDelete(record) || deletingHistory" :title="canDelete(record) ? '删除历史和操作记录，不删除视频' : '请先结束录制并在素材库删除关联视频'" @click.stop="removeHistory(record)">{{ armedHistoryId === record.sessionId ? '确认删除' : '删除历史' }}</button>
           </span>
           <details class="history-segments" @click.stop>
-            <summary>{{ record.media.id ? `${record.session.segments.length} 个视频片段` : '视频已不存在或未生成' }} · {{ draftReason(record.session) || `${record.session.event_count} 条操作记录` }}</summary>
+            <summary>{{ record.media.id ? `${record.session.segments.length} 个视频片段` : '视频已不存在或未生成' }} · {{ sampleReason(record.session) || `${record.session.event_count} 条操作记录` }}</summary>
             <p v-if="record.session.error">{{ record.session.error }}</p>
             <div v-for="(segment, index) in record.session.segments" :key="segment.media_id">
               <span>片段 {{ index + 1 }} · {{ segmentReason(segment.reason) }} · {{ fmtDuration(segment.duration_us) }}</span>
@@ -171,7 +171,7 @@
       <div v-if="currentRecording.error" class="history-event-error" data-testid="recording-terminal-error">{{ currentRecording.error }}</div>
       <div v-if="eventLoading" class="list-empty" data-testid="recording-events-loading">读取事件…</div>
       <div v-else-if="eventError" class="history-event-error" role="alert" data-testid="recording-events-error">{{ eventError }}</div>
-      <div v-else-if="eventsLoaded && !eventRows.length" class="list-empty" data-testid="recording-events-empty">没有操作记录，无法生成脚本。视频仍可预览和制作模板；开始录制后在投屏中操作，才会记录点击、滑动等事件。</div>
+      <div v-else-if="eventsLoaded && !eventRows.length" class="list-empty" data-testid="recording-events-empty">没有操作记录，无法制作素材包。视频仍可预览和制作模板；开始录制后在投屏中操作，才会记录点击、滑动等事件。</div>
       <div v-else-if="eventsLoaded" class="event-list" data-testid="recording-events-list">
         <div v-for="item in eventRows" :key="item.eventId" class="event-row">
           <span class="mono">{{ item.timelineLabel }}</span>
@@ -489,10 +489,10 @@ function selectHistory(record) {
   }
 }
 
-function canDraft(record) {
+function canSample(record) {
   return !['recording', 'finalizing'].includes(record.state) && record.event_count > 0 && record.events_available !== false
 }
-function draftReason(record) {
+function sampleReason(record) {
   if (['recording', 'finalizing'].includes(record.state)) return '请先结束录制'
   if (!record.event_count) return '无操作记录'
   if (record.events_available === false) return '操作记录已丢失'
@@ -522,7 +522,7 @@ async function removeHistory(record) {
 async function loadEvents(recording) {
   if (recording?.events_available === false) {
     eventsSeq++; eventLoading.value = false; eventsLoaded.value = true; eventRows.value = []
-    eventError.value = recording.event_count > 0 ? '操作记录已丢失，无法查看或生成脚本' : ''
+    eventError.value = recording.event_count > 0 ? '操作记录已丢失，无法查看或制作素材包' : ''
     return
   }
   const id = String(recording?.id || '').trim()

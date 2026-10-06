@@ -1,6 +1,7 @@
 <script setup>
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
+import { pluginMessageChannel } from '../../../web/src/workspace/plugin-messages'
 import { WORKSPACE_CONTEXT_KEY } from '../../../web/src/workspace/context'
 import { budgetValue, displayTime, eventDetails, isActive, stateLabel, tokenUsage, usageValue } from './ai-format'
 import { conversationTurns, DELIVERY_LABELS, diagnosticCategory, mergeEvents, safeDiagnostic } from './conversation-format'
@@ -10,10 +11,16 @@ import AgentMarkdown from './AgentMarkdown.vue'
 import RequestContext from './RequestContext.vue'
 import {DEFAULT_LIMITS,LIMIT_FIELDS,validLimits} from './budget-format'
 
-const props = defineProps({ packageId: { type: String, default: '' }, attachedMemory: { type: Array, default: () => [] }, active: { type: Boolean, default: true } })
-const emit = defineEmits(['detach', 'memory', 'settings'])
+const props = defineProps({ packageId: { type: String, default: '' }, attachedMemory: { type: Array, default: () => [] }, active: { type: Boolean, default: true }, automationContext: { type: Object, default: null } })
+const emit = defineEmits(['detach', 'memory', 'settings', 'detach-automation'])
 const workspace = inject(WORKSPACE_CONTEXT_KEY, null)
 const context = computed(() => workspace?.getSnapshot?.() || {})
+const automation = computed(() => props.automationContext?.script_id ? { script_id: props.automationContext.script_id, ...(props.automationContext.run_id ? { run_id: props.automationContext.run_id } : {}), ...(props.automationContext.candidate_id ? { candidate_id: props.automationContext.candidate_id } : {}) } : null)
+async function reviewAutomation() {
+  const request = pluginMessageChannel('gamer-yaml:open-generation')
+  request.packageId = props.packageId; request.candidateId = automation.value?.candidate_id || ''; request.seq++
+  try { await workspace?.uiBridge.workspace.openPanel('gamer-yaml:automation') } catch (e) { error.value = e.message }
+}
 const deviceId = computed(() => context.value.deviceId || '')
 const conversations = ref([]), selectedId = ref(''), conversation = ref(null), events = ref([]), pending = ref([])
 const latestSeq = ref(0), oldestSeq = ref(null), moreBefore = ref(false), loadingHistory = ref(false)
@@ -142,7 +149,7 @@ async function send() {
   if (!canSend.value) return
   sending.value = true; error.value = ''; feedback.value = ''
   let receipt
-  const message = draft.value.trim(), packageId = props.packageId
+  const message = draft.value.trim(), packageId = props.packageId, attachedAutomation = automation.value ? { ...automation.value } : null
   try {
     if (!selectedId.value) {
       const initialGameLimits = {...gameLimits}
@@ -154,13 +161,14 @@ async function send() {
     const id = selectedId.value, request = serial
     receipt = reactive({ id: `sending:${crypto.randomUUID()}`, text: message, status: 'sending', at: new Date().toISOString() })
     pending.value.push(receipt)
-    const result = await call('conversation.message', { conversation_id: id, message, device_id: deviceId.value,
+    const result = await call('conversation.message', { conversation_id: id, message, device_id: attachedAutomation ? '' : deviceId.value,
+      ...(attachedAutomation ? { automation: attachedAutomation } : {}),
       attached_memory: props.attachedMemory.filter(item => item.content_package === packageId).map(({ id, revision }) => ({ id, revision })),
       ...(limitsChanged.value ? {limits:{...limits}} : {}), game_limits: {...gameLimits},
       ...(searchAvailable.value ? { web_search: webSearch.value } : {}) })
     if (disposed || request !== serial) return
     Object.assign(receipt, { id: result.message.id, status: result.message.status || 'queued' })
-    draft.value = ''; feedback.value = boundGame.value?.state==='paused' ? '消息已接收，设备保持暂停；Agent 正在判断下一步。' : isActive(boundGame.value) ? '新指令已接收；设备先暂停当前动作，Agent 正在判断下一步。' : '消息已接收，Agent 将根据内容查询记忆、回答或安排游玩。'
+    draft.value = ''; feedback.value = attachedAutomation ? '消息与自动化上下文已接收；先读取证据，候选修改需审核后保存。' : boundGame.value?.state==='paused' ? '消息已接收，设备保持暂停；Agent 正在判断下一步。' : isActive(boundGame.value) ? '新指令已接收；设备先暂停当前动作，Agent 正在判断下一步。' : '消息已接收，Agent 将根据内容查询记忆、回答或安排游玩。'
     if (result.conversation) conversation.value = result.conversation
     const value = await call('conversation.get', { conversation_id: id, after_seq: latestSeq.value, limit: 80 })
     if (!disposed && request === serial) applyPage(value)
@@ -299,8 +307,9 @@ defineExpose({select,refreshList:list,refreshSettings,setGameOptions,getGameOpti
       <p class="mode-guidance" v-else-if="activeDeviceSession && activeDeviceSession.session_id!==boundGame?.session_id">当前设备已有{{ activeDeviceSession.mode==='mcp' ? '外部 MCP' : '游玩' }}会话，Agent 会检查控制状态再安排操作。</p>
       <div v-if="attachedMemory.length" class="attachments"><span v-for="item in attachedMemory" :key="item.id">▧ {{ item.title }} · r{{ item.revision }}<button aria-label="移除记忆引用" @click="emit('detach',item.id)">×</button></span></div>
       <p v-if="readonlyHistory" class="hint">此记录仅供回看。需要聊天时请在当前配置包建立新对话；历史输入不会重放。</p>
+      <div v-if="automation" class="automation-context" aria-label="已附加自动化"><span>自动化：{{ automation.script_id }}<span v-if="automation.run_id"> · 运行 {{ automation.run_id }}</span></span><button type="button" @click="emit('detach-automation')">移除</button><button type="button" @click="reviewAutomation">审核自动化候选</button><small>只读分析与候选建议；发送所选脚本和必要运行证据到配置模型，不占用设备</small></div>
       <form class="chat-composer" @submit.prevent="send"><textarea v-model="draft" rows="3" aria-label="Agent 消息" placeholder="讨论攻略、管理记忆，或描述游玩目标…" :disabled="sending || readonlyHistory" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" />
-        <div class="composer-tools"><span class="composer-device" :title="deviceId || '讨论攻略无需设备'">{{ deviceId || '无设备' }}</span><label v-if="searchAvailable" class="search-toggle"><input v-model="webSearch" type="checkbox" />联网</label><button type="button" @click="emit('settings','mcp')">外部 MCP</button><button type="submit" class="send-button" :disabled="!canSend">{{ sending ? '发送中…' : '发送' }}<span aria-hidden="true"> ↑</span></button></div>
+        <div class="composer-tools"><span class="composer-device" :title="deviceId || '讨论攻略无需设备'">{{ automation ? '自动化离线分析' : deviceId || '无设备' }}</span><label v-if="searchAvailable" class="search-toggle"><input v-model="webSearch" type="checkbox" />联网</label><button type="button" @click="emit('settings','mcp')">外部 MCP</button><button type="submit" class="send-button" :disabled="!canSend">{{ sending ? '发送中…' : '发送' }}<span aria-hidden="true"> ↑</span></button></div>
       </form>
       <div class="composer-status"><span>{{ packageId || '未选配置包' }}</span><details v-if="usageLedgers.length" class="usage"><summary>Token <span v-for="ledger in usageLedgers" :key="ledger.key"> · {{ ledger.label }} {{ tokenUsage(ledger.usage) }} / {{ budgetValue(ledger.limits,'max_tokens') }}</span></summary><div class="usage-ledgers"><section v-for="ledger in usageLedgers" :key="ledger.key" :data-ledger="ledger.key"><b>{{ ledger.label }}用量</b><p>Token {{ tokenUsage(ledger.usage) }} / {{ budgetValue(ledger.limits,'max_tokens') }}<small v-if="ledger.usage?.has_unknown_tokens"> · 部分请求用量未知</small></p><p>模型 {{ usageValue(ledger.usage,['turns']) }} / {{ budgetValue(ledger.limits,'max_turns') }} 轮 · 工具 {{ usageValue(ledger.usage,['actions']) }} / {{ budgetValue(ledger.limits,'max_actions') }} 次</p><p>活动 {{ usageValue(ledger.usage,['active_seconds']) }} / {{ budgetValue(ledger.limits,'max_seconds') }} 秒 · 连续失败 {{ usageValue(ledger.usage,['consecutive_failures']) }} / {{ budgetValue(ledger.limits,'max_failures') }}</p></section></div></details><small>Ctrl / ⌘ + Enter 发送</small></div>
     </div>
@@ -309,7 +318,7 @@ defineExpose({select,refreshList:list,refreshSettings,setGameOptions,getGameOpti
 </template>
 
 <style scoped>
-.budget-interruption{margin:8px 14px 0;padding:10px 12px;border:1px solid var(--accent,#e4c956);border-radius:8px;background:var(--bg-2,#24282a);font-size:11px}.budget-interruption b{color:var(--accent,#e4c956)}.budget-interruption button{margin-top:6px}
+.automation-context{display:flex;gap:6px;align-items:center;flex-wrap:wrap;border:1px solid var(--border);border-radius:5px;padding:8px;font-size:11px}.automation-context>span{flex:1;overflow-wrap:anywhere}.automation-context small{flex-basis:100%}.automation-context button{font-size:10px;padding:3px 5px}.budget-interruption{margin:8px 14px 0;padding:10px 12px;border:1px solid var(--accent,#e4c956);border-radius:8px;background:var(--bg-2,#24282a);font-size:11px}.budget-interruption b{color:var(--accent,#e4c956)}.budget-interruption button{margin-top:6px}
 .agent-conversation{display:flex;flex-direction:column;min-height:0;min-width:0;flex:1;position:relative;font-size:12px;overflow:hidden}h3,h4,p{margin:0}p{white-space:pre-wrap;line-height:1.8;overflow-wrap:anywhere}small,.hint{color:var(--text-2,#aab5b2);line-height:1.7}button,input,select,textarea{font:inherit;color:inherit;background:var(--bg-1,#181b1c);border:1px solid var(--border,#41484a);border-radius:6px;padding:6px 8px;min-width:0;box-sizing:border-box}button{cursor:pointer}button:hover:not(:disabled){background:var(--bg-2,#282b2d)}button:disabled{opacity:.45;cursor:default}input[type=checkbox]{width:auto;margin:0;accent-color:var(--accent,#e4c956)}.actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.actions button{font-size:11px;padding:4px 7px;border-color:transparent;background:transparent}.agent-header{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 14px 8px}.agent-identity{display:flex;gap:8px;align-items:center;min-width:0}.agent-identity h3{font-size:13px;font-weight:650}.agent-mark{color:var(--accent,#e4c956);font-size:20px;line-height:1}.model-button{font-size:10px;color:var(--text-2,#aab5b2);border:0;padding:2px 0;background:transparent;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .conversation-bar{display:flex;gap:6px;align-items:center;padding:4px 14px 9px;border-bottom:1px solid var(--border,#41484a);flex-wrap:wrap}.conversation-bar select{flex:1;min-width:100px;border:0;background:transparent;font-size:11px;padding:3px 0}.conversation-bar button{font-size:10px;border:0}.conversation-state{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--text-2,#aab5b2)}.status-dot{width:5px;height:5px;border-radius:50%;background:var(--accent,#e4c956)}
 .game-controls{margin:8px 14px 0;padding:8px 10px;display:grid;gap:5px;border:1px solid var(--border,#41484a);border-radius:8px;background:var(--bg-2,#24282a);font-size:11px}.game-control-heading{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.game-control-heading>button{margin-left:auto;font-size:10px;padding:2px 0;border:0;background:transparent;color:var(--text-2,#aab5b2)}.scope-tag{border-radius:4px;padding:2px 5px;background:var(--bg-1,#181b1c);color:var(--accent,#e4c956);font-size:10px}.game-controls p{font-size:10px;color:var(--text-2,#aab5b2)}.game-controls .pause-reason{color:var(--accent,#e4c956)}

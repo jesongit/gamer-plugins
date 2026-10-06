@@ -1,7 +1,9 @@
 // @vitest-environment happy-dom
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { load as loadYaml } from 'js-yaml'
+import { useSourceYamlEditor } from '../../composables/useSourceYamlEditor'
 import { mount } from '@vue/test-utils'
 import { serialize } from '../codec'
 import { hasParamDefault } from '../schema'
@@ -24,16 +26,21 @@ const provide = { [SE_TARGET_OPTIONS]: {
   resolveParams: async name => ctx.resolveParams(name),
 } }
 
-describe('YAML 跨前后端验收夹具', () => {
+describe('YAML v2 公开源码与编辑边界', () => {
   for (const file of ['_function.yaml', 'flow.yaml', 'native.yaml']) {
-    it(`${file}：真实目录与模板校验、序列化往返`, () => {
-      const kind = file.startsWith('_function') ? 'function_library' : 'script'
-      const first = validateSource(fixture(file), kind, ctx)
-      expect(first.diagnostics).toEqual([])
-      const text = serialize(first.result.model)
-      const second = validateSource(text, kind, ctx)
-      expect(second.diagnostics).toEqual([])
-      expect(serialize(second.result.model)).toBe(text)
+    it(`${file}：完整源码经过原文编辑器逐字保存，语义由服务端权威校验`, async () => {
+      const source = fixture(file)
+      const doc = loadYaml(source)
+      expect(doc.version).toBe(2)
+      const isFunction = file.startsWith('_function')
+      const get = vi.fn().mockResolvedValue({ content: source, version: 'v1' })
+      const update = vi.fn().mockResolvedValue({ version: 'v2' })
+      const editor = useSourceYamlEditor({ api: { getScript: get, getFunction: get, updateScript: update, updateFunction: update }, call: vi.fn() })
+      editor.reset('fixture', isFunction ? 'function_library' : 'script')
+      await editor.load(`fixture/${file}`)
+      await editor.save()
+      expect(update).toHaveBeenCalledWith(`fixture/${file}`, { content: source, expected_version: 'v1' })
+      expect(editor.content.value).toBe(source)
     })
   }
 
@@ -41,56 +48,27 @@ describe('YAML 跨前后端验收夹具', () => {
     const tutorial = readFileSync(resolve(__dirname, '../../../../../../docs/guides/yaml-tutorial.md'), 'utf8')
     const examples = [...tutorial.matchAll(/```yaml\r?\n([\s\S]*?)```/g)]
     expect(examples.length).toBeGreaterThan(0)
-    return examples.flatMap(([, original]) => [original, original.replace(/^(\s*)# ([a-z_]\w*:.*)$/gm, '$1$2')])
-      .map(source => ({ source, kind: source.trimStart().startsWith('functions:') ? 'function_library' : 'script' }))
+    return examples.map(([, source]) => ({ source, document: loadYaml(source) }))
   }
 
-  it('教程全部案例及启用可选参数后的案例按真实函数目录校验和往返', () => {
-    const examples = tutorialExamples()
-    const functions = examples.filter(e => e.kind === 'function_library')
-      .flatMap(e => validateSource(e.source, e.kind).result.model.functions)
-    const tutorialCtx = {
-      knownFunctions: new Set([...catalog, ...functions].map(f => f.name)),
-      resolveParams: name => [...catalog, ...functions].find(f => f.name === name)?.params,
-      resolveTemplate: name => name === '指南.png',
-    }
-    for (const { source, kind } of examples) {
-      const first = validateSource(source, kind, tutorialCtx)
-      expect(first.diagnostics, source).toEqual([])
-      const text = serialize(first.result.model)
-      const second = validateSource(text, kind, tutorialCtx)
-      expect(second.diagnostics, source).toEqual([])
-      expect(serialize(second.result.model), source).toBe(text)
+  it('教程完整文档都显式声明 v2，脚本含视觉完成条件，函数库有定义', () => {
+    for (const { document } of tutorialExamples()) {
+      expect(document.version).toBe(2)
+      if (document.functions) expect(Object.keys(document.functions).length).toBeGreaterThan(0)
+      else {
+        expect(Array.isArray(document.run)).toBe(true)
+        expect(document.run.some(step => Object.hasOwn(step, 'finish'))).toBe(true)
+        expect(Object.keys(document.targets).length).toBeGreaterThan(0)
+      }
     }
   })
 
-  it('教程案例覆盖完整原生函数目录、每个参数及模板分支等步骤', () => {
-    const calls = new Map()
-    const kinds = new Set()
-    function visit(steps) {
-      for (const step of steps) {
-        kinds.add(step.kind)
-        if (step.kind === 'call') {
-          const params = calls.get(step.fn) || new Set()
-          if (step.args.kind === 'map') Object.keys(step.args.entries).forEach(name => params.add(name))
-          if (step.args.kind === 'value') params.add(catalog.find(f => f.name === step.fn)?.params[0]?.name)
-          calls.set(step.fn, params)
-        }
-        for (const child of childStepLists(step)) visit(child.list)
-      }
-    }
-    for (const { source, kind } of tutorialExamples()) {
-      const first = validateSource(source, kind)
-      expect(first.diagnostics, source).toEqual([])
-      const model = first.result.model
-      if (kind === 'function_library') model.functions.forEach(fn => visit(fn.run))
-      else visit(model.run)
-    }
-    expect([...kinds].sort()).toEqual(['call', 'if', 'match_templates', 'repeat', 'return'])
-    for (const fn of catalog) {
-      expect(calls.has(fn.name), `教程遗漏函数 ${fn.name}`).toBe(true)
-      expect([...calls.get(fn.name)].sort(), `教程遗漏 ${fn.name} 参数`).toEqual(fn.params.map(p => p.name).sort())
-    }
+  it('教程区分只观察、可选弹窗与完成条件，不让旧表单重序列化新语法', () => {
+    const document = tutorialExamples()[0].document
+    expect(document.run[0]).toMatchObject({ wait: 'claim', as: 'button', then: [{ tap: '$button' }] })
+    expect(document.run[1].optional).toMatchObject({ find: 'confirm', timeout: '0ms' })
+    expect(document.run.at(-1)).toMatchObject({ finish: 'done' })
+    expect(validateSource(tutorialExamples()[0].source, 'script', ctx).diagnostics.length).toBeGreaterThan(0)
   })
 
   it('教程列出全部参数类型', () => {
@@ -112,7 +90,7 @@ describe('YAML 跨前后端验收夹具', () => {
   })
 })
 
-describe('全部 18 个内置函数的真实参数 Schema 表单', () => {
+describe(`全部 ${catalog.length} 个内置函数的真实参数 Schema 表单`, () => {
   it('障碍模板列表可选取、保存重开和删除，非法元素与缺失模板报错', async () => {
     const created = setupScript('run:\n  - wait_find: button.png\n')
     const wrapper = mount(StepCard, { props: { ...created, step: created.model.run[0], containerPath: ['run'], basePath: 'run', index: 0, templates: ['button.png'] }, global: { provide } })
@@ -152,18 +130,22 @@ describe('全部 18 个内置函数的真实参数 Schema 表单', () => {
     })
   }
 
-  it('wait_find 更多参数包含 click，默认真且关闭后保存重开保留假', async () => {
+  it('wait_find 默认仅观察，显式点击开关的真与假均可保存重开', async () => {
     const created = setupScript('run:\n  - wait_find: button.png\n')
     const wrapper = mount(StepCard, { props: { ...created, step: created.model.run[0], containerPath: ['run'], basePath: 'run', index: 0 }, global: { provide } })
     await expandCard(wrapper, created.model.run[0].uuid)
     const more = wrapper.get('details.optional-params')
     more.element.open = true
     const button = more.get('button[data-param="click"]')
-    expect(button.text()).toContain('true')
+    expect(button.text()).toContain('false')
     expect(button.attributes('aria-pressed')).toBe('false')
     await button.trigger('click')
     const input = more.get('select[aria-label="参数 click"]')
-    expect(input.element.value).toBe('true')
+    expect(input.element.value).toBe('false')
+    await input.setValue('true')
+    const clicking = setupScript(serialize(created.model))
+    expect(clicking.model.run[0].args.entries.click).toEqual({ lit: true })
+    expect(validateSource(serialize(created.model), 'script', ctx).diagnostics).toEqual([])
     await input.setValue('false')
     const reopened = setupScript(serialize(created.model))
     expect(reopened.model.run[0].args.entries.click).toEqual({ lit: false })

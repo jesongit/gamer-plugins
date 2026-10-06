@@ -2,8 +2,8 @@
  * 录制事件 ↔ 媒体时间轴对齐（Phase 6，计划 §9.2）。
  *
  * 事件 `timeline_us` 是**会话单调钟**域；视频帧 PTS 是**媒体时钟**域。两者
- * 的整数映射由录制服务端显式化：`SegmentMeta.base_pts_us`（段首帧原始 PTS），
- * `media_pts = base_pts_us + timeline_us − start_us`（对应 Rust 侧
+ * 文件内 PTS 从 0 起；原始 `SegmentMeta.base_pts_us` 仅供采集诊断，
+ * `media_pts = timeline_us − start_us`（对应 Rust 侧
  * `media_pts_for_timeline`，全程整数微秒，不混用浏览器时间）。
  *
  * 会话可能分段（断连/编码参数变化/磁盘压力）：先按 `[start_us, start_us +
@@ -99,12 +99,11 @@ export function eventMediaPosition(event, segments) {
   const segment = segmentForTimeline(segments, event?.timeline_us)
   if (!segment) return null
   const start = Number(segment.start_us) || 0
-  const base = Number(segment.base_pts_us) || 0
   const timelineUs = Math.max(0, Math.round(Number(event.timeline_us) || 0))
   return {
     media_id: segment.media_id,
     // 与 Rust `SegmentMeta::media_pts_for_timeline` 同一整数映射
-    pts_us: base + Math.max(0, timelineUs - start),
+    pts_us: Math.max(0, timelineUs - start),
     segment,
   }
 }

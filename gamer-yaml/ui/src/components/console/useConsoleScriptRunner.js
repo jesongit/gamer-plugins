@@ -51,12 +51,14 @@ export function useConsoleScriptRunner({
     return {
       kind,
       runKind: ref(kind),        // 锁定（面板类型即资源类型；模板分支沿用）
+      sourceFile: ref(''), sourceFunction: ref(''), sourcePackage: ref(''),
       scriptMode: ref('run'),    // run | edit | raw（面板独立）
     }
   }
   const scriptScope = createPanelScope('script')
   const funcScope = createPanelScope('func')
   const automationTab = ref('scripts')
+  const sourceEditorDirty = ref(false), sourceEditorSaving = ref(false)
 
   async function refreshScripts() {
     const requestedPackage = String(packageId.value || '').trim()
@@ -641,7 +643,7 @@ export function useConsoleScriptRunner({
       } catch { /* 列表刷新失败时下方查找仍可能命中旧缓存 */ }
       if (request !== automationEditorRequest.seq || requestedPackage !== packageId.value
         || selectedAtStart !== selScript.value || focusAtStart !== editFocusFn.value) return
-      if (scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value || store.running) {
+      if (sourceEditorDirty.value || sourceEditorSaving.value || scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value || store.running) {
         toast('请先保存或结束当前操作，再打开草稿脚本', 'warn')
         return
       }
@@ -651,7 +653,7 @@ export function useConsoleScriptRunner({
       }
       selScript.value = scriptId
       if (rawEditor.resourceId.value) cancelRawScript(scriptScope)
-      await editCurrentScript()
+      scriptScope.scriptMode.value = 'run'
       automationTab.value = 'scripts'
     })()
   })
@@ -1191,9 +1193,10 @@ export function useConsoleScriptRunner({
     const previous = packageId.value
     if (next === packageId.value) return true
     if (navigationPending.value) { toast('正在切换或删除资源，请稍后切换配置包', 'warn'); return false }
-    if (scriptShell.saving || rawEditor.saving.value) { toast('正在保存，请稍后切换配置包', 'warn'); return false }
-    if ((scriptShell.dirty || rawEditor.dirty.value) && !await confirmDialog('当前编辑有未保存修改，放弃后将切换配置包。', { title: '切换配置包', confirmText: '放弃并切换', danger: true })) return false
-    if (packageId.value !== previous || scriptShell.saving || rawEditor.saving.value || navigationPending.value) return false
+    if (sourceEditorSaving.value || scriptShell.saving || rawEditor.saving.value) { toast('正在保存，请稍后切换配置包', 'warn'); return false }
+    if ((sourceEditorDirty.value || scriptShell.dirty || rawEditor.dirty.value) && !await confirmDialog('当前编辑有未保存修改，放弃后将切换配置包。', { title: '切换配置包', confirmText: '放弃并切换', danger: true })) return false
+    if (packageId.value !== previous || sourceEditorSaving.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value) return false
+    sourceEditorDirty.value = false
     scriptShell.reset()
     rawEditor.reset()
     scriptScope.scriptMode.value = 'run'
@@ -1206,7 +1209,7 @@ export function useConsoleScriptRunner({
   let restoringPackage = false
   watch(packageId, (next, previous) => {
     if (restoringPackage || next === previous) return
-    if (scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value) {
+    if (sourceEditorDirty.value || sourceEditorSaving.value || scriptShell.dirty || rawEditor.dirty.value || scriptShell.saving || rawEditor.saving.value || navigationPending.value) {
       restoringPackage = true
       restorePackage(previous)
       restoringPackage = false
@@ -1229,8 +1232,10 @@ export function useConsoleScriptRunner({
   function buildPanelContext(scope) {
     return {
       pendingRunLocation,
+      sourceEditorDirty, sourceEditorSaving,
       automationTab,
       kind: scope.kind,
+      sourceFile: scope.sourceFile, sourceFunction: scope.sourceFunction, sourcePackage: scope.sourcePackage,
       kindLocked: true,
       runKind: scope.runKind,
       scriptMode: scope.scriptMode,
