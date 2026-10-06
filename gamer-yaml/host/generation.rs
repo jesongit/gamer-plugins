@@ -593,6 +593,11 @@ impl Inner {
                                         &serde_json::to_vec(&s)?,
                                     )?;
                                 }
+                                if self.active(&s.candidate.id)
+                                    && matches!(s.candidate.state.as_str(), "passed" | "failed")
+                                {
+                                    s.candidate.state = "validating".into();
+                                }
                                 candidates.push(s.candidate);
                             }
                         }
@@ -672,6 +677,13 @@ impl Inner {
                             "base_resources_or_settings_changed: create a fresh candidate before saving".into(),
                         );
                         envelope.verification_scope["validation_status"] = Value::Null;
+                    }
+                    // Completion also publishes the final budget ledger and
+                    // removes the job. Never expose a terminal receipt earlier.
+                    if self.active(&id)
+                        && matches!(envelope.candidate.state.as_str(), "passed" | "failed")
+                    {
+                        envelope.candidate.state = "validating".into();
                     }
                     return Ok(serde_json::to_value(envelope)?);
                 }
@@ -1119,7 +1131,19 @@ impl Inner {
             ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
             s.candidate.report = Some(serde_json::to_value(report)?);
             let passed = s.candidate.report.as_ref().unwrap()["status"] == "passed";
-            s.candidate.state = if passed { "passed" } else { "failed" }.into();
+            let complete = passed
+                || !generate
+                || unchanged > 0
+                || attempt + 1 >= attempts
+                || attempt + 1 >= limits.max_failures;
+            s.candidate.state = if passed {
+                "passed"
+            } else if complete {
+                "failed"
+            } else {
+                "generating"
+            }
+            .into();
             s.candidate.updated_at = chrono::Utc::now().to_rfc3339();
             if !passed {
                 s.candidate.reason = Some(
@@ -1140,7 +1164,7 @@ impl Inner {
                 ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
                 self.write(&s)?;
             }
-            if passed || !generate || unchanged > 0 || attempt + 1 >= limits.max_failures {
+            if complete {
                 return Ok(());
             }
         }
@@ -1970,6 +1994,54 @@ mod tests {
         assert!(!service.inner.active(id));
         service.inner.launch("default", id, false).unwrap();
         assert_eq!(settled(&service, id).await["candidate"]["state"], "passed");
+    }
+
+    #[tokio::test]
+    async fn terminal_candidate_receipt_waits_for_job_and_final_usage() {
+        let (_root, service, input) = fixture();
+        let created = service
+            .inner
+            .dispatch("generation.create", input)
+            .await
+            .unwrap();
+        let id = created["candidate"]["id"].as_str().unwrap();
+        let mut stored = service.inner.read("default", id).unwrap();
+        stored.candidate.state = "failed".into();
+        service.inner.write(&stored).unwrap();
+        service.inner.jobs.lock().insert(
+            id.into(),
+            Job {
+                cancel: Arc::new(AtomicBool::new(false)),
+                request_id: "finishing".into(),
+            },
+        );
+        let values = json!({"package_id":"default","candidate_id":id});
+        assert_eq!(
+            service
+                .inner
+                .dispatch("generation.get", values.clone())
+                .await
+                .unwrap()["candidate"]["state"],
+            "validating"
+        );
+        assert_eq!(
+            service
+                .inner
+                .dispatch("generation.list", json!({"package_id":"default"}))
+                .await
+                .unwrap()["candidates"][0]["state"],
+            "validating"
+        );
+        stored.candidate.active_seconds = 12.0;
+        service.inner.write(&stored).unwrap();
+        service.inner.jobs.lock().remove(id);
+        let terminal = service
+            .inner
+            .dispatch("generation.get", values)
+            .await
+            .unwrap();
+        assert_eq!(terminal["candidate"]["state"], "failed");
+        assert_eq!(terminal["candidate"]["active_seconds"], 12.0);
     }
 
     async fn settled(service: &GenerationService, id: &str) -> Value {
