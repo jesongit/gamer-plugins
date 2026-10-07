@@ -52,6 +52,9 @@ struct State {
     generation: watch::Sender<u64>,
     pending: AtomicUsize,
     active_pid: AtomicU32,
+    closing: AtomicUsize,
+    #[cfg(test)]
+    child_fixture: Mutex<Option<fn() -> Command>>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +210,9 @@ impl OcrService {
                 generation,
                 pending: AtomicUsize::new(0),
                 active_pid: AtomicU32::new(0),
+                closing: AtomicUsize::new(0),
+                #[cfg(test)]
+                child_fixture: Mutex::new(None),
             }),
         })
     }
@@ -270,6 +276,10 @@ impl OcrService {
     }
 
     async fn recognize(&self, values: Value) -> Result<Value> {
+        ensure!(
+            self.state.closing.load(Ordering::Acquire) == 0,
+            "OCR 正在停止"
+        );
         let mut cancelled = self.state.generation.subscribe();
         let epoch = *cancelled.borrow();
         let request: Request = serde_json::from_value(values).context("OCR 请求无效")?;
@@ -290,6 +300,10 @@ impl OcrService {
             permit=self.state.workers.clone().acquire_owned()=>permit.context("OCR 工作队列已关闭")?,
         };
         ensure!(*cancelled.borrow() == epoch, "OCR 已停止");
+        ensure!(
+            self.state.closing.load(Ordering::Acquire) == 0,
+            "OCR 正在停止"
+        );
         let state = self.state.clone();
         let (abort, aborted) = oneshot::channel();
         // An owned task retains the permit through kill + wait, even when its caller
@@ -304,6 +318,7 @@ impl OcrService {
             .context("OCR 图像处理任务异常")??;
             ensure!(Instant::now() < deadline, "OCR 图像处理超时");
             ensure!(*cancelled.borrow() == epoch, "OCR 已停止");
+            ensure!(state.closing.load(Ordering::Acquire) == 0, "OCR 正在停止");
             let mut command = Command::new(settings::engine_argument_path(&engine.executable));
             command
                 .args(["stdin", "stdout", "--tessdata-dir"])
@@ -325,6 +340,12 @@ impl OcrService {
             // Equivalent to Tesseract's tsv config, without requiring a copied
             // tessdata/configs/tsv file in installations containing only models.
             command.env("OMP_THREAD_LIMIT", "1");
+            #[cfg(test)]
+            if let Some(factory) = *state.child_fixture.lock() {
+                // Lifecycle fixtures exercise the actual admitted call/worker
+                // path with a sleeping OS child, not OCR recognition quality.
+                command = factory();
+            }
             let bytes =
                 run_process(command, prepared.png, deadline, cancelled, aborted, state).await?;
             Ok::<_, anyhow::Error>(serde_json::to_value(parser::parse_tsv(
@@ -361,6 +382,13 @@ struct Active(Arc<State>);
 impl Drop for Active {
     fn drop(&mut self) {
         self.0.active_pid.store(0, Ordering::Release);
+    }
+}
+
+struct Cancellation(Arc<State>);
+impl Drop for Cancellation {
+    fn drop(&mut self) {
+        self.0.closing.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -446,15 +474,20 @@ impl BuiltinService for OcrService {
     fn extension_id(&self) -> &'static str {
         ID
     }
+    fn cancel_inflight(&self) -> Option<Box<dyn Send>> {
+        self.state.closing.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        Some(Box::new(Cancellation(self.state.clone())))
+    }
     async fn call(&self, action: &str, values: Value) -> ExtensionResult<Value> {
         self.dispatch(action, values)
             .await
             .map_err(|error| ExtensionError::CallRejected(error.to_string()))
     }
     async fn stop(&self) {
-        self.state
-            .generation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let _cancellation = self.cancel_inflight();
         let _ = self.state.workers.clone().acquire_owned().await;
     }
 }

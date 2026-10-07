@@ -324,3 +324,354 @@ async fn service_stop_and_dropped_caller_wait_for_real_process_exit() {
         assert_exited(pid).await;
     }
 }
+
+fn archive(manifest: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file("manifest.toml", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(manifest.as_bytes()).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+async fn managed_fixture() -> (
+    tempfile::TempDir,
+    Arc<OcrService>,
+    Arc<crate::extensions::ExtensionService>,
+    crate::extensions::ExtensionId,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let data_root = root.path().join("data");
+    std::fs::create_dir_all(&data_root).unwrap();
+    let deps = root.path().join("deps/tesseract");
+    std::fs::create_dir_all(deps.join("tessdata")).unwrap();
+    std::fs::write(
+        deps.join(if cfg!(windows) {
+            "tesseract.exe"
+        } else {
+            "tesseract"
+        }),
+        b"test process factory replaces this executable",
+    )
+    .unwrap();
+    std::fs::write(
+        deps.join("tessdata/eng.traineddata"),
+        b"not an OCR model; lifecycle test only",
+    )
+    .unwrap();
+    let ocr = Arc::new(OcrService::new(&data_root).unwrap());
+    *ocr.state.child_fixture.lock() = Some(sleeper);
+    let manager = Arc::new(
+        crate::extensions::ExtensionService::for_data_root(
+            &data_root,
+            crate::capabilities::CapabilityRegistry::default(),
+        )
+        .with_builtin_service(ocr.clone()),
+    );
+    let id = crate::extensions::ExtensionId::parse(ID).unwrap();
+    manager
+        .install(&archive(include_str!("../manifest.toml")))
+        .await
+        .unwrap();
+    manager.enable(&id).await.unwrap();
+    manager.start(&id).await.unwrap();
+    (root, ocr, manager, id)
+}
+
+fn slow_request() -> Value {
+    json!({"png_base64":png(2,2),"language":"eng","timeout_ms":15000})
+}
+
+#[tokio::test]
+async fn management_stop_and_disable_cancel_real_children_before_waiting_for_call_gates() {
+    for disable in [true, false] {
+        let (_root, ocr, manager, id) = managed_fixture().await;
+        let active = {
+            let manager = manager.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_extension(&id, "recognize", slow_request())
+                    .await
+            })
+        };
+        let pid = running(&ocr.state).await;
+        let queued = {
+            let manager = manager.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_extension(&id, "recognize", slow_request())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ocr.state.pending.load(Ordering::Acquire) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Before the pre-gate hook this waits for the full 15s call timeout.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            if disable {
+                manager.disable(&id).await
+            } else {
+                manager.stop(&id).await
+            }
+        })
+        .await
+        .expect("management must cancel before awaiting readers")
+        .unwrap();
+        assert!(active.await.unwrap().is_err());
+        assert!(queued.await.unwrap().is_err());
+        assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), 0);
+        assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+        assert_exited(pid).await;
+        assert!(manager
+            .call_extension(&id, "recognize", slow_request())
+            .await
+            .is_err());
+        if disable {
+            manager.enable(&id).await.unwrap();
+        }
+        manager.start(&id).await.unwrap();
+        let mut request = slow_request();
+        request["timeout_ms"] = json!(30);
+        let error = manager
+            .call_extension(&id, "recognize", request)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("超时"),
+            "restarting must restore admission: {error}"
+        );
+        manager.disable(&id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rejected_management_preserves_provider_work_and_dropped_call_still_reaps_child() {
+    let (_root, ocr, manager, id) = managed_fixture().await;
+    manager.install(&archive("manifest_version=2\nid=\"gamer-notify\"\nversion=\"0.1.0\"\nname=\"Required provider fixture\"\n[execution]\nkind=\"builtin\"\nbuiltin_id=\"gamer-notify\"\n[[dependencies]]\nid=\"gamer-ocr\"\nversion=\"^0.1.0\"\nrequired=true\n")).await.unwrap();
+    let dependent = crate::extensions::ExtensionId::parse("gamer-notify").unwrap();
+    manager.enable(&dependent).await.unwrap();
+    manager.start(&dependent).await.unwrap();
+    let call = {
+        let manager = manager.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            manager
+                .call_extension(&id, "recognize", slow_request())
+                .await
+        })
+    };
+    let pid = running(&ocr.state).await;
+    assert!(manager.disable(&id).await.is_err());
+    assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), pid);
+    assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+    call.abort();
+    let _ = call.await;
+    let permit = tokio::time::timeout(
+        Duration::from_secs(3),
+        ocr.state.workers.clone().acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), 0);
+    assert_exited(pid).await;
+    drop(permit);
+    manager.disable(&dependent).await.unwrap();
+    manager.disable(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_cancellation_guards_keep_new_calls_blocked_until_all_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let ocr = OcrService::new(root.path()).unwrap();
+    let first = ocr.cancel_inflight();
+    let second = ocr.cancel_inflight();
+    assert_eq!(ocr.state.closing.load(Ordering::Acquire), 2);
+    drop(first);
+    assert!(ocr
+        .call("recognize", json!({}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("正在停止"));
+    drop(second);
+    assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn shutdown_update_and_active_uninstall_cancel_real_children_before_management_waits() {
+    for action in ["shutdown", "update", "uninstall"] {
+        let (_root, ocr, manager, id) = managed_fixture().await;
+        let call = {
+            let manager = manager.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_extension(&id, "recognize", slow_request())
+                    .await
+            })
+        };
+        let pid = running(&ocr.state).await;
+        let active = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.id() == &id)
+            .unwrap()
+            .active_version()
+            .clone();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            match action {
+                "shutdown" => manager.shutdown_builtin_service().await,
+                "update" => {
+                    let manifest = include_str!("../manifest.toml")
+                        .replace("version = \"0.1.0\"", "version = \"0.1.1\"");
+                    manager.update(&archive(&manifest)).await.unwrap();
+                }
+                "uninstall" => assert!(manager.uninstall(&id, &active).await.unwrap()),
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .expect("management must cancel before waiting for active calls");
+        assert!(call.await.unwrap().is_err());
+        assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), 0);
+        assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+        assert_exited(pid).await;
+        if action == "shutdown" {
+            assert!(manager
+                .call_extension(&id, "recognize", slow_request())
+                .await
+                .is_err());
+        } else {
+            if action == "uninstall" {
+                manager
+                    .install(&archive(include_str!("../manifest.toml")))
+                    .await
+                    .unwrap();
+                manager.enable(&id).await.unwrap();
+                manager.start(&id).await.unwrap();
+            }
+            let mut request = slow_request();
+            request["timeout_ms"] = json!(30);
+            assert!(manager
+                .call_extension(&id, "recognize", request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("超时"));
+            manager.disable(&id).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_updates_and_uninstalls_reject_before_interrupting_work() {
+    let (_root, ocr, manager, id) = managed_fixture().await;
+    let call = {
+        let manager = manager.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            manager
+                .call_extension(&id, "recognize", slow_request())
+                .await
+        })
+    };
+    let pid = running(&ocr.state).await;
+    assert!(manager.update(b"not a zip").await.is_err());
+    assert!(manager
+        .update(&archive(include_str!("../manifest.toml")))
+        .await
+        .is_err());
+    let increased_permissions = include_str!("../manifest.toml")
+        .replace("version = \"0.1.0\"", "version = \"0.1.1\"")
+        .replace(
+            "\"ui.host\", \"vision.ocr\"",
+            "\"ui.host\", \"vision.ocr\", \"notify.send\"",
+        );
+    assert!(manager
+        .update_with_context(
+            &archive(&increased_permissions),
+            &crate::extensions::service::ExtensionInstallContext::default()
+        )
+        .await
+        .is_err());
+    let missing = crate::extensions::ExtensionVersion::parse("9.9.9").unwrap();
+    assert!(manager.uninstall(&id, &missing).await.is_err());
+    assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), pid);
+    assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+    call.abort();
+    let _ = call.await;
+    let permit = tokio::time::timeout(
+        Duration::from_secs(3),
+        ocr.state.workers.clone().acquire_owned(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_exited(pid).await;
+    drop(permit);
+    manager.disable(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn incompatible_updates_and_inactive_uninstalls_do_not_cancel_active_provider() {
+    let (_root, ocr, manager, id) = managed_fixture().await;
+    let older =
+        include_str!("../manifest.toml").replace("version = \"0.1.0\"", "version = \"0.0.9\"");
+    manager.install(&archive(&older)).await.unwrap();
+    manager.install(&archive("manifest_version=2\nid=\"gamer-notify\"\nversion=\"0.1.0\"\nname=\"Required provider fixture\"\n[execution]\nkind=\"builtin\"\nbuiltin_id=\"gamer-notify\"\n[[dependencies]]\nid=\"gamer-ocr\"\nversion=\"^0.1.0\"\nrequired=true\n")).await.unwrap();
+    let dependent = crate::extensions::ExtensionId::parse("gamer-notify").unwrap();
+    manager.enable(&dependent).await.unwrap();
+    manager.start(&dependent).await.unwrap();
+    let call = {
+        let manager = manager.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            manager
+                .call_extension(&id, "recognize", slow_request())
+                .await
+        })
+    };
+    let pid = running(&ocr.state).await;
+    let incompatible =
+        include_str!("../manifest.toml").replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    assert!(manager.update(&archive(&incompatible)).await.is_err());
+    let active = crate::extensions::ExtensionVersion::parse("0.1.0").unwrap();
+    assert!(manager.uninstall(&id, &active).await.is_err());
+    let removing = {
+        let manager = manager.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            manager
+                .uninstall(
+                    &id,
+                    &crate::extensions::ExtensionVersion::parse("0.0.9").unwrap(),
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(ocr.state.active_pid.load(Ordering::Acquire), pid);
+    assert_eq!(ocr.state.closing.load(Ordering::Acquire), 0);
+    assert!(!removing.is_finished());
+    call.abort();
+    let _ = call.await;
+    assert!(tokio::time::timeout(Duration::from_secs(3), removing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+    let permit = ocr.state.workers.clone().acquire_owned().await.unwrap();
+    assert_exited(pid).await;
+    drop(permit);
+    manager.disable(&dependent).await.unwrap();
+    manager.disable(&id).await.unwrap();
+}
