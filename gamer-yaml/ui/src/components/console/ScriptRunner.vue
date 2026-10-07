@@ -7,6 +7,7 @@
       </select>
       <span v-else class="resource-select">{{ ctx.shell.scriptDisplayName || '新脚本' }}</span>
       <button class="btn resource-action" :disabled="!editing || !(ctx.shell.dirty || namePending) || navigationBusy" @click="save">保存</button>
+      <button v-if="!isFunction && ctx.configureTargetScript" class="btn resource-action" :disabled="!hasTarget || !ctx.store.deviceId || navigationBusy || ctx.shell.dirty || ctx.runArgsFlow?.modal.loading" @click="ctx.configureTargetScript">运行配置</button>
       <button v-if="!ctx.store.running" class="btn btn-primary resource-action" :disabled="!hasTarget || !ctx.store.deviceId || navigationBusy" @click="run()">{{ ctx.startPending ? '提交中' : '运行' }}</button>
       <button v-else class="btn btn-danger resource-action" :disabled="ctx.runStopping" @click="ctx.stopScript">{{ ctx.runStopping ? '停止中' : '停止' }}</button>
       <details ref="moreEl" class="resource-more"><summary class="btn btn-icon menu-summary" title="更多操作" aria-label="更多操作"><UiIcon name="more" /></summary><div class="resource-menu action-menu">

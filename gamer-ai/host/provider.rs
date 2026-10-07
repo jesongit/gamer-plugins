@@ -176,8 +176,16 @@ impl Provider {
     /// GLM-5.3 default max thinking workload for each bounded correction turn;
     /// other providers and ordinary chat/game decisions retain their settings.
     pub(super) fn with_candidate_profile(mut self, repair: bool) -> Self {
-        if self.config.model.to_ascii_lowercase().starts_with("glm-5.3")
-            && official_glm_endpoint(&self.config.base_url,&self.config.model,&self.config.protocol)
+        if self
+            .config
+            .model
+            .to_ascii_lowercase()
+            .starts_with("glm-5.3")
+            && official_glm_endpoint(
+                &self.config.base_url,
+                &self.config.model,
+                &self.config.protocol,
+            )
         {
             self.candidate_reasoning_effort = Some(if repair { "low" } else { "high" });
         }
@@ -1913,17 +1921,23 @@ mod tests {
 
     #[test]
     fn candidate_reasoning_profile_is_scoped_to_official_glm_without_changing_chat() {
-        for protocol in ["responses","chat_completions"] {
-            let ordinary=glm_provider(protocol);
-            let (_,body)=ordinary.request_body(&[],&[],None,true).unwrap();
+        for protocol in ["responses", "chat_completions"] {
+            let ordinary = glm_provider(protocol);
+            let (_, body) = ordinary.request_body(&[], &[], None, true).unwrap();
             assert!(body.get("reasoning").is_none() && body.get("reasoning_effort").is_none());
-            let candidate=ordinary.with_candidate_profile(true);
-            let (_,body)=candidate.request_body(&[],&[],None,true).unwrap();
-            if protocol=="responses" { assert_eq!(body["reasoning"]["effort"],"low"); }
-            else { assert_eq!(body["reasoning_effort"],"low"); }
-            let mut other=glm_provider(protocol);
-            other.config.base_url="https://example.com/v1".into();
-            let (_,body)=other.with_candidate_profile(true).request_body(&[],&[],None,true).unwrap();
+            let candidate = ordinary.with_candidate_profile(true);
+            let (_, body) = candidate.request_body(&[], &[], None, true).unwrap();
+            if protocol == "responses" {
+                assert_eq!(body["reasoning"]["effort"], "low");
+            } else {
+                assert_eq!(body["reasoning_effort"], "low");
+            }
+            let mut other = glm_provider(protocol);
+            other.config.base_url = "https://example.com/v1".into();
+            let (_, body) = other
+                .with_candidate_profile(true)
+                .request_body(&[], &[], None, true)
+                .unwrap();
             assert!(body.get("reasoning").is_none() && body.get("reasoning_effort").is_none());
         }
     }

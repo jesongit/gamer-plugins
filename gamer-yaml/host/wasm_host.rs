@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store, StoreContextMut, UpdateDeadline};
 
@@ -34,20 +33,20 @@ use crate::extensions::wit;
 /// （ADR-YAML-04）Engine 开启 epoch interruption 作为取消兜底——guest 纯计算
 /// 死循环不经过 capability 边界，stop 标志只能靠 epoch 检查点打断。epoch 仅
 /// 服务取消，不做 host 超时强杀（步预算语义由 yaml-interp 的执行预算承载）。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LazyYamlWasmtimeRuntime {
-    engine: OnceLock<Engine>,
+    engine: Arc<OnceLock<Engine>>,
     /// 与 engine 同生命周期创建的 epoch ticker（见 [`EpochTicker`]）。
-    ticker: OnceLock<Arc<EpochTicker>>,
-    components: AsyncMutex<HashMap<[u8; 32], Arc<Component>>>,
+    ticker: Arc<OnceLock<Arc<EpochTicker>>>,
+    components: Arc<Mutex<HashMap<[u8; 32], Arc<Component>>>>,
 }
 
 impl LazyYamlWasmtimeRuntime {
     pub(crate) fn new() -> Self {
         Self {
-            engine: OnceLock::new(),
-            ticker: OnceLock::new(),
-            components: AsyncMutex::new(HashMap::new()),
+            engine: Arc::new(OnceLock::new()),
+            ticker: Arc::new(OnceLock::new()),
+            components: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -331,20 +330,17 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
     }
 }
 
+/// Called only from the isolated blocking execution thread. Reuse the server's
+/// runtime so capability I/O and spawned work retain their normal lifetime;
+/// creating a new thread/runtime per event or native call is unnecessary.
 fn block_on_yaml<T>(
-    future: impl Future<Output = Result<T, anyhow::Error>> + Send + 'static,
-) -> Result<T, anyhow::Error>
-where
-    T: Send + 'static,
-{
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| anyhow::anyhow!("YAML capability runtime 初始化失败: {error}"))?
-            .block_on(future)
-    })
-    .join()
+    future: impl Future<Output = Result<T, anyhow::Error>>,
+) -> Result<T, anyhow::Error> {
+    // Preserve the previous bridge's panic-to-error boundary without an OS
+    // thread per capability. The outer blocking task still owns the Store.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::runtime::Handle::current().block_on(future)
+    }))
     .map_err(|_| anyhow::anyhow!("YAML capability thread 异常退出"))?
 }
 
@@ -401,14 +397,22 @@ fn validate_contract_response(response: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[async_trait]
-impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
-    async fn run(&self, request: YamlWasmRunRequest) -> Result<YamlWasmRunResult, anyhow::Error> {
+impl LazyYamlWasmtimeRuntime {
+    /// Compile, instantiate and execute on a blocking worker, never a Tokio I/O
+    /// worker. Each call still owns its Store, host state and cancellation flag;
+    /// only the Engine, compiled component cache and epoch ticker are shared.
+    fn run_blocking(
+        &self,
+        request: YamlWasmRunRequest,
+    ) -> Result<YamlWasmRunResult, anyhow::Error> {
         let require_goal = request.program["require_goal"].as_bool().unwrap_or(false);
         let mut digest = [0u8; 32];
         digest.copy_from_slice(Sha256::digest(&request.wasm).as_slice());
         let component = {
-            let mut components = self.components.lock().await;
+            let mut components = self
+                .components
+                .lock()
+                .map_err(|_| anyhow::anyhow!("YAML 组件缓存锁异常"))?;
             if let Some(component) = components.get(&digest).cloned() {
                 component
             } else {
@@ -454,9 +458,8 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
             .unwrap_or_default();
         if let Some(frames) = state.host.registry().frame() {
             if let Some(run_id) = request.program["trace"]["run_id"].as_str() {
-                let _ = frames
-                    .trace_snapshot(run_id.to_string(), request.program.clone())
-                    .await;
+                let _ = tokio::runtime::Handle::current()
+                    .block_on(frames.trace_snapshot(run_id.to_string(), request.program.clone()));
             }
         }
         state.settings = request
@@ -550,9 +553,11 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
                 let device = crate::capabilities::DeviceHandle::new(
                     crate::capabilities::DeviceId::new(context.device_id.as_str()),
                 );
-                let _ = frames
-                    .trace_capture(&device, data.run_state.metadata("error_fresh"), true)
-                    .await;
+                let _ = tokio::runtime::Handle::current().block_on(frames.trace_capture(
+                    &device,
+                    data.run_state.metadata("error_fresh"),
+                    true,
+                ));
             }
         }
         let (result,) = match call_result {
@@ -575,6 +580,16 @@ impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
         let value = serde_json::from_str::<serde_json::Value>(&result)
             .map_err(|error| anyhow::anyhow!("YAML guest 返回值不是 JSON: {error}"))?;
         Ok(YamlWasmRunResult { value })
+    }
+}
+
+#[async_trait]
+impl YamlWasmRuntime for LazyYamlWasmtimeRuntime {
+    async fn run(&self, request: YamlWasmRunRequest) -> Result<YamlWasmRunResult, anyhow::Error> {
+        let runtime = self.clone();
+        tokio::task::spawn_blocking(move || runtime.run_blocking(request))
+            .await
+            .map_err(|error| anyhow::anyhow!("YAML 执行线程异常退出: {error}"))?
     }
 
     fn is_available(&self) -> bool {

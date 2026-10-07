@@ -27,7 +27,12 @@ async function refresh() {
     if (token !== scope) return
     resources.value = list || []
     if (!isFunction.value) scriptsData.value = resources.value
-    if (!selected.value && resources.value.length) { selected.value = resources.value[0].id; await editor.load(selected.value); if (!isFunction.value) ctx.selScript = selected.value }
+    // Offline authoring retains its first-file convenience; an execution target must opt in.
+    if (!ctx.store.deviceId && !selected.value && resources.value.length) {
+      selected.value = resources.value[0].id
+      await editor.load(selected.value)
+      if (token === scope && !isFunction.value) ctx.selScript = selected.value
+    }
   } catch (e) { if (token === scope) editor.error = e.message }
 }
 async function beforeTabChange() {
@@ -76,13 +81,13 @@ async function sendToAi() {
   requestAutomationContext(ctx.packageId, { script_id: editor.id.slice(ctx.packageId.length + 1) })
   try { await workspace?.uiBridge.workspace.openPanel('gamer-ai:ai') } catch (e) { editor.error = e.message }
 }
-watch(() => ctx.packageId, () => {
+watch([() => ctx.packageId, () => ctx.store.deviceId], () => {
   const restore = ctx.sourcePackage === ctx.packageId ? ctx.sourceFile || (!isFunction.value ? ctx.selScript : '') : (!isFunction.value ? ctx.selScript : '')
   const restoreFunction = ctx.sourcePackage === ctx.packageId ? ctx.sourceFunction : ''
   scope++; selected.value = restore && restore.startsWith(`${ctx.packageId}/`) ? restore : ''; resources.value = []; functionName.value = restoreFunction || ''; showLogs.value = false
   ctx.sourcePackage = ctx.packageId
   editor.reset(ctx.packageId, isFunction.value ? 'function_library' : 'script'); if (selected.value) void editor.load(selected.value); void refresh(); void checkAi()
-}, { immediate: true, flush: 'sync' })
+}, { immediate: true })
 watch(functionNames, names => { if (!names.includes(functionName.value)) functionName.value = names.includes(ctx.sourceFunction) ? ctx.sourceFunction : names[0] || '' })
 watch([selected, functionName], () => { ctx.sourceFile = selected.value; if (functionName.value) ctx.sourceFunction = functionName.value }, { flush: 'sync' })
 watch(() => ctx.selScript, async id => {
@@ -103,6 +108,7 @@ defineExpose({ beforeTabChange })
       <select class="select" :value="selected" :disabled="busy" aria-label="选择源码文件" @change="selectResource"><option value="">选择{{ isFunction ? '函数库' : '脚本' }}</option><option v-for="resource in resources" :key="resource.id" :value="resource.id">{{ resource.name || resource.file || resource.id }}</option></select>
       <button class="btn" :disabled="busy || !ctx.packageId" @click="create">新建</button>
       <button class="btn" :disabled="busy || !editor.dirty || !editor.name" @click="save">保存</button>
+      <button v-if="!isFunction && ctx.configureTargetScript" class="btn" :disabled="busy || editor.dirty || !editor.id || !ctx.store.deviceId || ctx.runArgsFlow?.modal.loading" @click="ctx.configureTargetScript">运行配置</button>
       <button v-if="!ctx.store.running" class="btn btn-primary" :disabled="busy || !ctx.store.deviceId || !editor.name || isFunction && !functionName" @click="run">运行</button>
       <button v-else class="btn btn-danger" :disabled="ctx.runStopping" @click="ctx.stopScript">停止</button>
       <button class="btn" @click="showLogs = !showLogs">{{ showLogs ? '原文' : '日志' }}</button>

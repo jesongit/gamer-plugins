@@ -677,10 +677,22 @@ impl NativeYamlHost {
 
     async fn sleep(&self, args: &BoundArgs) -> Result<Value> {
         let duration = args.duration_ms("duration")?.min(MAX_SLEEP_MS);
-        self.runtime
-            .sleep(Duration::from_millis(duration))
-            .await
-            .map_err(anyhow::Error::new)?;
+        // Keep one sleep request (including offline virtual-clock semantics),
+        // but do not hold a cancelled run's lease for an hour-long host wait.
+        // Epoch interruption cannot interrupt a capability future in progress.
+        tokio::select! {
+            result = self.runtime.sleep(Duration::from_millis(duration)) => {
+                result.map_err(anyhow::Error::new)?;
+            }
+            _ = async {
+                loop {
+                    if self.runtime.cancelled() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } => return Err(anyhow::Error::new(crate::capabilities::CapabilityError::Cancelled)),
+        }
         Ok(Value::Null)
     }
 
@@ -2241,6 +2253,38 @@ log = "^1.0"
     }
 
     #[tokio::test]
+    async fn native_sleep_preserves_single_virtual_clock_wait_and_cancel_error() {
+        for cancel_on_sleep in [false, true] {
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]);
+            let mut native =
+                NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                    .await
+                    .unwrap();
+            let clock = Arc::new(ClickClock {
+                trace,
+                sleeps: Mutex::new(vec![]),
+                stop: AtomicBool::new(false),
+                cancel_on_sleep,
+            });
+            native.runtime = clock.clone();
+            let result = native.call_function("sleep", json!("5s")).await;
+            assert_eq!(*clock.sleeps.lock().unwrap(), vec![(0, 5000)]);
+            if cancel_on_sleep {
+                assert!(matches!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<crate::capabilities::CapabilityError>(),
+                    Some(crate::capabilities::CapabilityError::Cancelled)
+                ));
+            } else {
+                assert_eq!(result.unwrap(), Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn input_delays_wrap_every_automation_click_and_key_exactly_once() {
         for name in [
             "tap",
@@ -2540,6 +2584,7 @@ mod wasm_tests {
     use zip::write::SimpleFileOptions;
 
     include!("acceptance_tests.rs");
+    include!("concurrency_tests.rs");
 
     /// The YAML production registrar supplies the same execution-model
     /// declaration, but this focused guest test does not need a Scheduler.

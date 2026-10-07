@@ -1,3 +1,4 @@
+import { packageStore, selectPackage } from '../../../../../../web/src/package-store'
 import { useConfirmDialog } from '../../../../../../web/src/components/ui/useConfirmDialog'
 import { functionCallParams } from '../../script-editor/call-names'
 import { computed, nextTick, onUnmounted, provide, reactive, ref, watch } from 'vue'
@@ -5,10 +6,10 @@ import { api } from '../../../../../../web/src/api'
 import { GAMER_YAML_RUNNER_ID, runYamlFunction, runYamlScript } from '../../gamer-yaml-runner'
 import { FUNCTION_LIBRARY_DEFAULT } from '../../../../../../web/src/gamer-plugin-ids'
 import {
-  applyRunRecord, beginCancel, findRun, pushRunConflict, resetStoreRunState,
+  applyRunRecord, beginCancel, findRun, pushRunConflict,
   scriptsData, store, templatesData,
 } from '../../../../../../web/src/store'
-import { isDeviceBusyConflict, isTerminalRunState, sourceLabel, terminalLabel } from '../../../../../../web/src/runs'
+import { isDeviceBusyConflict, sourceLabel } from '../../../../../../web/src/runs'
 import { useScriptEditorShell } from '../../composables/useScriptEditorShell'
 import { useRawYamlEditor } from '../../composables/useRawYamlEditor'
 import { useFunctionLibrary } from '../../composables/useFunctionLibrary'
@@ -33,6 +34,7 @@ import { buildFunctionViews, filterFunctionViews, createPinyinInitials } from '.
 
 export function useConsoleScriptRunner({
   toast,
+  multiviewWorkspace = null,
   packageId,
   restorePackage = previous => { packageId.value = previous },
   consoleRuntime,
@@ -41,6 +43,7 @@ export function useConsoleScriptRunner({
   loadData,
 }) {
   const confirmDialog = useConfirmDialog()
+  let disposed = false
   // 资源请求属于当前 hook 实例；Package 切换时递增序号，旧响应不能回写全局候选。
   let scriptsInflight = null
   let scriptsInflightPackage = ''
@@ -128,6 +131,48 @@ export function useConsoleScriptRunner({
   /** 各面板目标选择（面板独立）。函数面板无「选中文件」态：函数以个体为单位
    *  平铺展示（buildFunctionViews），运行按 `<pkg>#<名>` 寻址，所有函数库均按所属文件编辑。 */
   const selScript = ref('')
+  let projectingTarget = false
+  // Configuration is per target; the panel is only a projection of that target.
+  watch([selScript, packageId], () => {
+    if (projectingTarget || !store.deviceId) return
+    multiviewWorkspace?.updateConfig(store.deviceId, {
+      packageId: packageId.value || '', scriptId: selScript.value || '', runnerId: GAMER_YAML_RUNNER_ID,
+      ...(selScript.value !== multiviewWorkspace?.getConfig(store.deviceId)?.scriptId ? { args: {} } : {}),
+    })
+  }, { flush: 'post' })
+  function beforeTargetChange(id) {
+    if (id === store.deviceId) return true
+    if (sourceEditorDirty.value || sourceEditorSaving.value || scriptShell.dirty || rawEditor.dirty.value
+      || scriptShell.saving || rawEditor.saving.value || navigationPending.value) {
+      toast('请先保存或放弃当前编辑，再切换目标', 'warn')
+      return false
+    }
+    if (runArgsFlow.modal.submitting || runArgsFlow.modal.loading && runArgsFlow.modal.mode !== 'configure') {
+      toast('正在提交运行，请稍后切换目标', 'warn'); return false
+    }
+    return true
+  }
+  // Call before writing store.deviceId. Synchronous: refusal cannot leave a half-switched target.
+  function projectTargetConfig(id) {
+    const config = multiviewWorkspace?.getConfig(id)
+    let nextPackage = config?.packageId || null
+    if (nextPackage && !packageStore.packages.some(pkg => pkg.id === nextPackage)) {
+      toast('此目标的配置包已不存在，请重新选择配置包和脚本', 'warn')
+      multiviewWorkspace?.updateConfig(id, { packageId: '', scriptId: '', args: {} })
+      nextPackage = null
+    }
+    projectingTarget = true
+    try {
+      if (!selectPackage(nextPackage)) return false
+      runArgsFlow.close()
+      scriptShell.reset(); rawEditor.reset()
+      selScript.value = nextPackage ? config?.scriptId || '' : ''
+      scriptScope.sourceFile.value = selScript.value
+      scriptScope.sourcePackage.value = nextPackage || ''
+      funcScope.sourceFile.value = ''; funcScope.sourceFunction.value = ''; funcScope.sourcePackage.value = nextPackage || ''
+      return true
+    } finally { projectingTarget = false }
+  }
   const scriptDeleteConfirmId = ref('')
   /** 运行按钮可用性：脚本面板看脚本选择 */
   const canRunTargetScript = computed(() => !!selScript.value)
@@ -331,6 +376,7 @@ export function useConsoleScriptRunner({
   }
 
   function startLogPolling() {
+    if (disposed) return
     consoleRuntime.startLogPolling(refreshLogs)
   }
 
@@ -828,34 +874,22 @@ export function useConsoleScriptRunner({
     scriptShell.dismissConflict()
   }
 
-  // 运行状态轮询：以当前 run_id 单次查询 GET /api/runs/:run_id，
-  // 按 record.state 驱动状态机（stopping→停止中、终态→复位空闲并归档）。
-  let runStatusTimer = null
-
+  // One authoritative poller covers every known target, including hidden/background runs.
+  let singleTargetPoll = null
+  async function pollSingleTarget() {
+    const runId = store.runId
+    if (!runId) return
+    try { applyRunRecord(await api.getRun(runId)) } catch { /* Keep authority on transient errors. */ }
+  }
   function startRunStatusPoll() {
-    if (runStatusTimer) clearInterval(runStatusTimer)
-    checkRunStatus()
-    runStatusTimer = setInterval(checkRunStatus, 1000)
+    if (disposed) return
+    if (multiviewWorkspace) return multiviewWorkspace.startPolling()
+    if (!singleTargetPoll) { void pollSingleTarget(); singleTargetPoll = setInterval(pollSingleTarget, 1000) }
   }
-
   function stopRunStatusPoll() {
-    if (runStatusTimer) { clearInterval(runStatusTimer); runStatusTimer = null }
-  }
-
-  async function checkRunStatus() {
-    if (!store.running) { stopRunStatusPoll(); return }
-    const rid = store.runId
-    if (!rid) { stopRunStatusPoll(); resetStoreRunState(); return }
-    let rec
-    try {
-      rec = await api.getRun(rid)
-    } catch (e) { return } // 网络抖动等：下轮再试，不提前复位运行态
-    const m = applyRunRecord(rec)
-    if (m && isTerminalRunState(m.state)) {
-      stopRunStatusPoll()
-      const detail = `：${terminalLabel(m.state)}${m.error ? `（${m.error}）` : ''}`
-      toast(`脚本已结束${detail}`, m.state === 'success' ? 'info' : 'warn')
-    }
+    multiviewWorkspace?.stopPolling()
+    if (singleTargetPoll) clearInterval(singleTargetPoll)
+    singleTargetPoll = null
   }
 
   // ---------- 运行模式：只读步骤摘要 + 从此步骤运行（plan §10「只读源码展示/从某行运行」行） ----------
@@ -1013,14 +1047,24 @@ export function useConsoleScriptRunner({
    *  提供「仍要查看日志」跳控制台对应设备；不打断本页其他功能 */
   function openRunConflict(d) {
     console.warn('[run] device busy (409)', d)
-    pushRunConflict({ ...(d || {}), device_id: store.deviceId })
+    pushRunConflict({ ...(d || {}), device_id: d?.device_id || store.deviceId })
   }
 
   // ---------- 运行参数流程（阶段 5）：目标声明 params 时先弹参数表单，稀疏 args 提交 ----------
   // exec 完成 API 调用与 run_id 登记；flow 负责表单开关/400 诊断回填字段/覆盖建议缓存/摘要
   const runArgsFlow = useRunArgsFlow({
+    saveConfiguration: ({ id, deviceId, args }) => {
+      if (disposed || !deviceId || deviceId !== store.deviceId || id !== selScript.value
+        || !id.startsWith(`${packageId.value}/`)) throw new Error('目标或脚本已切换，请重新打开运行配置')
+      if (!multiviewWorkspace?.updateConfig(deviceId, { packageId: packageId.value, scriptId: id, runnerId: GAMER_YAML_RUNNER_ID, args: args || {} })) {
+        throw new Error('目标已移出工作台，请重新选择目标')
+      }
+      toast('已保存此目标运行配置，尚未运行', 'success')
+      return { saved: true }
+    },
     exec: async ({ id, name, kind, fnName, startIndex, args, deviceId }) => {
       if (!deviceId || deviceId !== store.deviceId) throw new Error('运行设备已切换，请在当前设备重新点击运行')
+      if (kind !== 'function_library') multiviewWorkspace?.updateConfig(deviceId, { packageId: String(id).split('/')[0], scriptId: id, runnerId: GAMER_YAML_RUNNER_ID, args: args || {} })
       startPending.value = true
       // 每次运行清空日志区域，只显示本次运行产生的日志
       runStartTime = Date.now()
@@ -1034,25 +1078,46 @@ export function useConsoleScriptRunner({
         // 当前运行响应固定含 run_id；启动即登记实例，后续查询只按该主键进行。
         applyRunRecord({ ...rep, device_id: deviceId, entrypoint: kind === 'function_library' ? `${id}#${fnName}` : id, script_id: id, source: 'manual', display: name })
         return rep
+      } catch (e) {
+        e.runDeviceId = deviceId
+        throw e
       } finally {
         startPending.value = false
       }
     },
-    notify: ({ summary }) => {
+    notify: ({ summary, deviceId }) => {
       toast('脚本已开始运行', 'success')
       // resolved_args 摘要（默认继承/显式覆盖来源标注）进运行日志区，说明本次实际使用的参数
-      if (summary) pushLog('info', summary)
+      if (!deviceId || deviceId === store.deviceId) {
+        if (summary) pushLog('info', summary)
+      }
       // POST 成功（服务端已登记条目）后才开始轮询，避免设备离线时 connect_device 耗时较长、
       // 查询先于登记返回导致状态被提前复位
-      startLogPolling()
+      if (!deviceId || deviceId === store.deviceId) startLogPolling()
       startRunStatusPoll()
     },
   })
 
+  // Invalidate pending schema/form on every identity change, including same-package scripts.
+  watch([() => store.deviceId, selScript, packageId], () => runArgsFlow.close(), { flush: 'sync' })
+  async function configureTargetScript() {
+    if (!multiviewWorkspace || !store.deviceId || !packageId.value || !selScript.value) return toast('请先选择目标、配置包和脚本', 'warn')
+    if (sourceEditorDirty.value || sourceEditorSaving.value || scriptShell.dirty || scriptShell.saving || rawEditor.dirty.value || rawEditor.saving.value) return toast('请先保存脚本原文，再配置运行参数', 'warn')
+    const id = selScript.value, deviceId = store.deviceId
+    try {
+      await runArgsFlow.begin({
+        mode: 'configure', id, deviceId, name: id, runnerId: GAMER_YAML_RUNNER_ID, entrypoint: id,
+        title: '此目标运行配置', submitLabel: '保存配置',
+        desc: `仅保存目标 ${deviceId} 的脚本与参数，不启动运行`,
+        initialArgs: multiviewWorkspace.getConfig(deviceId)?.args || {}, templates: templateNames.value,
+      })
+    } catch (e) { toast('读取运行参数失败：' + e.message, 'error') }
+  }
+
   /** 运行启动失败统一处理：409 设备占用 → 冲突弹窗；其余写日志 + toast（400 诊断由 flow 消化不经过此） */
   function handleRunStartError(e) {
     if (isDeviceBusyConflict(e)) {
-      openRunConflict({ ...(e.data || {}), device_id: store.deviceId })
+      openRunConflict({ ...(e.data || {}), device_id: e.runDeviceId || store.deviceId })
     } else {
       pushLog('error', `执行失败：${e.message}`)
       toast('脚本执行失败', 'error')
@@ -1112,6 +1177,8 @@ export function useConsoleScriptRunner({
       await runArgsFlow.begin({
         id: s.id,
         deviceId: store.deviceId,
+        initialArgs: multiviewWorkspace?.getConfig(store.deviceId)?.args || {},
+        useConfiguredArgs: !!multiviewWorkspace,
         name: s.name,
         runnerId: GAMER_YAML_RUNNER_ID,
         entrypoint: s.id,
@@ -1154,13 +1221,18 @@ export function useConsoleScriptRunner({
   async function restoreRunState() {
     if (!store.deviceId || store.running) return
     const deviceId = store.deviceId
-    let rep = null
-    try {
-      rep = await api.deviceRun(deviceId)
-    } catch (e) { /* 恢复失败不影响进入页面 */ return }
-    if (deviceId !== store.deviceId || store.running || !rep.active) return
-    const rec = rep.run
-    if (!rec?.run_id) return
+    let rec
+    if (multiviewWorkspace) {
+      await multiviewWorkspace.refreshRunStates([deviceId])
+      rec = multiviewWorkspace.getRun(deviceId)
+    } else {
+      try {
+        const result = await api.deviceRun(deviceId)
+        if (store.running || !result.active) return
+        rec = result.run
+      } catch { return }
+    }
+    if (disposed || !rec?.run_id || deviceId !== store.deviceId) return
     // 运行目标展示名：entrypoint 为主（runner 语义），script_id 为服务端保留的兼容展示字段
     const target = rec.entrypoint || rec.script_id || ''
     const srcTag = sourceLabel(rec.source)
@@ -1185,6 +1257,7 @@ export function useConsoleScriptRunner({
   }
 
   onUnmounted(() => {
+    disposed = true
     if (autoSaveTimer) { clearTimeout(autoSaveTimer); autoSaveTimer = null }
     stopRunStatusPoll()
   })
@@ -1250,6 +1323,7 @@ export function useConsoleScriptRunner({
       fnSearch, filteredFnViews,
       editFunction, runFunction, runFromFunctionStep,
       runScript: opts => runScript(scope, opts),
+      configureTargetScript,
       editCurrentTarget: () => editCurrentTarget(scope),
       editRawCurrentTarget: view => editRawCurrentTarget(scope, view),
       startNewTarget: () => startNewTarget(scope),
@@ -1282,7 +1356,7 @@ export function useConsoleScriptRunner({
 
   return {
     // 共享机制（Console 壳接线：弹窗/轮询/钩子）
-    scriptShell, rawEditor, fnLib, beforePackageChange,
+    scriptShell, rawEditor, fnLib, beforePackageChange, beforeTargetChange, projectTargetConfig,
     liveLogs, startPending, runStopping, runArgsFlow, onRunArgsSubmit,
     startLogPolling, stopLogPolling, pushLog,
     clearCallParamsCache, editorMatchThreshold, onTemplateRenamed: scriptShell.onTemplateRenamed,

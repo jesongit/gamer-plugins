@@ -5,6 +5,8 @@
 // 宿主注入：
 // - exec({ id, name, kind, fnName, startIndex, args }) → 202 回复（宿主完成 API 调用与
 //   run_id 登记/轮询启动；抛错时 400 invalid_args 由本流程消化，其余原样抛回宿主处理）；
+// - saveConfiguration(opts): begin({mode:'configure'}) 的仅保存入口；永不调用 exec，包含无参数脚本。
+// - useConfiguredArgs: 显式目标配置的合法覆盖值完整保留，且不读写跨目标建议缓存。
 // - notify({ rep, args, summary })：202 成功后的页面反馈（toast/日志区摘要）；
 // - loadParams({ runnerId, entrypoint })：参数 schema descriptor 获取（缺省走
 //   api.getEntrypointParams，契约 §7——前端不为取参数而解析 YAML）。
@@ -13,7 +15,7 @@ import { reactive } from 'vue'
 import { api } from '../../../../../web/src/api'
 import {
   describeResolvedArgs, loadRunArgsSuggestion,
-  mapArgDiagnostics, saveRunArgsSuggestion,
+  mapArgDiagnostics, saveRunArgsSuggestion, validateArgsAgainstParams,
 } from '../script-editor/params'
 import { schemaToParamDecls } from '../script-editor/entrypointParams'
 import { checkLiteral, hasParamDefault } from '../script-editor/schema'
@@ -43,15 +45,17 @@ function toParamsLoadError(e, { runnerId, entrypoint }) {
   return e // 网络/登录等其余错误原样上抛
 }
 
-export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, loadParams = undefined } = {}) {
+export function useRunArgsFlow({ exec, saveConfiguration, notify = () => {}, storage = undefined, loadParams = undefined } = {}) {
   const loadDescriptor = loadParams
     || (({ runnerId, entrypoint }) => api.getEntrypointParams(runnerId, entrypoint))
   let generation = 0
   let declaredParams = []
   let suppliedRequiredArgs = {}
+  let saveSuggestions = true
   // 弹窗态（RunParamsModal props 直接绑定 modal.*）
   const modal = reactive({
     open: false,
+    mode: 'run',
     title: '运行参数',
     desc: '',
     submitLabel: '▶ 运行',
@@ -95,10 +99,12 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
   async function begin(opts = {}) {
     if (modal.open || modal.submitting || modal.loading) return { form: false, busy: true }
     const request = ++generation
+    saveSuggestions = !opts.useConfiguredArgs && opts.mode !== 'configure'
     const kind = opts.kind || 'script'
     const runnerId = opts.runnerId || ''
     const entrypoint = opts.entrypoint || ''
     Object.assign(modal, {
+      mode: opts.mode === 'configure' ? 'configure' : 'run',
       title: opts.title || (kind === 'function_library' ? '测试函数参数' : '运行参数'),
       desc: opts.desc || '',
       submitLabel: opts.submitLabel || (kind === 'function_library' ? '▶ 测试' : '▶ 运行'),
@@ -128,16 +134,24 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
     if (request !== generation) return { form: false, cancelled: true }
     declaredParams = schemaToParamDecls(descriptor?.schema)
     const required = declaredParams.filter(param => param.required && !hasParamDefault(param))
-    suppliedRequiredArgs = Object.fromEntries(required.filter(param => {
+    suppliedRequiredArgs = Object.fromEntries((opts.useConfiguredArgs ? declaredParams : required).filter(param => {
       const value = opts.initialArgs?.[param.name]
-      return value !== undefined && value !== null && value !== '' && !checkLiteral(param.type, value)
+      return (opts.useConfiguredArgs ? Object.hasOwn(opts.initialArgs || {}, param.name) : value !== undefined && value !== null && value !== '') && !checkLiteral(param.type, value)
     }).map(param => [param.name, opts.initialArgs[param.name]]))
     // 手动运行直接采用声明默认值，只补齐未提供的必填值。
     modal.params = required.filter(param => !Object.hasOwn(suppliedRequiredArgs, param.name))
-    const suggestions = loadRunArgsSuggestion(opts.id || '', storage)
+    const suggestions = opts.useConfiguredArgs ? {} : loadRunArgsSuggestion(opts.id || '', storage)
     modal.suggestions = Object.fromEntries(modal.params.filter(param => Object.hasOwn(suggestions, param.name))
       .map(param => [param.name, suggestions[param.name]]))
     modal.templates = opts.templates || []
+    if (modal.mode === 'configure') {
+      suppliedRequiredArgs = {}
+      modal.params = declaredParams
+      modal.initialArgs = JSON.parse(JSON.stringify(opts.initialArgs || {}))
+      modal.suggestions = {}
+      modal.open = true
+      return { form: true, configuration: true }
+    }
     if (!modal.params.length) {
       await run(undefined)
       return { form: false }
@@ -171,17 +185,33 @@ export function useRunArgsFlow({ exec, notify = () => {}, storage = undefined, l
       ...(modal.deviceId ? { deviceId: modal.deviceId } : {}),
     }
     try {
+      if (modal.mode === 'configure') {
+        const errors = validateArgsAgainstParams(declaredParams, args)
+        if (errors.length) {
+          modal.fieldErrors = Object.fromEntries(errors.map(error => [error.name, [error.message]]))
+          return { ok: false, reason: 'invalid_args' }
+        }
+        if (!saveConfiguration) throw new Error('当前页面不支持保存目标运行配置')
+        const result = await saveConfiguration(opts)
+        modal.open = false
+        return { ok: true, configuration: true, result }
+      }
       const rep = await exec(opts)
       modal.open = false
       // 仅补填的必填值进建议缓存；声明默认值不写入，也不被旧覆盖缓存遮蔽。
-      if (args && Object.keys(args).length) saveRunArgsSuggestion(modal.targetId, args, storage)
+      if (saveSuggestions && args && Object.keys(args).length) saveRunArgsSuggestion(modal.targetId, args, storage)
       notify({
+        deviceId: opts.deviceId,
         rep,
         args,
         summary: describeResolvedArgs(declaredParams, args, rep?.resolved_args),
       })
       return { ok: true, rep }
     } catch (e) {
+      if (modal.mode === 'configure') {
+        modal.generalErrors = [e.message || String(e)]
+        return { ok: false, reason: 'configuration_error' }
+      }
       if (e && e.status === 400 && e.data && e.data.error === 'invalid_args' && modal.open) {
         const mapped = mapArgDiagnostics(
           e.data.diagnostics,

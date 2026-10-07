@@ -482,23 +482,39 @@ impl Inner {
             "generation.start" | "generation.create" | "generation.repair" => {
                 let mut v = v;
                 let repair = if action == "generation.repair" {
-                    ensure!(v.get("yaml").is_none() && v.get("templates").is_none(),
-                        "repair source must come from the selected failed run");
-                    let name = script_name(required(&v,"name")?)?;
-                    let run_id = required(&v,"run_id")?.to_string();
+                    ensure!(
+                        v.get("yaml").is_none() && v.get("templates").is_none(),
+                        "repair source must come from the selected failed run"
+                    );
+                    let name = script_name(required(&v, "name")?)?;
+                    let run_id = required(&v, "run_id")?.to_string();
                     let scope = crate::extensions::ai::automation::AutomationScope {
-                        context_id: uuid::Uuid::new_v4().to_string(), package_id: package.clone(),
-                        script_id: name.clone(), script_version: None, candidate_id: None,
-                        candidate_revision: None, run_id: Some(run_id.clone()), device_id: None,
+                        context_id: uuid::Uuid::new_v4().to_string(),
+                        package_id: package.clone(),
+                        script_id: name.clone(),
+                        script_version: None,
+                        candidate_id: None,
+                        candidate_revision: None,
+                        run_id: Some(run_id.clone()),
+                        device_id: None,
                     };
                     let record = self.scoped_run(&scope).await?;
-                    let db = self.diagnostics.lock().clone().context("run journal unavailable")?;
-                    let trace = db.trace.page(&run_id,0,100);
-                    let (yaml, context) = repair::from_run(&package,&name,&run_id,&record,&trace)?;
-                    v.as_object_mut().context("repair request object required")?.remove("run_id");
+                    let db = self
+                        .diagnostics
+                        .lock()
+                        .clone()
+                        .context("run journal unavailable")?;
+                    let trace = db.trace.page(&run_id, 0, 100);
+                    let (yaml, context) =
+                        repair::from_run(&package, &name, &run_id, &record, &trace)?;
+                    v.as_object_mut()
+                        .context("repair request object required")?
+                        .remove("run_id");
                     v["yaml"] = json!(yaml);
                     Some(context)
-                } else { None };
+                } else {
+                    None
+                };
                 let mut request: Create = serde_json::from_value(v)?;
                 if let Some(limits) = &request.limits {
                     limits.validate()?;
@@ -551,7 +567,9 @@ impl Inner {
                 base.retain(|path, _| {
                     path.starts_with("automations/") || path.starts_with("templates/")
                 });
-                if let Some(context) = repair.as_ref() { repair::check_base(context,&base)?; }
+                if let Some(context) = repair.as_ref() {
+                    repair::check_base(context, &base)?;
+                }
                 ensure!(
                     base.values().map(Vec::len).sum::<usize>() <= 64 * 1024 * 1024,
                     "candidate base exceeds 64 MiB"
@@ -1017,23 +1035,39 @@ impl Inner {
             limits.max_seconds
         };
         ensure!(seconds > 0, "generation_time_budget");
-        if generate && initial.candidate.repair.as_ref().is_some_and(|r| r.baseline_report.is_none()) {
+        if generate
+            && initial
+                .candidate
+                .repair
+                .as_ref()
+                .is_some_and(|r| r.baseline_report.is_none())
+        {
             initial.candidate.phase = Some("validating_failure_source".into());
             {
                 let _guard = self.gate.lock();
-                ensure!(!cancel.load(Ordering::Acquire),"CANCELLED");
+                ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
                 self.write(&initial)?;
             }
             let ffmpeg = self.ffmpeg_path.lock().clone();
-            let result = tokio::time::timeout(Duration::from_secs(seconds),
-                offline_validation::validate_candidate_with_media(validation_request(&initial)?,
-                    cancel.clone(),ffmpeg)).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(seconds),
+                offline_validation::validate_candidate_with_media(
+                    validation_request(&initial)?,
+                    cancel.clone(),
+                    ffmpeg,
+                ),
+            )
+            .await;
             let report = match result {
                 Ok(report) => report?,
-                Err(_) => { cancel.store(true,Ordering::Release); anyhow::bail!("repair_baseline_time_budget"); }
+                Err(_) => {
+                    cancel.store(true, Ordering::Release);
+                    anyhow::bail!("repair_baseline_time_budget");
+                }
             };
             let report = serde_json::to_value(report)?;
-            initial.candidate.repair.as_mut().unwrap().baseline_report = Some(compact_report(&report));
+            initial.candidate.repair.as_mut().unwrap().baseline_report =
+                Some(compact_report(&report));
             initial.candidate.report = Some(report);
             let _guard = self.gate.lock();
             ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
@@ -1203,7 +1237,7 @@ impl Inner {
                         s.candidate.phase = Some("retrying_model".into());
                         {
                             let _guard = self.gate.lock();
-                            ensure!(!cancel.load(Ordering::Acquire),"CANCELLED");
+                            ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
                             self.write(&s)?;
                         }
                         tokio::select! {
@@ -1215,15 +1249,19 @@ impl Inner {
                     anyhow::bail!("{error}");
                 }
                 let proposal = (|| -> Result<Proposal> {
-                    let proposal: Proposal = serde_json::from_value(model_images::resolve_proposal(
-                        response["proposal"].clone(),
-                        &prepared.as_ref().unwrap().selected,
-                    )?).context("candidate proposal invalid")?;
+                    let proposal: Proposal =
+                        serde_json::from_value(model_images::resolve_proposal(
+                            response["proposal"].clone(),
+                            &prepared.as_ref().unwrap().selected,
+                        )?)
+                        .context("candidate proposal invalid")?;
                     if let Some(context) = s.candidate.repair.as_ref() {
-                        repair::check_proposal(context,&proposal.yaml)?;
+                        repair::check_proposal(context, &proposal.yaml)?;
                     }
-                    ensure!(proposal.yaml.len() <= 512 * 1024 && proposal.explanation.len() <= 32000,
-                        "proposal too large");
+                    ensure!(
+                        proposal.yaml.len() <= 512 * 1024 && proposal.explanation.len() <= 32000,
+                        "proposal too large"
+                    );
                     let mut preview = s.clone();
                     preview.candidate.yaml = proposal.yaml.clone();
                     preview.candidate.templates = proposal.templates.clone();
@@ -1232,7 +1270,9 @@ impl Inner {
                 })();
                 let proposal = match proposal {
                     Ok(proposal) => proposal,
-                    Err(error) if s.candidate.repair.is_some() && attempt + 1 < limits.max_failures => {
+                    Err(error)
+                        if s.candidate.repair.is_some() && attempt + 1 < limits.max_failures =>
+                    {
                         s.candidate.reason = Some(error.to_string());
                         self.write(&s)?;
                         continue;
@@ -1696,7 +1736,11 @@ fn all_templates(s: &Stored) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut templates = BTreeMap::new();
     for (path, bytes) in &s.base {
         if let Some(name) = path.strip_prefix("templates/") {
-            if s.candidate.repair.as_ref().is_some_and(|r| !r.template_versions.contains_key(path)) {
+            if s.candidate
+                .repair
+                .as_ref()
+                .is_some_and(|r| !r.template_versions.contains_key(path))
+            {
                 continue;
             }
             if name.ends_with(".png") {
@@ -1767,7 +1811,17 @@ fn prompt_request(
         full_frames,
         bytes,
     } = prepared;
-    let template_names: Vec<_> = s.base.keys().filter(|path| s.candidate.repair.as_ref().is_none_or(|r| r.template_versions.contains_key(*path))).filter_map(|path|path.strip_prefix("templates/")).collect();
+    let template_names: Vec<_> = s
+        .base
+        .keys()
+        .filter(|path| {
+            s.candidate
+                .repair
+                .as_ref()
+                .is_none_or(|r| r.template_versions.contains_key(*path))
+        })
+        .filter_map(|path| path.strip_prefix("templates/"))
+        .collect();
     let context = json!({"candidate_id":s.candidate.id,"goal":s.candidate.goal,"samples":s.samples.iter().map(model_sample_context).collect::<Vec<_>>(),"current_yaml":s.candidate.yaml,"current_templates":s.candidate.templates,"existing_template_names":template_names,"validation":s.candidate.report.as_ref().map(compact_report),"last_error":s.candidate.reason,"repair":s.candidate.repair,"args":s.candidate.args,"execution_settings":s.candidate.execution_settings,"functions_sources":functions(s)?,"dsl":DSL_GUIDE,"native_functions":super::native_funcs::native_functions().iter().map(super::native_funcs::native_schema_json).collect::<Vec<_>>(),"image_selection":{"selected":selected,"total_frames":total_frames,"omitted_count":total_frames.saturating_sub(*full_frames),"image_bytes":bytes,"codec":"jpegli_quality90_444","policy":"Full views preserve source resolution with local Jpegli JPEG encoding. Accepted taps have original-pixel lossless PNG detail views. START/END and every action-before state remain selected; the next action-before image shows the previous action result and END shows the final result. Transition frames and all original evidence remain in offline validation. Return template crops as view_id plus rect normalized to that view; the server maps them to original pixels."}});
     // Estimate input allowance; supplier image-token accounting can differ.
     // Requests/output tokens are hard-bounded; unknown usage stops correction.
