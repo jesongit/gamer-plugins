@@ -255,10 +255,10 @@ export const videoApi = {
     { device_id: requireId(deviceId, 'device_id') },
   ),
 
-  /** POST /api/recording/:id/stop（合同 body「-」，无请求体）→ 200 终态 session（幂等）。 */
+  /** POST stop → 202 finalizing / 200 terminal; completion is polled by session id. */
   recordingStop: async (id) => request('POST', `/api/recording/${encodeURIComponent(requireId(id, 'recording_id'))}/stop`),
 
-  /** POST /api/recording/:id/cancel（合同 body「-」）→ 200 终态（已落盘部分保留为 interrupted 素材）。 */
+  /** POST cancel → 202 finalizing / 200 terminal; saved segments are retained. */
   recordingCancel: async (id) => request('POST', `/api/recording/${encodeURIComponent(requireId(id, 'recording_id'))}/cancel`),
 
   /** GET /api/recording → 会话列表；列表接口 404 表示服务未提供能力，不能当作空历史。 */

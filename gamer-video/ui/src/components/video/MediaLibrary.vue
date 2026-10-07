@@ -25,8 +25,8 @@
           @click="start"
         ><UiIcon name="record" /> 开始录制</button>
         <template v-else>
-          <button class="btn btn-sm btn-primary" type="button" :disabled="busy" data-testid="record-stop" @click="stop"><UiIcon name="stop" /> 停止并保存</button>
-          <button class="btn btn-sm btn-danger" type="button" :disabled="busy" data-testid="record-cancel" @click="cancel">取消</button>
+          <button class="btn btn-sm btn-primary" type="button" :disabled="busy || session.state === 'finalizing'" data-testid="record-stop" @click="stop"><UiIcon name="stop" /> {{ session.state === 'finalizing' ? '正在保存…' : '停止并保存' }}</button>
+          <button class="btn btn-sm btn-danger" type="button" :disabled="busy || session.state === 'finalizing'" data-testid="record-cancel" @click="cancel">取消</button>
         </template>
 
         <button class="btn btn-sm" type="button" :disabled="loading" data-testid="media-refresh" @click="$emit('refresh')"><UiIcon name="refresh" /> 刷新</button>
@@ -48,6 +48,7 @@
         </span>
     </div>
 
+    <p v-if="session?.state === 'finalizing'" class="zone-note" role="status" data-testid="record-saving">录制已停止，正在保存视频；完成后会自动加入素材库，可以继续使用其他功能。</p>
     <div v-if="importing" class="zone-note" role="status" data-testid="media-import-progress">
       正在上传并探测「{{ importingName }}」…（当前导入接口不提供取消操作）
     </div>
@@ -292,12 +293,24 @@ async function pollActive() {
   }
   const seq = ++pollSeq
   try {
+    const previous = session.value
+    if (previous?.state === 'finalizing') {
+      const result = await videoApi.recordingStatus(previous.id)
+      if (seq !== pollSeq || id !== deviceId.value) return
+      if (result.state === 'finalizing' || result.state === 'recording') {
+        session.value = result
+        if (currentRecording.value?.id === result.id) currentRecording.value = result
+      } else completeRecording(result)
+      return
+    }
     const active = await videoApi.activeRecording(id)
     if (seq === pollSeq) {
-      const previous = session.value
       session.value = active
       if (active && (!currentRecording.value || currentRecording.value.id === active.id)) currentRecording.value = active
-      if (previous && !active) { emit('changed'); void loadHistory() }
+      if (previous && !active) {
+        const result = await videoApi.recordingStatus(previous.id)
+        if (seq === pollSeq && id === deviceId.value) completeRecording(result)
+      }
     }
   } catch (e) {
     // 轮询失败不打断面板：保留上次结果，仅首次失败提示
@@ -307,6 +320,7 @@ async function pollActive() {
 
 function startPolling() {
   stopPolling()
+  session.value = null
   if (!deviceId.value) {
     session.value = null
     return
@@ -319,6 +333,7 @@ function startPolling() {
 function stopPolling() {
   if (pollTimer) clearInterval(pollTimer)
   pollTimer = null
+  pollSeq++
 }
 
 watch(deviceId, startPolling, { immediate: true })
@@ -326,6 +341,27 @@ watch(() => props.mediaList.length, () => { error.value = '' })
 onBeforeUnmount(stopPolling)
 
 // ---- 录制动作 ----
+
+function completeRecording(finished) {
+  session.value = null
+  currentRecording.value = finished
+  if (finished.state === 'completed') {
+    operationNote.value = '录制已保存'
+    emit('recording-finished', finished)
+  } else if (finished.state === 'cancelled') operationNote.value = '录制已取消，已保存的片段保留'
+  else error.value = finished.error || '录制未能完整保存，已写入的画面保留'
+  emit('changed')
+  void loadHistory()
+  void loadEvents(finished)
+}
+
+function acceptRecordingFinish(result) {
+  if (result?.state === 'finalizing' || result?.state === 'recording') {
+    session.value = result
+    currentRecording.value = result
+    operationNote.value = '正在保存录像'
+  } else if (result) completeRecording(result)
+}
 
 async function start() {
   if (!canRecord.value) { error.value = '当前目标尚不支持录制'; return }
@@ -352,13 +388,7 @@ async function stop() {
   error.value = ''
   try {
     const finished = await videoApi.recordingStop(current.id)
-    session.value = null
-    currentRecording.value = finished || current
-    operationNote.value = '录制已结束'
-    emit('recording-finished', finished)
-    emit('changed')
-    void loadHistory()
-    void loadEvents(currentRecording.value)
+    if (current.device_id === deviceId.value) acceptRecordingFinish(finished)
   } catch (e) {
     error.value = describe(e, '停止录制失败')
   } finally {
@@ -374,12 +404,7 @@ async function cancel() {
   error.value = ''
   try {
     const cancelled = await videoApi.recordingCancel(current.id)
-    session.value = null
-    currentRecording.value = cancelled || current
-    operationNote.value = '录制已取消'
-    emit('changed')
-    void loadHistory() // 已落盘部分保留为 interrupted 素材，媒体列表可能变化
-    void loadEvents(currentRecording.value)
+    if (current.device_id === deviceId.value) acceptRecordingFinish(cancelled)
   } catch (e) {
     error.value = describe(e, '取消录制失败')
   } finally {
