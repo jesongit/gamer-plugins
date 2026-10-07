@@ -187,6 +187,39 @@ async fn private_settings_roundtrip_does_not_depend_on_package_resources() {
 }
 
 #[tokio::test]
+async fn damaged_private_configuration_does_not_prevent_optional_service_construction() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root
+        .path()
+        .join("extension-data/gamer-ocr/private/settings.dat");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let corrupt = b"damaged protected OCR settings";
+    std::fs::write(&path, corrupt).unwrap();
+    let service = OcrService::new(root.path())
+        .expect("optional OCR configuration must not block Core startup");
+    for (action, values) in [
+        ("settings.read", json!({})),
+        ("status", json!({})),
+        ("recognize", json!({"png_base64":png(2,2),"language":"eng"})),
+        (
+            "settings.save",
+            json!({"engine_path":"","tessdata_path":""}),
+        ),
+    ] {
+        let error = service.call(action, values).await.unwrap_err();
+        assert!(
+            error.to_string().contains("配置"),
+            "{action} must explicitly report private configuration failure: {error}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        corrupt,
+        "failed calls must not replace damaged or foreign-identity configuration"
+    );
+}
+
+#[tokio::test]
 async fn encoded_waiting_requests_have_a_bounded_shared_queue() {
     let root = tempfile::tempdir().unwrap();
     let service = OcrService::new(root.path()).unwrap();

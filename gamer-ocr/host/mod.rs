@@ -199,7 +199,9 @@ impl OcrService {
             .join(ID)
             .join("private")
             .join("settings.dat");
-        let _ = settings::Settings::load(&settings_path)?;
+        // OCR is optional. Private configuration is read only when an actual
+        // call needs it, so an unavailable DPAPI identity or damaged file does
+        // not prevent the Core from starting. Calls retain strict validation.
         let (generation, _) = watch::channel(0);
         Ok(Self {
             state: Arc::new(State {
