@@ -107,9 +107,10 @@ fn yaml_acceptance_export_native_catalog() {
             _ => None,
         })
         .collect();
-    // Visual completion and intentional failure need separate success/failure
-    // fixtures, rather than appending fail to this successful primitive flow.
-    called.extend(["observe", "finish", "trace", "fail"].map(str::to_string));
+    // Visual completion, intentional failure, and local OCR providers have
+    // separate success/failure fixtures. The generic primitive flow must not
+    // depend on an externally installed engine or language model.
+    called.extend(["observe", "finish", "trace", "fail", "ocr", "find_text"].map(str::to_string));
     assert_eq!(
         called,
         crate::extensions::gamer_yaml::native_funcs::native_names(),

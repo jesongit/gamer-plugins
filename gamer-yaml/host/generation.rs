@@ -458,6 +458,18 @@ impl Inner {
             .call_extension_from_plugin(&caller, &ExtensionId::parse("gamer-ai")?, action, values)
             .await?)
     }
+
+    async fn ocr_recognizer(&self) -> Option<super::ocr_bridge::Recognizer> {
+        let service = self.extensions.lock().upgrade()?;
+        let caller = service
+            .plugin_call_context(&ExtensionId::parse(super::YAML_EXTENSION_ID).ok()?)
+            .await
+            .ok()?;
+        Some(super::ocr_bridge::recognizer(
+            Arc::downgrade(&service),
+            caller,
+        ))
+    }
     async fn dispatch(self: &Arc<Self>, action: &str, v: Value) -> Result<Value> {
         if action == "generation.readiness" {
             return Ok(match self.ai("automation.readiness", json!({})).await {
@@ -1051,10 +1063,11 @@ impl Inner {
             let ffmpeg = self.ffmpeg_path.lock().clone();
             let result = tokio::time::timeout(
                 Duration::from_secs(seconds),
-                offline_validation::validate_candidate_with_media(
+                offline_validation::validate_candidate_with_ocr(
                     validation_request(&initial)?,
                     cancel.clone(),
                     ffmpeg,
+                    self.ocr_recognizer().await,
                 ),
             )
             .await;
@@ -1310,10 +1323,11 @@ impl Inner {
             let ffmpeg_path = self.ffmpeg_path.lock().clone();
             let report = match tokio::time::timeout(
                 remaining,
-                offline_validation::validate_candidate_with_media(
+                offline_validation::validate_candidate_with_ocr(
                     request,
                     cancel.clone(),
                     ffmpeg_path,
+                    self.ocr_recognizer().await,
                 ),
             )
             .await

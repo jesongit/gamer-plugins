@@ -1,0 +1,57 @@
+manifest_version = 2
+id = "gamer-ocr"
+version = "0.1.0"
+name = "文字识别"
+description = "按需本地 OCR，为自动化提供文字、置信度和位置"
+permissions = ["ui.host", "vision.ocr"]
+
+[host_api]
+ui = "^1.1"
+vision = "^1.0"
+runtime = "^1.0"
+
+[targets.android]
+packages = ["*"]
+
+[execution]
+kind = "builtin"
+builtin_id = "gamer-ocr"
+host_version = ">=0.3.0"
+
+[[ui.contributions]]
+panel_id = "settings"
+title = "文字识别"
+order = 58
+location = "console.right"
+runtime = "declarative"
+requires_device = false
+description = "OCR 使用本机 Tesseract，识别结束即退出。路径留空使用自动检测；语言包需提前安装，不会自动下载。"
+
+[[ui.contributions.fields]]
+type = "text"
+name = "engine_path"
+label = "Tesseract 程序"
+placeholder = "留空自动检测 tesseract.exe"
+default = ""
+
+[[ui.contributions.fields]]
+type = "text"
+name = "tessdata_path"
+label = "语言包目录"
+placeholder = "留空使用程序旁的 tessdata"
+default = ""
+
+[[ui.contributions.fields]]
+type = "button"
+label = "保存路径"
+action = "settings.save"
+
+[[ui.contributions.fields]]
+type = "button"
+label = "读取配置"
+action = "settings.read"
+
+[[ui.contributions.fields]]
+type = "button"
+label = "检测可用性"
+action = "status"

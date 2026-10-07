@@ -57,6 +57,53 @@ const RETURN_NULL: &str = "null";
 const RETURN_MATCH: &str = "match?";
 const RETURN_BOOL: &str = "boolean";
 
+fn ocr_params() -> Vec<ParamSchema> {
+    vec![
+        p(
+            "region",
+            ParamType::List,
+            false,
+            None,
+            "原始截图区域 [x,y,w,h]（0..1 相对坐标）",
+        ),
+        p(
+            "language",
+            ParamType::String,
+            false,
+            Some(json!("chi_sim+eng")),
+            "已安装的 Tesseract 语言，例如 chi_sim+eng / eng",
+        ),
+        p(
+            "mode",
+            ParamType::String,
+            false,
+            Some(json!("block")),
+            "版面模式：line / block / sparse",
+        ),
+        p(
+            "whitelist",
+            ParamType::String,
+            false,
+            None,
+            "可选字符白名单，例如 0123456789:",
+        ),
+        p(
+            "scale",
+            ParamType::Integer,
+            false,
+            Some(json!(2)),
+            "识别前放大倍数 1..3；结果坐标始终对应原图",
+        ),
+        p(
+            "timeout",
+            ParamType::Duration,
+            false,
+            Some(json!("10s")),
+            "本地识别时间上限，最多 15s；超时明确失败",
+        ),
+    ]
+}
+
 pub(crate) fn native_functions() -> &'static [NativeFunction] {
     static FUNCTIONS: std::sync::LazyLock<Vec<NativeFunction>> = std::sync::LazyLock::new(|| {
         let mut functions = vec![
@@ -481,6 +528,42 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             returns: "object",
             permissions: &[],
         });
+        functions.push(NativeFunction {
+            name: "ocr",
+            display_name: "识别文字",
+            description:
+                "按需识别原始截图文字；返回文字、置信度、行和单词；OCR 插件不可用时明确失败",
+            params: ocr_params(),
+            returns: "object",
+            permissions: &[Permission::DeviceRead, Permission::VisionOcr],
+        });
+        let mut text_params = vec![
+            p("text", ParamType::String, true, None, "要查找的文字"),
+            p(
+                "match",
+                ParamType::String,
+                false,
+                Some(json!("contains")),
+                "contains 包含 / exact 完全匹配；按阅读顺序返回首个行或词",
+            ),
+            p(
+                "min_confidence",
+                ParamType::Number,
+                false,
+                Some(json!(0.5)),
+                "最低置信度 0..1",
+            ),
+        ];
+        text_params.extend(ocr_params());
+        functions.push(NativeFunction {
+            name: "find_text",
+            display_name: "查找文字",
+            description:
+                "单次识别并查找文字；未找到返回 null，命中可直接传给 tap；等待可使用 repeat",
+            params: text_params,
+            returns: "match?",
+            permissions: &[Permission::DeviceRead, Permission::VisionOcr],
+        });
         for name in ["observe", "finish"] {
             functions.push(NativeFunction {
                 name,
@@ -564,7 +647,7 @@ pub fn native_schema_json(func: &NativeFunction) -> Value {
         "name": func.name,
         "description": func.description,
         "source": "plugin",
-        "optional_extension": if func.name == "notify" { Some("gamer-notify") } else { None },
+        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "ocr" | "find_text" => Some("gamer-ocr"), _ => None },
         "params": func.params.iter().map(|param| {
             let mut schema = json!({
             "name": param.name,
@@ -605,6 +688,6 @@ mod tests {
                 timeouts += 1;
             }
         }
-        assert_eq!(timeouts, 5);
+        assert_eq!(timeouts, 7);
     }
 }

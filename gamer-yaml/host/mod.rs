@@ -27,6 +27,7 @@ pub(crate) mod error;
 pub(crate) mod generation;
 pub(crate) mod native_funcs;
 pub(crate) mod notification;
+pub(crate) mod ocr_bridge;
 pub(crate) mod offline_validation;
 mod reference_types;
 pub(crate) mod resources;
@@ -120,6 +121,11 @@ pub(crate) async fn run_yaml_program(
             program["trace"]["run_id"].as_str().map(str::to_string),
         )
     });
+    let ocr = service
+        .plugin_call_context(&id)
+        .await
+        .ok()
+        .map(|caller| ocr_bridge::recognizer(std::sync::Arc::downgrade(service), caller));
     service
         .with_guest_for_run(&id, move |wasm, host| async move {
             yaml_runtime()
@@ -131,6 +137,7 @@ pub(crate) async fn run_yaml_program(
                     stop,
                     sink,
                     notification,
+                    ocr,
                 })
                 .await
                 .map(|result| result.value)

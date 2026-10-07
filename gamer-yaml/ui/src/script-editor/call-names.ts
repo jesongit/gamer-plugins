@@ -7,6 +7,7 @@ export const NATIVE_CALL_NAMES: Record<string, string> = {
   launch: '启动应用', stop_app: '停止应用', sleep: '等待', log: '日志',
   find: '查找模板', find_any: '查找首个模板', wait_find: '等待模板出现', tap_template: '点击模板',
   wait_disappear: '等待模板消失', notify: '发送通知', eq: '等于', ne: '不等于',
+  ocr: '识别文字', find_text: '查找文字',
   gt: '大于', ge: '大于等于', lt: '小于', le: '小于等于',
 }
 

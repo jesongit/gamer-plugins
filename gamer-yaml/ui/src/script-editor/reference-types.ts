@@ -6,7 +6,7 @@ import { normalizeParamType } from './schema'
 import type { ValidationContext } from './validation'
 
 type Env = Map<string, string>
-const matches = new Set(['find', 'find_any', 'wait_find', 'tap_template'])
+const matches = new Set(['find', 'find_any', 'wait_find', 'tap_template', 'find_text'])
 const booleans = new Set(['wait_disappear', 'eq', 'ne', 'gt', 'ge', 'lt', 'le'])
 const strings = new Set(['string', 'template', 'key'])
 
@@ -22,7 +22,7 @@ function initial(params: ParamDecl[], vars: Record<string, unknown>): Env {
 function refType(path: string, env: Env): string {
   const [head, ...fields] = path.split('.')
   let type = env.get(head) || 'any'
-  const fieldsOfMatch: Record<string, string> = { center: 'point', template: 'template', score: 'number',
+  const fieldsOfMatch: Record<string, string> = { center: 'point', template: 'template', score: 'number', text: 'string', confidence: 'number',
     index: 'integer', x: 'integer', y: 'integer', width: 'integer', height: 'integer', region: 'object' }
   for (const field of fields) {
     type = type === 'match' ? fieldsOfMatch[field] || 'any'

@@ -174,11 +174,17 @@ foreach ($package in $packages) {
     $out = Join-Path $stagingRoot $name
     $packArgs = @('pack', '--manifest', $package.Manifest, '--out', $out)
     if ($package.Component) { $packArgs += @('--wasm', $package.Component) }
-    Invoke-Native 'node' @((Join-Path $RepoRoot 'tools\build-ui.mjs'), $package.Id) $RepoRoot | Out-Host
-    $uiRoot = Join-Path (Split-Path -Parent $package.Manifest) 'dist\ui'
-    foreach ($asset in Get-ChildItem -LiteralPath $uiRoot -File -Recurse | Sort-Object FullName) {
-        $relative = Get-RelativeReleasePath $uiRoot $asset.FullName
-        $packArgs += @('--file', "ui/$relative=$($asset.FullName)")
+    $sourceRoot = Split-Path -Parent $package.Manifest
+    if (Test-Path -LiteralPath (Join-Path $sourceRoot 'ui\package.json')) {
+        Invoke-Native 'node' @((Join-Path $RepoRoot 'tools\build-ui.mjs'), $package.Id) $RepoRoot | Out-Host
+        $uiRoot = Join-Path $sourceRoot 'dist\ui'
+        foreach ($asset in Get-ChildItem -LiteralPath $uiRoot -File -Recurse | Sort-Object FullName) {
+            $relative = Get-RelativeReleasePath $uiRoot $asset.FullName
+            $packArgs += @('--file', "ui/$relative=$($asset.FullName)")
+        }
+    }
+    elseif (@($package.Meta.ui.contributions | Where-Object { $_.runtime -ne 'declarative' }).Count -gt 0) {
+        throw "插件 $($package.Id) 的界面贡献缺少 ui/package.json"
     }
     $packOutput = Invoke-Native $PackerExe $packArgs $RepoRoot
     $package.Artifact = $out

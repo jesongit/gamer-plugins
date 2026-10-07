@@ -52,6 +52,7 @@ mod concurrency_tests {
                 self.runtime
                     .run(YamlWasmRunRequest {
                         notification: None,
+                        ocr: None,
                         wasm: self.wasm.clone(),
                         program,
                         host: host_with_permissions(

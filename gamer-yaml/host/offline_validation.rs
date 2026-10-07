@@ -133,6 +133,18 @@ pub async fn validate_candidate_with_media(
     stop: Arc<AtomicBool>,
     ffmpeg_path: String,
 ) -> Result<ValidationReport> {
+    validate_candidate_with_ocr(request, stop, ffmpeg_path, None).await
+}
+
+/// OCR may perform bounded local CPU work on recorded pixels. This callback
+/// cannot access a live device and the OCR provider never installs/downloads
+/// engines or language data while recognizing.
+pub(crate) async fn validate_candidate_with_ocr(
+    request: ValidationRequest,
+    stop: Arc<AtomicBool>,
+    ffmpeg_path: String,
+    ocr: Option<super::ocr_bridge::Recognizer>,
+) -> Result<ValidationReport> {
     ensure!(
         !request.samples.is_empty() && request.samples.len() <= 32,
         "需选择 1..32 份素材"
@@ -150,7 +162,7 @@ pub async fn validate_candidate_with_media(
     let fingerprint = candidate_sha256(&request)?;
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        validate_sync(request, stop, handle, fingerprint, ffmpeg_path)
+        validate_sync(request, stop, handle, fingerprint, ffmpeg_path, ocr)
     })
     .await?
 }
@@ -187,6 +199,7 @@ fn validate_sync(
     runtime: tokio::runtime::Handle,
     fingerprint: String,
     ffmpeg_path: String,
+    ocr: Option<super::ocr_bridge::Recognizer>,
 ) -> Result<ValidationReport> {
     let program = prepare_program(&request);
     let mut reports = Vec::new();
@@ -241,7 +254,8 @@ fn validate_sync(
             let native = runtime
                 .block_on(NativeYamlHost::new(host, context, stop.clone(), None))?
                 .with_runtime(replay.clone())
-                .with_settings(request.settings.clone());
+                .with_settings(request.settings.clone())
+                .with_ocr(ocr.clone());
             let state = native.run_state.clone();
             let events = ReplayEvents {
                 replay: replay.clone(),
@@ -1033,6 +1047,34 @@ impl RuntimeService for Replay {
 }
 #[async_trait]
 impl FrameService for Replay {
+    fn release(&self, frame: FrameHandle) {
+        // Evict only the transient decoded view of this captured handle. The
+        // original sample PNGs, clip anchors, and private media stay available.
+        self.png_cache
+            .lock()
+            .unwrap()
+            .retain(|entry| entry.handle != frame);
+        if let Some(clips) = &self.clips {
+            clips
+                .cached
+                .lock()
+                .unwrap()
+                .retain(|entry| entry.handle != frame);
+        }
+    }
+    async fn image_png(
+        &self,
+        frame: FrameHandle,
+        region: Option<SearchRegion>,
+    ) -> CapabilityResult<Vec<u8>> {
+        self.check_cancel()?;
+        let frame = self.frame(frame)?;
+        crate::matcher::compute::run(move || {
+            crate::capabilities::adapters::encode_frame_png(&frame.image, region)
+        })
+        .await
+        .map_err(|error| failed(error.to_string()))?
+    }
     async fn coordinate_space(
         &self,
         _: &DeviceHandle,
@@ -1240,6 +1282,77 @@ pub(crate) fn validation_fixture_samples() -> (String, BTreeMap<String, Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replay_ocr_reads_current_original_pixels_without_time_or_input_side_effects() {
+        use base64::Engine;
+        let sample = fixture(false);
+        let replay = Arc::new(
+            Replay::new(
+                &sample,
+                &BTreeMap::new(),
+                Arc::new(AtomicBool::new(false)),
+                "ffmpeg",
+            )
+            .unwrap(),
+        );
+        let registry = CapabilityRegistry::builder()
+            .with_device_service(replay.clone())
+            .with_frame_service(replay.clone())
+            .build();
+        let manifest = crate::extensions::manifest::parse_manifest(
+            super::super::yaml_extension::YAML_EXTENSION_MANIFEST_TOML.as_bytes(),
+        )
+        .unwrap();
+        let host =
+            crate::extensions::HostApi::for_manifest(registry, Default::default(), &manifest)
+                .unwrap();
+        let expected = crate::matcher::DecodedFrame::from_png(&sample.files["frames/f0.png"])
+            .unwrap()
+            .pixel_sha256();
+        let recognize: super::super::ocr_bridge::Recognizer = Arc::new(move |request| {
+            let expected = expected.clone();
+            Box::pin(async move {
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(request["png_base64"].as_str().unwrap())
+                    .unwrap();
+                let image = crate::matcher::DecodedFrame::from_png(&png).unwrap();
+                assert_eq!(image.dimensions(), (64, 48));
+                assert_eq!(image.pixel_sha256(), expected);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok(
+                    json!({"text":"123", "confidence":0.9, "lines":[], "words":[], "width":64, "height":48}),
+                )
+            })
+        });
+        let context = crate::core::AppContext {
+            device_id: crate::core::DeviceId::new("offline-replay").unwrap(),
+            android_package: None,
+            content_package: Some(crate::core::AppPackageId::new("offline-replay").unwrap()),
+        };
+        let native = NativeYamlHost::new(host, context, Arc::new(AtomicBool::new(false)), None)
+            .await
+            .unwrap()
+            .with_runtime(replay.clone())
+            .with_ocr(Some(recognize));
+        let result = native.call_function("ocr", json!({})).await.unwrap();
+        assert_eq!(result["text"], "123");
+        assert_eq!(result["_observed_at_ms"], 0);
+        assert_eq!(replay.now_ms(), 0);
+        assert!(replay.png_cache.lock().unwrap().is_empty());
+        let reloaded = replay.frame_at(0).unwrap();
+        assert_eq!(reloaded.id, "f0");
+        assert_eq!(
+            reloaded.image.pixel_sha256(),
+            crate::matcher::DecodedFrame::from_png(&sample.files["frames/f0.png"])
+                .unwrap()
+                .pixel_sha256()
+        );
+        let progress = replay.progress.lock().unwrap();
+        assert_eq!(progress.action, 0);
+        assert_eq!(progress.timeline_us, 0);
+        assert_eq!(progress.last_frame.as_deref(), Some("f0"));
+    }
     fn png(image: &image::RgbImage) -> Vec<u8> {
         let mut data = std::io::Cursor::new(vec![]);
         image.write_to(&mut data, image::ImageFormat::Png).unwrap();

@@ -32,6 +32,8 @@ use crate::extensions::gamer_yaml::native_funcs::{native_function, ParamSchema};
 use crate::extensions::gamer_yaml::syntax::{parse_duration_ms, point_components, ParamType};
 use crate::extensions::{HostApi, Permission};
 
+mod ocr;
+
 pub(crate) const YAML_EXTENSION_ID: &str = "gamer-yaml";
 /// 运行结构事件私有通道（guest → sink，先于权限校验拦截）。
 pub(crate) const EVENT_CAPABILITY: &str = "__event";
@@ -72,6 +74,7 @@ const MAX_SLEEP_MS: u64 = 3_600_000;
 /// （含冻结的 Package 函数表、绑定参数与可选 start_index）。
 pub(crate) struct YamlWasmRunRequest {
     pub(crate) notification: Option<super::notification::Sender>,
+    pub(crate) ocr: Option<super::ocr_bridge::Recognizer>,
     pub(crate) wasm: Vec<u8>,
     pub(crate) program: Value,
     pub(crate) host: HostApi,
@@ -159,6 +162,7 @@ impl YamlRunState {
 pub(crate) struct NativeYamlHost {
     pub(crate) run_state: Arc<YamlRunState>,
     notification: Option<super::notification::Sender>,
+    ocr: Option<super::ocr_bridge::Recognizer>,
     settings: super::settings::Settings,
     host: HostApi,
     registry: CapabilityRegistry,
@@ -290,6 +294,7 @@ impl NativeYamlHost {
         function: (&str, &str),
         settings: super::settings::Settings,
         notification: Option<super::notification::Sender>,
+        ocr: Option<super::ocr_bridge::Recognizer>,
         run_state: Arc<YamlRunState>,
     ) -> Result<Value> {
         let (name, args_json) = function;
@@ -299,6 +304,7 @@ impl NativeYamlHost {
         host.run_state = run_state;
         host.settings = settings;
         host.notification = notification;
+        host.ocr = ocr;
         // 录制输入来源标注：guest 实例线程内执行点（task-local 不跨线程），
         // 在此线程内把 YAML runner 注入的输入标为 "runner"。
         crate::capabilities::adapters::with_caller_input_source("runner", async {
@@ -326,6 +332,7 @@ impl NativeYamlHost {
         Ok(Self {
             run_state: Arc::new(YamlRunState::new()),
             notification: None,
+            ocr: None,
             settings: super::settings::Settings::default(),
             host,
             registry,
@@ -345,6 +352,11 @@ impl NativeYamlHost {
     }
     pub(crate) fn with_settings(mut self, settings: super::settings::Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    pub(crate) fn with_ocr(mut self, ocr: Option<super::ocr_bridge::Recognizer>) -> Self {
+        self.ocr = ocr;
         self
     }
 
@@ -422,6 +434,8 @@ impl NativeYamlHost {
             "sleep" => self.sleep(&bound).await,
             "log" => self.log(&bound).await,
             "find" => self.find(&bound).await,
+            "ocr" => self.ocr(&bound, false).await,
+            "find_text" => self.ocr(&bound, true).await,
             "find_any" => self.find_any(&bound).await,
             "wait_find" => self.wait_find(&bound).await,
             "tap_template" => self.tap_template(&bound).await,
@@ -1401,6 +1415,7 @@ pub(crate) mod tests {
         pub(crate) apps: Mutex<Vec<(String, String)>>,
         pub(crate) swipes: Mutex<Vec<SwipeGesture>>,
         pub(crate) keys: Mutex<Vec<KeyInput>>,
+        expected_stamp: Mutex<Option<crate::capabilities::FrameStamp>>,
     }
 
     #[async_trait]
@@ -1431,6 +1446,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl crate::capabilities::InputService for Trace {
+        async fn tap_from_frame(
+            &self,
+            device: &DeviceHandle,
+            point: TouchPoint,
+            stamp: Option<&crate::capabilities::FrameStamp>,
+        ) -> CapabilityResult<()> {
+            if stamp.is_some() && stamp != self.expected_stamp.lock().unwrap().as_ref() {
+                return Err(crate::capabilities::CapabilityError::InvalidRequest(
+                    "STALE_FRAME".into(),
+                ));
+            }
+            self.tap(device, point).await
+        }
         async fn tap(&self, _: &DeviceHandle, point: TouchPoint) -> CapabilityResult<()> {
             self.taps.lock().unwrap().push([point.x(), point.y()]);
             Ok(())
@@ -1498,6 +1526,7 @@ pub(crate) mod tests {
         pub(crate) captures: AtomicU64,
         pub(crate) outcomes: Mutex<VecDeque<MatchOutcome>>,
         pub(crate) match_calls: AtomicU64,
+        released: Mutex<Vec<FrameHandle>>,
         frames: Mutex<Vec<FrameHandle>>,
         regions: Mutex<Vec<Option<SearchRegion>>>,
         stamp: Mutex<Option<crate::capabilities::FrameStamp>>,
@@ -1511,6 +1540,7 @@ pub(crate) mod tests {
                 captures: AtomicU64::new(0),
                 outcomes: Mutex::new(VecDeque::new()),
                 match_calls: AtomicU64::new(0),
+                released: Mutex::new(Vec::new()),
                 frames: Mutex::new(Vec::new()),
                 regions: Mutex::new(Vec::new()),
                 stamp: Mutex::new(None),
@@ -1524,6 +1554,9 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl FrameService for VisionStub {
+        fn release(&self, frame: FrameHandle) {
+            self.released.lock().unwrap().push(frame);
+        }
         async fn stamp(
             &self,
             _frame: FrameHandle,
@@ -1545,6 +1578,21 @@ pub(crate) mod tests {
 
         async fn size(&self, _frame: FrameHandle) -> CapabilityResult<FrameSize> {
             Ok(self.size)
+        }
+        async fn image_png(
+            &self,
+            frame: FrameHandle,
+            region: Option<SearchRegion>,
+        ) -> CapabilityResult<Vec<u8>> {
+            self.frames.lock().unwrap().push(frame);
+            self.regions.lock().unwrap().push(region);
+            let image = image::RgbImage::from_fn(self.size.width, self.size.height, |x, y| {
+                image::Rgb([x as u8, y as u8, 17])
+            });
+            crate::capabilities::adapters::encode_frame_png(
+                &crate::matcher::DecodedFrame::from_rgb(image),
+                region,
+            )
         }
     }
 
@@ -1794,6 +1842,240 @@ log = "^1.0"
         assert!(trace.taps.lock().unwrap().is_empty());
         call("tap", json!({"position":{"x":0.2,"y":0.3}}), &host).unwrap();
         assert_eq!(trace.taps.lock().unwrap().len(), 1);
+    }
+
+    fn ocr_stamp() -> crate::capabilities::FrameStamp {
+        crate::capabilities::FrameStamp {
+            target: "device-1".into(),
+            epoch: "ocr-test".into(),
+            revision: 3,
+        }
+    }
+
+    fn ocr_reply(width: u32, height: u32) -> Value {
+        let word =
+            json!({"text":"排队 123", "confidence":0.95, "x":10,"y":20,"width":80,"height":30});
+        json!({"text":"排队 123","confidence":0.95,"width":width,"height":height,"lines":[word.clone()],"words":[word]})
+    }
+
+    #[tokio::test]
+    async fn ocr_uses_original_roi_and_maps_text_center_to_guarded_tap() {
+        use base64::Engine;
+        let trace = Arc::new(Trace::default());
+        *trace.expected_stamp.lock().unwrap() = Some(ocr_stamp());
+        let stub = VisionStub::new(FrameSize::new(1000, 500));
+        *stub.stamp.lock().unwrap() = Some(ocr_stamp());
+        let host = vision_host(
+            trace.clone(),
+            &stub,
+            LogTrace::new(),
+            &["device.read", "vision.ocr", "input.tap"],
+        );
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = received.clone();
+        let recognize: super::super::ocr_bridge::Recognizer = Arc::new(move |request| {
+            requests.lock().unwrap().push(request);
+            Box::pin(async { Ok(ocr_reply(400, 100)) })
+        });
+        let mut native =
+            NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                .await
+                .unwrap()
+                .with_ocr(Some(recognize));
+        native.settings.before_click_ms = 0;
+        native.settings.after_click_ms = 0;
+        let result = native
+            .call_function(
+                "find_text",
+                json!({"text":"排队", "region":[0.2,0.3,0.4,0.2]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stub.captures.load(Ordering::Relaxed), 1);
+        assert_eq!(stub.released.lock().unwrap().len(), 1);
+        assert_eq!(
+            *stub.regions.lock().unwrap(),
+            vec![Some(SearchRegion::new(200, 150, 400, 100))]
+        );
+        let request = received.lock().unwrap()[0].clone();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(request["png_base64"].as_str().unwrap())
+            .unwrap();
+        let image = crate::matcher::DecodedFrame::from_png(&png).unwrap();
+        assert_eq!(image.dimensions(), (400, 100));
+        assert_eq!(image.pixel(0, 0), Some([200, 150, 17]));
+        assert_eq!(request["scale"], 2);
+        assert_eq!(request["timeout_ms"], 10_000);
+        assert_eq!(result["x"], 210);
+        assert_eq!(result["y"], 170);
+        assert_eq!(result["center"]["x"], 0.25);
+        assert_eq!(result["center"]["y"], 0.37);
+        assert_eq!(result["_frame"], json!(ocr_stamp()));
+        native
+            .call_function("tap", json!({"position":result.clone()}))
+            .await
+            .unwrap();
+        assert_eq!(*trace.taps.lock().unwrap(), vec![[250, 185]]);
+        trace.expected_stamp.lock().unwrap().as_mut().unwrap().epoch = "new-connection".into();
+        assert!(native
+            .call_function("tap", json!({"position":result}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("STALE_FRAME"));
+        assert_eq!(trace.taps.lock().unwrap().len(), 1);
+        for args in [
+            json!({"text":"缺失", "region":[0.2,0.3,0.4,0.2]}),
+            json!({"text":"排队", "match":"exact", "region":[0.2,0.3,0.4,0.2]}),
+            json!({"text":"排队", "min_confidence":0.99, "region":[0.2,0.3,0.4,0.2]}),
+        ] {
+            assert_eq!(
+                native.call_function("find_text", args).await.unwrap(),
+                Value::Null
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ocr_permission_and_provider_errors_never_become_empty_success() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 500));
+        *stub.stamp.lock().unwrap() = Some(ocr_stamp());
+        for permissions in [&["device.read"][..], &["device.read", "vision.ocr"][..]] {
+            let host = vision_host(trace.clone(), &stub, LogTrace::new(), permissions);
+            let native =
+                NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                    .await
+                    .unwrap();
+            let error = native
+                .call_function("ocr", json!({}))
+                .await
+                .unwrap_err()
+                .to_string();
+            if permissions.len() == 1 {
+                assert!(error.contains("vision.ocr"), "{error}");
+            } else {
+                assert!(error.contains("OCR_UNAVAILABLE"), "{error}");
+            }
+        }
+        assert_eq!(stub.captures.load(Ordering::Relaxed), 0);
+        let host = vision_host(
+            trace,
+            &stub,
+            LogTrace::new(),
+            &["device.read", "vision.ocr"],
+        );
+        let recognize: super::super::ocr_bridge::Recognizer =
+            Arc::new(|_| Box::pin(async { bail!("OCR_ENGINE_MISSING") }));
+        let native =
+            NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                .await
+                .unwrap()
+                .with_ocr(Some(recognize));
+        assert!(native
+            .call_function("ocr", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("OCR_ENGINE_MISSING"));
+        assert_eq!(stub.released.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ocr_cancel_drops_recognition_without_advancing_runtime_clock() {
+        struct InFlight(Arc<AtomicBool>);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 500));
+        *stub.stamp.lock().unwrap() = Some(ocr_stamp());
+        let host = vision_host(
+            trace.clone(),
+            &stub,
+            LogTrace::new(),
+            &["device.read", "vision.ocr"],
+        );
+        let clock = Arc::new(ClickClock {
+            trace,
+            sleeps: Mutex::new(vec![]),
+            stop: AtomicBool::new(false),
+            cancel_on_sleep: false,
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = dropped.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let recognize: super::super::ocr_bridge::Recognizer = Arc::new(move |_| {
+            let marker = marker.clone();
+            let signal = signal.clone();
+            Box::pin(async move {
+                let _guard = InFlight(marker);
+                signal.notify_one();
+                std::future::pending::<Result<Value>>().await
+            })
+        });
+        let native =
+            NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                .await
+                .unwrap()
+                .with_runtime(clock.clone())
+                .with_ocr(Some(recognize));
+        let cancel_clock = clock.clone();
+        let (result, ()) = tokio::join!(native.call_function("ocr", json!({})), async move {
+            started.notified().await;
+            cancel_clock.stop.store(true, Ordering::SeqCst);
+        });
+        assert!(result.unwrap_err().to_string().contains("CANCELLED"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+        assert_eq!(stub.released.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ocr_rejects_unsafe_regions_modes_deadlines_and_provider_geometry() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 500));
+        *stub.stamp.lock().unwrap() = Some(ocr_stamp());
+        let host = vision_host(
+            trace,
+            &stub,
+            LogTrace::new(),
+            &["device.read", "vision.ocr"],
+        );
+        let recognize: super::super::ocr_bridge::Recognizer =
+            Arc::new(|_| Box::pin(async { Ok(ocr_reply(400, 100)) }));
+        let native =
+            NativeYamlHost::new(host, test_context(), Arc::new(AtomicBool::new(false)), None)
+                .await
+                .unwrap()
+                .with_ocr(Some(recognize));
+        for args in [
+            json!({"region":[0.8,0.2,0.3,0.5]}),
+            json!({"region":[0.2,0.2,0.0,0.3]}),
+            json!({"mode":"auto"}),
+            json!({"scale":4}),
+            json!({"timeout":"16s"}),
+        ] {
+            assert!(native
+                .call_function("ocr", args)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("OCR_INVALID_ARGUMENT"));
+        }
+        assert!(native
+            .call_function("ocr", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("OCR_INVALID_RESULT"));
+        assert_eq!(
+            stub.released.lock().unwrap().len() as u64,
+            stub.captures.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -2794,6 +3076,7 @@ runtime = "^1.0"
     ) -> YamlWasmRunRequest {
         YamlWasmRunRequest {
             notification: None,
+            ocr: None,
             wasm: guest_component(),
             program,
             host,

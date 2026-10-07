@@ -160,6 +160,7 @@ struct YamlHostState {
     contract_deadline: Option<Instant>,
     run_state: Arc<super::yaml_extension::YamlRunState>,
     notification: Option<super::notification::Sender>,
+    ocr: Option<super::ocr_bridge::Recognizer>,
     current_trace: Option<serde_json::Value>,
     settings: super::settings::Settings,
     host: HostApi,
@@ -180,6 +181,7 @@ impl YamlHostState {
             contract_deadline: None,
             run_state: Arc::new(super::yaml_extension::YamlRunState::new()),
             notification: None,
+            ocr: None,
             current_trace: None,
             host,
             cancelled,
@@ -288,6 +290,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
             });
             let settings = self.settings.clone();
             let notification = self.notification.clone();
+            let ocr = self.ocr.clone();
             let run_state = self.run_state.clone();
             let result = block_on_yaml(async move {
                 let context =
@@ -316,6 +319,7 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     (&name, &serde_json::to_string(&args)?),
                     settings,
                     notification,
+                    ocr,
                     run_state,
                 )
                 .await?;
@@ -440,6 +444,7 @@ impl LazyYamlWasmtimeRuntime {
             request.sink.clone(),
         );
         state.notification = request.notification;
+        state.ocr = request.ocr;
         *state.run_state.trace_context.write().unwrap() = request
             .program
             .get("trace")

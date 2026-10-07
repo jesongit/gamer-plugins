@@ -47,7 +47,8 @@ fn reference(path: &str, env: &Env) -> Type {
         ty = match (ty, field) {
             (Type::Match, "center") => Type::Known(ParamType::Point),
             (Type::Match, "template") => Type::Known(ParamType::Template),
-            (Type::Match, "score") => Type::Known(ParamType::Number),
+            (Type::Match, "text") => Type::Known(ParamType::String),
+            (Type::Match, "score" | "confidence") => Type::Known(ParamType::Number),
             (Type::Match, "index" | "x" | "y" | "width" | "height") => {
                 Type::Known(ParamType::Integer)
             }
