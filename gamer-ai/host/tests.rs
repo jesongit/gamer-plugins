@@ -140,7 +140,11 @@ pub(super) fn record() -> SessionRecord {
         reason: None,
         pause_reason: None,
         messages: vec![UserMessage::new("goal")],
-        limits: Limits::default(),
+        // Budget regressions use an explicit finite cap independent of defaults.
+        limits: Limits {
+            max_tokens: 100_000,
+            ..Limits::default()
+        },
         usage: Usage::default(),
         events: vec![],
     }
@@ -1437,6 +1441,7 @@ async fn local_browser_mcp_pause_resume_and_model_gameplay_roundtrip() {
     // limit to zero permits continuation without erasing unknown usage.
     {
         let mut record = session.record.lock();
+        record.limits.max_tokens = 100_000;
         record.usage.known_tokens = record.limits.max_tokens + 100;
         record.usage.has_unknown_tokens = true;
         record.usage.total_tokens = None;

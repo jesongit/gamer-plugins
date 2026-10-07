@@ -63,6 +63,24 @@ describe('source-only YAML v2', () => {
 })
 
 describe('candidate revisions and validation gate', () => {
+  it('keeps a saved passing report visible without offering another final save', async () => {
+    const saved = candidate({ state: 'saved', report: report() })
+    api.callExtension.mockImplementation(async (_, action) => action === 'generation.readiness'
+      ? { ready: true }
+      : action === 'generation.list' ? { candidates: [saved] }
+        : action === 'generation.get' ? { candidate: saved, base_yaml: '', base_exists: false }
+          : { samples: [], revisions: [] })
+    api.listPluginResources.mockResolvedValue({ resources: [] })
+    const wrapper = mount(AutomationGenerationPanel, { props: { packageId: 'pkg' } })
+    try {
+      await flushPromises()
+      await wrapper.find('.candidate-picker select').setValue('c1')
+      await flushPromises()
+      expect(wrapper.find('.candidate > header strong').text()).toBe('已保存正式版本')
+      expect(wrapper.find('.report h4').text()).toBe('全部素材通过')
+      expect(wrapper.findAll('button').find(button => button.text() === '确认保存正式版本').attributes('disabled')).toBeDefined()
+    } finally { wrapper.unmount() }
+  })
   it('requires every exact selected sample, rejects duplicates and evidence insufficiency', () => {
     expect(allSamplesPassed(candidate({ state: 'passed', report: report() }))).toBe(true)
     for (const reportValue of [report(['passed', 'insufficient_evidence']), { status: 'passed', samples: [{ sample_id: 'a', status: 'passed' }] }, { status: 'passed', samples: [{ sample_id: 'a', status: 'passed' }, { sample_id: 'a', status: 'passed' }] }]) expect(allSamplesPassed(candidate({ state: 'passed', report: reportValue }))).toBe(false)
@@ -283,4 +301,31 @@ it('does not offer a download link for expired or unreadable trace evidence', as
     expect(wrapper.find('a[download]').exists()).toBe(false)
     expect(wrapper.get('button[aria-label="保存原始画面"]').element.disabled).toBe(true)
   } finally { wrapper.unmount() }
+})
+
+
+describe('failed-run AI repair entry', () => {
+  it('uses the selected run and complete existing samples without providing hand-fixed source', async () => {
+    const request = pluginMessageChannel('gamer-yaml:open-generation')
+    request.packageId = 'pkg'; request.candidateId = null; request.repairRun = { scriptId: 'demo.yaml', runId: 'failed-run' }; request.seq++
+    api.callExtension.mockImplementation(async (_, action) => action === 'generation.readiness' ? { ready: true }
+      : action === 'generation.list' ? { candidates: [candidate({ state: 'saved' })] }
+        : action === 'sample.list' ? { samples: [{ id: 'a', name: 'rewarded', status: 'complete' }, { id: 'b', name: 'no rewards', status: 'complete' }, { id: 'bad', status: 'unable_to_validate' }] }
+          : action === 'generation.repair' ? { candidate: candidate({ state: 'generating', repair: { run_id: 'failed-run' } }) }
+            : { revisions: [] })
+    api.listPluginResources.mockResolvedValue({ resources: [] })
+    const wrapper = mount(AutomationGenerationPanel, { props: { packageId: 'pkg' } })
+    try {
+      await flushPromises()
+      expect(wrapper.text()).toContain('failed-run')
+      const boxes = wrapper.findAll('.samples input')
+      expect(boxes[0].element.checked).toBe(true); expect(boxes[1].element.checked).toBe(true)
+      expect(boxes[2].attributes('disabled')).toBeDefined()
+      await wrapper.findAll('button').find(b => b.text() === '开始 AI 修复并验证全部素材').trigger('click'); await flushPromises()
+      const call = api.callExtension.mock.calls.find(([, action]) => action === 'generation.repair')
+      expect(call[2]).toEqual(expect.objectContaining({ package_id: 'pkg', name: 'demo.yaml', run_id: 'failed-run', samples: [{ sample_id: 'a', plugin_id: 'gamer-video' }, { sample_id: 'b', plugin_id: 'gamer-video' }] }))
+      expect(call[2]).not.toHaveProperty('yaml'); expect(call[2]).not.toHaveProperty('templates')
+      expect(api.callExtension.mock.calls.some(([, action]) => action === 'generation.save')).toBe(false)
+    } finally { wrapper.unmount(); request.packageId = ''; request.repairRun = null; request.seq++ }
+  })
 })

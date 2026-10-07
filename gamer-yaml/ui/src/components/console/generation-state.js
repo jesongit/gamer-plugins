@@ -4,7 +4,7 @@ export const candidateRunning = candidate => ['generating', 'validating'].includ
 export const validationLabel = status => ({ passed: '通过', failed: '逻辑或匹配失败', insufficient_evidence: '证据不足', unsupported: '不支持' }[status] || '未验证')
 export function allSamplesPassed(candidate) {
   const ids = candidate?.sample_ids || [], report = candidate?.report
-  return candidate?.state === 'passed' && report?.status === 'passed' && ids.length > 0
+  return ['passed', 'saved'].includes(candidate?.state) && report?.status === 'passed' && ids.length > 0
     && new Set(ids).size === ids.length && report.samples?.length === ids.length
     && ids.every(id => report.samples.filter(sample => sample.sample_id === id && sample.status === 'passed').length === 1)
 }
@@ -22,7 +22,7 @@ export function useGenerationState(packageId, call) {
   let scope = 0, request = 0, pollRequest = 0, refreshRequest = 0, timer, disposed = false
   const dirty = computed(() => !!candidate.value && yaml.value !== candidate.value.yaml)
   const running = computed(() => candidateRunning(candidate.value))
-  const canSave = computed(() => !busy.value && !dirty.value && baselineReady.value && allSamplesPassed(candidate.value))
+  const canSave = computed(() => !busy.value && !dirty.value && baselineReady.value && candidate.value?.state === 'passed' && allSamplesPassed(candidate.value))
   function acceptBase(result) {
     verificationScope.value = result.verification_scope && typeof result.verification_scope === 'object' && !Array.isArray(result.verification_scope) ? result.verification_scope : null
     if (typeof result.base_yaml === 'string' && typeof result.base_exists === 'boolean') { baseline.value = result.base_yaml; baseExists.value = result.base_exists; baselineReady.value = true }
@@ -69,7 +69,7 @@ export function useGenerationState(packageId, call) {
     try {
       const result = await call(action, values)
       if (token !== scope || serial !== request) return false
-      if (action === 'generation.start' || action === 'generation.create') { baseline.value = ''; baselineReady.value = false; baseExists.value = false }
+      if (['generation.start', 'generation.create', 'generation.repair'].includes(action)) { baseline.value = ''; baselineReady.value = false; baseExists.value = false }
       if (result.candidate && accept(result.candidate)) acceptBase(result)
       if (action === 'generation.rollback') { notice.value = '版本已回退；请重新加载编辑器与模板'; await refresh() }
       if (action === 'generation.save') { notice.value = extra.mode === 'validated' ? '已原子保存已验证脚本、模板与版本记录' : '候选草稿已保留，未写入正式资源'; await refresh() }

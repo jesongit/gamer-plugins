@@ -138,6 +138,18 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         mapping: "",
     },
     PublicAction {
+        name: "generation.repair",
+        version: 1,
+        surface: ActionSurface::Native,
+        summary: "Repair the selected failed run from its source snapshot and validate all selected samples",
+        caller: "user-management",
+        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
+        caller_permissions: &[],
+        context: &["package_id"],
+        params: &["name", "run_id", "goal", "samples"],
+        mapping: "",
+    },
+    PublicAction {
         name: "generation.get",
         version: 1,
         surface: ActionSurface::Native,

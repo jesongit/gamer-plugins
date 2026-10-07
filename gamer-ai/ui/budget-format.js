@@ -1,4 +1,4 @@
-export const DEFAULT_LIMITS = {max_turns:40,max_actions:120,max_seconds:600,max_tokens:100000,max_failures:3}
+export const DEFAULT_LIMITS = {max_turns:40,max_actions:120,max_seconds:600,max_tokens:0,max_failures:3}
 export const LIMIT_FIELDS = [
   {key:'max_turns',label:'模型轮数',min:1,max:500},
   {key:'max_actions',label:'工具次数',min:1,max:2000},

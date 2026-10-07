@@ -7,3 +7,12 @@ export function requestAutomationContext(packageId, automation) {
   automationAiRequest.seq += 1
   return true
 }
+export function requestRunRepair(packageId, scriptId, runId) {
+  if (!packageId || !scriptId || !runId) return false
+  const request = pluginMessageChannel('gamer-yaml:open-generation')
+  request.packageId = String(packageId)
+  request.candidateId = null
+  request.repairRun = { scriptId: String(scriptId), runId: String(runId) }
+  request.seq += 1
+  return true
+}

@@ -11,7 +11,7 @@
       <span v-if="target && target !== journal.record.entrypoint" class="other-target">此记录来自其他脚本或函数</span>
       <div class="run-counts"><span>{{ steps.length }} 个执行动作</span><span>成功 {{ counts.success }}</span><span v-if="counts.running">运行中 {{ counts.running }}</span><span v-if="counts.failed" class="failed">失败 {{ counts.failed }}</span><span v-if="counts.cancelled">停止 {{ counts.cancelled }}</span></div>
     </div>
-    <div class="trace-toolbar"><button class="btn btn-sm" :disabled="!journal.record" @click="showTrace = !showTrace">图像证据 ({{ trace.images.length }})</button><button class="btn btn-sm" :disabled="!journal.record || !aiAvailable || sendingContext" :title="aiAvailable ? '附上当前运行供 AI 只读分析' : 'AI 助手未运行'" @click="sendToAi">交给 AI 分析</button><button class="btn btn-sm" :disabled="!journal.record?.finished_at || !trace.images.length || trace.status === 'retained' || retaining" @click="retainTrace">{{ trace.status === 'retained' ? '证据已保留' : '长期保留证据' }}</button><span v-if="trace.status === 'expired'">证据已过期</span><span v-else-if="!trace.enabled">Trace 关闭</span><span v-if="trace.gaps.length">{{ trace.gaps.length }} 处证据缺口</span></div>
+    <div class="trace-toolbar"><button class="btn btn-sm" :disabled="!journal.record" @click="showTrace = !showTrace">图像证据 ({{ trace.images.length }})</button><button class="btn btn-sm" :disabled="!journal.record || !aiAvailable || sendingContext" :title="aiAvailable ? '附上当前运行供 AI 只读分析' : 'AI 助手未运行'" @click="sendToAi">交给 AI 分析</button><button class="btn btn-sm" :disabled="journal.record?.state !== 'failed' || !aiAvailable" @click="sendToRepair">交给 AI 修复</button><button class="btn btn-sm" :disabled="!journal.record?.finished_at || !trace.images.length || trace.status === 'retained' || retaining" @click="retainTrace">{{ trace.status === 'retained' ? '证据已保留' : '长期保留证据' }}</button><span v-if="trace.status === 'expired'">证据已过期</span><span v-else-if="!trace.enabled">Trace 关闭</span><span v-if="trace.gaps.length">{{ trace.gaps.length }} 处证据缺口</span></div>
     <RunTraceImages v-if="showTrace" class="run-trace" :run-id="journal.selected" :images="trace.images" :status="trace.status" :enabled="trace.enabled" :gaps="trace.gaps" />
     <p v-if="trace.error" class="failure-text">{{ trace.error }}</p>
     <button v-if="showTrace && trace.hasMore" class="btn btn-sm" :disabled="trace.loading" @click="trace.refresh">加载更多图像</button>
@@ -42,7 +42,7 @@ import { useRunJournal } from './useRunJournal'
 import { actionRunRows, buildRunTree, filterRunRows, flattenRunTree, stateText } from './run-journal'
 import { api } from '../../../../../../web/src/api'
 import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
-import { requestAutomationContext } from './automationAiBridge'
+import { requestAutomationContext, requestRunRepair } from './automationAiBridge'
 import { useRunTrace } from './useRunTrace'
 import RunTraceImages from './RunTraceImages.vue'
 import RunJournalRow from './RunJournalRow.vue'
@@ -74,6 +74,17 @@ async function sendToAi() {
   if (workspace?.getSnapshot?.().currentPackageId !== pkg) { journal.error = `请先切换到运行所属配置包 ${pkg}，避免跨包分析`; return }
   sendingContext.value = true
   try { requestAutomationContext(pkg, { script_id: entrypoint.slice(pkg.length + 1), run_id: record.run_id }); await workspace?.uiBridge.workspace.openPanel('gamer-ai:ai') } catch (e) { journal.error = e.message } finally { sendingContext.value = false }
+}
+async function sendToRepair() {
+  const record = journal.record
+  if (!record || record.state !== 'failed' || !aiAvailable.value) return
+  const entrypoint = String(record.entrypoint || ''), pkg = entrypoint.split('/')[0]
+  if (record.runner_id !== 'gamer-yaml' || workspace?.getSnapshot?.().currentPackageId !== pkg) {
+    journal.error = '请先选择当前配置包的 YAML 失败运行'; return
+  }
+  requestRunRepair(pkg, entrypoint.slice(pkg.length + 1), record.run_id)
+  try { await workspace?.uiBridge.workspace.openPanel('gamer-yaml:automation') }
+  catch (e) { journal.error = e.message }
 }
 const tree = computed(() => buildRunTree(journal.events, journal.hasMore ? null : journal.record))
 const rows = computed(() => flattenRunTree(tree.value))

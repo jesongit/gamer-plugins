@@ -252,7 +252,7 @@ impl Default for Limits {
             max_turns: 40,
             max_actions: 120,
             max_seconds: 600,
-            max_tokens: 100_000,
+            max_tokens: 0,
             max_failures: 3,
         }
     }

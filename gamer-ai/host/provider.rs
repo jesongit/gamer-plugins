@@ -141,6 +141,7 @@ pub struct Provider {
     config: ConnectionConfig,
     http: reqwest::Client,
     max_output_tokens: u32,
+    candidate_reasoning_effort: Option<&'static str>,
 }
 
 impl Provider {
@@ -167,7 +168,20 @@ impl Provider {
             config,
             http,
             max_output_tokens,
+            candidate_reasoning_effort: None,
         })
+    }
+
+    /// Structured candidates have deterministic replay feedback. Avoid the
+    /// GLM-5.3 default max thinking workload for each bounded correction turn;
+    /// other providers and ordinary chat/game decisions retain their settings.
+    pub(super) fn with_candidate_profile(mut self, repair: bool) -> Self {
+        if self.config.model.to_ascii_lowercase().starts_with("glm-5.3")
+            && official_glm_endpoint(&self.config.base_url,&self.config.model,&self.config.protocol)
+        {
+            self.candidate_reasoning_effort = Some(if repair { "low" } else { "high" });
+        }
+        self
     }
 
     pub async fn turn(
@@ -300,6 +314,13 @@ impl Provider {
                 "max_tokens"
             };
             body[key] = json!(self.max_output_tokens);
+        }
+        if let Some(effort) = self.candidate_reasoning_effort {
+            if self.config.protocol == "responses" {
+                body["reasoning"] = json!({"effort":effort});
+            } else {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         // GLM documents public thinking for Chat Completions. Its Responses
         // API already thinks by default and has no reasoning.summary option.
@@ -1887,6 +1908,23 @@ mod tests {
             provider.max_output_tokens = 0;
             let (_, body) = provider.request_body(&[], &[], None, false).unwrap();
             assert!(body.get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn candidate_reasoning_profile_is_scoped_to_official_glm_without_changing_chat() {
+        for protocol in ["responses","chat_completions"] {
+            let ordinary=glm_provider(protocol);
+            let (_,body)=ordinary.request_body(&[],&[],None,true).unwrap();
+            assert!(body.get("reasoning").is_none() && body.get("reasoning_effort").is_none());
+            let candidate=ordinary.with_candidate_profile(true);
+            let (_,body)=candidate.request_body(&[],&[],None,true).unwrap();
+            if protocol=="responses" { assert_eq!(body["reasoning"]["effort"],"low"); }
+            else { assert_eq!(body["reasoning_effort"],"low"); }
+            let mut other=glm_provider(protocol);
+            other.config.base_url="https://example.com/v1".into();
+            let (_,body)=other.with_candidate_profile(true).request_body(&[],&[],None,true).unwrap();
+            assert!(body.get("reasoning").is_none() && body.get("reasoning_effort").is_none());
         }
     }
 

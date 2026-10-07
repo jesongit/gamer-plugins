@@ -1,4 +1,8 @@
 //! Candidate orchestration belongs to automation; the optional AI service only proposes.
+#[path = "generation/model_images.rs"]
+mod model_images;
+#[path = "generation/repair.rs"]
+mod repair;
 use super::{
     offline_validation::{self, ValidationRequest},
     revisions,
@@ -32,6 +36,7 @@ pub(crate) const ACTIONS: &[&str] = &[
     "generation.readiness",
     "generation.create",
     "generation.start",
+    "generation.repair",
     "generation.get",
     "generation.template",
     "generation.list",
@@ -69,7 +74,7 @@ impl Limits {
             (1..=500).contains(&self.max_attempts)
                 && (1..=20).contains(&self.max_failures)
                 && (10..=7200).contains(&self.max_seconds)
-                && (2048..=2_000_000).contains(&self.max_tokens),
+                && (self.max_tokens == 0 || (2048..=2_000_000).contains(&self.max_tokens)),
             "invalid generation limits"
         );
         Ok(())
@@ -136,6 +141,10 @@ pub(crate) struct Candidate {
     #[serde(default)]
     pub active_seconds: f64,
     pub unknown_usage: bool,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub model_input: Option<Value>,
     pub reason: Option<String>,
     pub explanation: String,
     pub base_version: String,
@@ -146,6 +155,8 @@ pub(crate) struct Candidate {
     pub args: serde_json::Map<String, Value>,
     #[serde(default)]
     pub execution_settings: super::settings::Settings,
+    #[serde(default)]
+    pub repair: Option<repair::RepairContext>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Stored {
@@ -468,7 +479,26 @@ impl Inner {
                     json!({"valid":diagnostics.is_none(),"diagnostics":diagnostics.unwrap_or_default()}),
                 )
             }
-            "generation.start" | "generation.create" => {
+            "generation.start" | "generation.create" | "generation.repair" => {
+                let mut v = v;
+                let repair = if action == "generation.repair" {
+                    ensure!(v.get("yaml").is_none() && v.get("templates").is_none(),
+                        "repair source must come from the selected failed run");
+                    let name = script_name(required(&v,"name")?)?;
+                    let run_id = required(&v,"run_id")?.to_string();
+                    let scope = crate::extensions::ai::automation::AutomationScope {
+                        context_id: uuid::Uuid::new_v4().to_string(), package_id: package.clone(),
+                        script_id: name.clone(), script_version: None, candidate_id: None,
+                        candidate_revision: None, run_id: Some(run_id.clone()), device_id: None,
+                    };
+                    let record = self.scoped_run(&scope).await?;
+                    let db = self.diagnostics.lock().clone().context("run journal unavailable")?;
+                    let trace = db.trace.page(&run_id,0,100);
+                    let (yaml, context) = repair::from_run(&package,&name,&run_id,&record,&trace)?;
+                    v.as_object_mut().context("repair request object required")?.remove("run_id");
+                    v["yaml"] = json!(yaml);
+                    Some(context)
+                } else { None };
                 let mut request: Create = serde_json::from_value(v)?;
                 if let Some(limits) = &request.limits {
                     limits.validate()?;
@@ -504,7 +534,7 @@ impl Inner {
                     samples.push(serde_json::from_value::<Sample>(value)?);
                 }
                 validate_samples(&samples)?;
-                let model = if action == "generation.start" {
+                let model = if action != "generation.create" {
                     let model = self.ai("automation.readiness", json!({})).await?;
                     ensure!(model["ready"] == true, "AI not ready: {}", model["reason"]);
                     if request.limits.is_none() {
@@ -521,6 +551,7 @@ impl Inner {
                 base.retain(|path, _| {
                     path.starts_with("automations/") || path.starts_with("templates/")
                 });
+                if let Some(context) = repair.as_ref() { repair::check_base(context,&base)?; }
                 ensure!(
                     base.values().map(Vec::len).sum::<usize>() <= 64 * 1024 * 1024,
                     "candidate base exceeds 64 MiB"
@@ -546,6 +577,8 @@ impl Inner {
                     known_tokens: 0,
                     active_seconds: 0.0,
                     unknown_usage: false,
+                    phase: None,
+                    model_input: None,
                     reason: None,
                     explanation: String::new(),
                     base_version,
@@ -555,6 +588,7 @@ impl Inner {
                     limits: request.limits.unwrap_or_default(),
                     args: request.args,
                     execution_settings: super::settings::load(self.packages.data_root())?,
+                    repair,
                 };
                 let stored = Stored {
                     candidate,
@@ -563,7 +597,7 @@ impl Inner {
                 };
                 crop_templates(&stored)?;
                 self.write(&stored)?;
-                if action == "generation.start" {
+                if action != "generation.create" {
                     self.launch(&package, &id, true)?;
                 }
                 Ok(json!({"candidate":self.read(&package,&id)?.candidate}))
@@ -877,9 +911,10 @@ impl Inner {
         );
         let mut s = self.read(package, id)?;
         if generate {
-            ensure!(!s.candidate.unknown_usage,"usage_unknown: prior model request may have incurred unreported charges; automatic retry disabled");
+            ensure!(!s.candidate.unknown_usage || s.candidate.limits.max_tokens == 0,"usage_unknown: prior model usage is unknown; retry disabled with a finite token budget");
             ensure!(
-                s.candidate.known_tokens < s.candidate.limits.max_tokens,
+                s.candidate.limits.max_tokens == 0
+                    || s.candidate.known_tokens < s.candidate.limits.max_tokens,
                 "generation_token_budget"
             );
             ensure!(
@@ -898,8 +933,10 @@ impl Inner {
         let cancel = Arc::new(AtomicBool::new(false));
         let request_id = format!("{id}:{}", uuid::Uuid::new_v4());
         s.candidate.state = if generate { "generating" } else { "validating" }.into();
-        s.candidate.reason = None;
-        s.candidate.report = None;
+        if !generate {
+            s.candidate.reason = None;
+            s.candidate.report = None;
+        }
         s.candidate.updated_at = chrono::Utc::now().to_rfc3339();
         self.write(&s)?;
         jobs.insert(
@@ -980,7 +1017,34 @@ impl Inner {
             limits.max_seconds
         };
         ensure!(seconds > 0, "generation_time_budget");
-        if generate {
+        if generate && initial.candidate.repair.as_ref().is_some_and(|r| r.baseline_report.is_none()) {
+            initial.candidate.phase = Some("validating_failure_source".into());
+            {
+                let _guard = self.gate.lock();
+                ensure!(!cancel.load(Ordering::Acquire),"CANCELLED");
+                self.write(&initial)?;
+            }
+            let ffmpeg = self.ffmpeg_path.lock().clone();
+            let result = tokio::time::timeout(Duration::from_secs(seconds),
+                offline_validation::validate_candidate_with_media(validation_request(&initial)?,
+                    cancel.clone(),ffmpeg)).await;
+            let report = match result {
+                Ok(report) => report?,
+                Err(_) => { cancel.store(true,Ordering::Release); anyhow::bail!("repair_baseline_time_budget"); }
+            };
+            let report = serde_json::to_value(report)?;
+            initial.candidate.repair.as_mut().unwrap().baseline_report = Some(compact_report(&report));
+            initial.candidate.report = Some(report);
+            let _guard = self.gate.lock();
+            ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
+            self.write(&initial)?;
+        }
+        if generate && initial.candidate.repair.is_none() {
+            initial.candidate.phase = Some("checking_samples".into());
+            {
+                let _guard = self.gate.lock();
+                self.write(&initial)?;
+            }
             let samples = initial
                 .samples
                 .iter()
@@ -993,7 +1057,7 @@ impl Inner {
                 .collect::<Result<Vec<_>>>()?;
             let ffmpeg_path = self.ffmpeg_path.lock().clone();
             match tokio::time::timeout(
-                Duration::from_secs(seconds),
+                Duration::from_secs(seconds).saturating_sub(started.elapsed()),
                 offline_validation::preflight_samples(samples, cancel.clone(), ffmpeg_path),
             )
             .await
@@ -1005,6 +1069,31 @@ impl Inner {
                 }
             }
         }
+        let prepared = if generate {
+            initial.candidate.phase = Some("preparing_images".into());
+            {
+                let _guard = self.gate.lock();
+                ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
+                self.write(&initial)?;
+            }
+            let sources = model_images::select(&initial.samples)?;
+            let stop = cancel.clone();
+            // Prepare once per job; correction turns reuse identical derived views.
+            let result = tokio::time::timeout(
+                Duration::from_secs(seconds).saturating_sub(started.elapsed()),
+                tokio::task::spawn_blocking(move || model_images::prepare(sources, &stop)),
+            )
+            .await;
+            Some(match result {
+                Ok(result) => result??,
+                Err(_) => {
+                    cancel.store(true, Ordering::Release);
+                    anyhow::bail!("model_preparation_time_budget");
+                }
+            })
+        } else {
+            None
+        };
         let mut previous = None;
         let mut unchanged = 0u32;
         let attempts = if generate {
@@ -1023,11 +1112,11 @@ impl Inner {
             let mut s = self.read(package, id)?;
             if generate {
                 ensure!(
-                    !s.candidate.unknown_usage,
+                    !s.candidate.unknown_usage || limits.max_tokens == 0,
                     "usage_unknown: 无法确认累计费用，停止自动重试"
                 );
                 ensure!(
-                    s.candidate.known_tokens < limits.max_tokens,
+                    limits.max_tokens == 0 || s.candidate.known_tokens < limits.max_tokens,
                     "generation_token_budget"
                 );
                 let readiness = self.ai("automation.readiness", json!({})).await?;
@@ -1045,7 +1134,6 @@ impl Inner {
                     ensure!(expected == &model, "model_version_conflict");
                 }
                 s.candidate.model_version = Some(model.clone());
-                s.candidate.attempts += 1;
                 s.candidate.state = "generating".into();
                 {
                     let _guard = self.gate.lock();
@@ -1058,11 +1146,35 @@ impl Inner {
                 }
                 let request = prompt_request(
                     &s,
+                    prepared.as_ref().unwrap(),
                     &model,
                     &request_id,
                     seconds.saturating_sub(started.elapsed().as_secs()),
-                    limits.max_tokens - s.candidate.known_tokens,
+                    if limits.max_tokens == 0 {
+                        u64::MAX
+                    } else {
+                        limits.max_tokens - s.candidate.known_tokens
+                    },
                 )?;
+                // Image preparation and sample preflight consume the same task
+                // deadline. Count only submitted requests as model attempts.
+                ensure!(
+                    started.elapsed().as_secs() < seconds,
+                    "generation_time_budget"
+                );
+                s.candidate.attempts += 1;
+                s.candidate.phase = Some("requesting_model".into());
+                s.candidate.model_input = Some(
+                    json!({"codec":"jpegli","full_frames":prepared.as_ref().unwrap().full_frames,
+                    "detail_frames":prepared.as_ref().unwrap().images.len()-prepared.as_ref().unwrap().full_frames,
+                    "image_bytes":prepared.as_ref().unwrap().bytes,"request_bytes":serde_json::to_vec(&request)?.len(),
+                    "preserves_source_resolution":true,"max_seconds":request["max_seconds"]}),
+                );
+                {
+                    let _guard = self.gate.lock();
+                    ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
+                    self.write(&s)?;
+                }
                 let response = tokio::select! {result=self.model_turn(request,&request_id,&cancel)=>match result {
                     Ok(response)=>response,
                     Err(error)=>{let _guard=self.gate.lock();if !cancel.load(Ordering::Acquire){s.candidate.unknown_usage=true;self.write(&s)?;}return Err(error);}
@@ -1081,8 +1193,52 @@ impl Inner {
                     ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
                     self.write(&s)?;
                 }
-                let proposal: Proposal = serde_json::from_value(response["proposal"].clone())
-                    .context("candidate proposal invalid")?;
+                if let Some(error) = response["error"].as_str() {
+                    if s.candidate.repair.is_some()
+                        && (!s.candidate.unknown_usage || limits.max_tokens == 0)
+                        && attempt + 1 < attempts.min(limits.max_failures)
+                        && started.elapsed().as_secs() + 2 < seconds
+                    {
+                        s.candidate.reason = Some(error.to_string());
+                        s.candidate.phase = Some("retrying_model".into());
+                        {
+                            let _guard = self.gate.lock();
+                            ensure!(!cancel.load(Ordering::Acquire),"CANCELLED");
+                            self.write(&s)?;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                            _ = cancelled(&cancel) => anyhow::bail!("CANCELLED"),
+                        }
+                        continue;
+                    }
+                    anyhow::bail!("{error}");
+                }
+                let proposal = (|| -> Result<Proposal> {
+                    let proposal: Proposal = serde_json::from_value(model_images::resolve_proposal(
+                        response["proposal"].clone(),
+                        &prepared.as_ref().unwrap().selected,
+                    )?).context("candidate proposal invalid")?;
+                    if let Some(context) = s.candidate.repair.as_ref() {
+                        repair::check_proposal(context,&proposal.yaml)?;
+                    }
+                    ensure!(proposal.yaml.len() <= 512 * 1024 && proposal.explanation.len() <= 32000,
+                        "proposal too large");
+                    let mut preview = s.clone();
+                    preview.candidate.yaml = proposal.yaml.clone();
+                    preview.candidate.templates = proposal.templates.clone();
+                    crop_templates(&preview)?;
+                    Ok(proposal)
+                })();
+                let proposal = match proposal {
+                    Ok(proposal) => proposal,
+                    Err(error) if s.candidate.repair.is_some() && attempt + 1 < limits.max_failures => {
+                        s.candidate.reason = Some(error.to_string());
+                        self.write(&s)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 ensure!(
                     proposal.yaml.len() <= 512 * 1024 && proposal.explanation.len() <= 32000,
                     "proposal too large"
@@ -1092,10 +1248,10 @@ impl Inner {
                 s.candidate.explanation = proposal.explanation;
                 s.candidate.revision += 1;
                 s.candidate.report = None;
-                crop_templates(&s)?;
             }
             ensure!(!cancel.load(Ordering::Acquire), "CANCELLED");
             s.candidate.state = "validating".into();
+            s.candidate.phase = Some("validating_samples".into());
             s.candidate.updated_at = chrono::Utc::now().to_rfc3339();
             {
                 let _guard = self.gate.lock();
@@ -1192,10 +1348,11 @@ impl Inner {
                 .await?;
             match result["state"].as_str() {
                 Some("completed") => return Ok(result["result"].clone()),
-                Some("failed") => anyhow::bail!(
-                    "{}",
-                    result["error"].as_str().unwrap_or("model request failed")
-                ),
+                Some("failed") => {
+                    return Ok(
+                        json!({"error":result["error"],"usage":result["usage"],"diagnostics":result["diagnostics"]}),
+                    )
+                }
                 Some("running") => tokio::time::sleep(Duration::from_millis(75)).await,
                 _ => anyhow::bail!("invalid model job state"),
             }
@@ -1237,7 +1394,9 @@ impl Inner {
             "automation_read_samples" => {
                 let id = candidate.context("user must attach a candidate")?;
                 let s = self.read(package, id)?;
-                Ok(json!({"samples":s.samples.iter().map(|s|&s.manifest).collect::<Vec<_>>()}))
+                Ok(
+                    json!({"samples":s.samples.iter().map(model_sample_context).collect::<Vec<_>>()}),
+                )
             }
             "automation_read_sample_frame" => {
                 let id = candidate.context("user must attach a candidate")?;
@@ -1537,6 +1696,9 @@ fn all_templates(s: &Stored) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut templates = BTreeMap::new();
     for (path, bytes) in &s.base {
         if let Some(name) = path.strip_prefix("templates/") {
+            if s.candidate.repair.as_ref().is_some_and(|r| !r.template_versions.contains_key(path)) {
+                continue;
+            }
             if name.ends_with(".png") {
                 templates.insert(name.into(), bytes.clone());
             }
@@ -1583,55 +1745,30 @@ fn validation_request(s: &Stored) -> Result<ValidationRequest> {
     })
 }
 
+fn model_sample_context(sample: &Sample) -> Value {
+    let m = &sample.manifest;
+    json!({"id":m["id"],"name":m["name"],"coordinates":m["coordinates"],"start":m["start"],"end":m["end"],"goal":m["goal"],"actions":m["actions"],"windows":m["windows"],
+        "frames":m["frames"].as_array().into_iter().flatten().map(|f|json!({"id":f["id"],"role":f["role"],"event_id":f["event_id"],"timeline_us":f["timeline_us"],"frame_index":f["frame_index"],"width":f["width"],"height":f["height"]})).collect::<Vec<_>>()})
+}
+
 fn prompt_request(
     s: &Stored,
+    prepared: &model_images::Prepared,
     model: &str,
     request: &str,
     seconds: u64,
     remaining_tokens: u64,
 ) -> Result<Value> {
-    // Freeze all evidence for validation, but send a bounded deterministic image
-    // subset. START/END of every selected sample are mandatory; selected middle
-    // frames are spread over its timeline rather than biased to the first sample.
-    let mut quota = (96 / s.samples.len()).max(2);
-    let (images, selected, total_frames) = loop {
-        let mut images = Vec::new();
-        let mut selected = Vec::new();
-        let mut bytes = 0usize;
-        let mut total_frames = 0usize;
-        for sample in &s.samples {
-            let frames = sample.manifest["frames"]
-                .as_array()
-                .context("frames missing")?;
-            total_frames += frames.len();
-            let count = frames.len().min(quota);
-            let mut indices = BTreeSet::new();
-            if count == 1 {
-                indices.insert(0);
-            } else {
-                for i in 0..count {
-                    indices.insert(i * (frames.len() - 1) / (count - 1));
-                }
-            }
-            for index in indices {
-                let frame = &frames[index];
-                let file = sample
-                    .files
-                    .iter()
-                    .find(|file| file.path == frame["path"].as_str().unwrap_or(""))
-                    .context("frame missing")?;
-                bytes = bytes.saturating_add(file.base64.len() * 3 / 4);
-                images.push(json!({"label":format!("sample={} frame={} timeline_us={} role={} original={}x{}",sample.manifest["id"],frame["id"],frame["timeline_us"],frame["role"],frame["width"],frame["height"]),"data_url":format!("data:image/png;base64,{}",file.base64)}));
-                selected.push(json!({"sample_id":sample.manifest["id"],"frame_id":frame["id"]}));
-            }
-        }
-        if bytes <= 32 * 1024 * 1024 {
-            break (images, selected, total_frames);
-        }
-        ensure!(quota>2,"sample START/END images exceed model input32MiB; choose fewer samples or configure smaller evidence");
-        quota = (quota / 2).max(2);
-    };
-    let context = json!({"goal":s.candidate.goal,"samples":s.samples.iter().map(|s|&s.manifest).collect::<Vec<_>>(),"current_yaml":s.candidate.yaml,"current_templates":s.candidate.templates,"existing_template_names":s.base.keys().filter_map(|path|path.strip_prefix("templates/")).collect::<Vec<_>>(),"validation":s.candidate.report.as_ref().map(compact_report),"args":s.candidate.args,"execution_settings":s.candidate.execution_settings,"functions_sources":functions(s)?,"dsl":DSL_GUIDE,"native_functions":super::native_funcs::native_functions().iter().map(super::native_funcs::native_schema_json).collect::<Vec<_>>(),"image_selection":{"selected":selected,"total_frames":total_frames,"omitted_count":total_frames.saturating_sub(images.len()),"policy":"all samples retain START/END, middle frames uniformly sampled under 96 images/32MiB; all original evidence remains in offline validation"}});
+    ensure!(seconds > 0, "generation_time_budget");
+    let model_images::Prepared {
+        images,
+        selected,
+        total_frames,
+        full_frames,
+        bytes,
+    } = prepared;
+    let template_names: Vec<_> = s.base.keys().filter(|path| s.candidate.repair.as_ref().is_none_or(|r| r.template_versions.contains_key(*path))).filter_map(|path|path.strip_prefix("templates/")).collect();
+    let context = json!({"candidate_id":s.candidate.id,"goal":s.candidate.goal,"samples":s.samples.iter().map(model_sample_context).collect::<Vec<_>>(),"current_yaml":s.candidate.yaml,"current_templates":s.candidate.templates,"existing_template_names":template_names,"validation":s.candidate.report.as_ref().map(compact_report),"last_error":s.candidate.reason,"repair":s.candidate.repair,"args":s.candidate.args,"execution_settings":s.candidate.execution_settings,"functions_sources":functions(s)?,"dsl":DSL_GUIDE,"native_functions":super::native_funcs::native_functions().iter().map(super::native_funcs::native_schema_json).collect::<Vec<_>>(),"image_selection":{"selected":selected,"total_frames":total_frames,"omitted_count":total_frames.saturating_sub(*full_frames),"image_bytes":bytes,"codec":"jpegli_quality90_444","policy":"Full views preserve source resolution with local Jpegli JPEG encoding. Accepted taps have original-pixel lossless PNG detail views. START/END and every action-before state remain selected; the next action-before image shows the previous action result and END shows the final result. Transition frames and all original evidence remain in offline validation. Return template crops as view_id plus rect normalized to that view; the server maps them to original pixels."}});
     // Estimate input allowance; supplier image-token accounting can differ.
     // Requests/output tokens are hard-bounded; unknown usage stops correction.
     let estimated_input =
@@ -1641,10 +1778,10 @@ fn prompt_request(
         "generation_token_budget: selected evidence exceeds remaining estimated token budget"
     );
     Ok(
-        json!({"request_id":request,"package_id":s.candidate.package_id,"candidate_id":s.candidate.id,"expected_model_version":model,"context":context,"images":images,"max_seconds":seconds.clamp(1,600),"max_output_tokens":(remaining_tokens-estimated_input).clamp(256,16384)}),
+        json!({"request_id":request,"package_id":s.candidate.package_id,"candidate_id":s.candidate.id,"expected_model_version":model,"context":context,"images":images,"max_seconds":seconds.min(600),"max_output_tokens":(remaining_tokens-estimated_input).clamp(256,16384)}),
     )
 }
-const DSL_GUIDE:&str="Canonical YAML: version: 2; targets: {claim: {template: claim.png, threshold: 0.8, region: [x,y,w,h]}, done: {template: done.png}}; run: [{id: claim_step, wait: claim, timeout: 10s, then: [{tap: claim}]}, {optional: {find: confirm, timeout: 0ms, then: [{tap: confirm}]}}, {finish: done, timeout: 10s}]. tap bare target uses last named observation. as:button then tap:$button also valid. wait default10s, optional default0ms, only absence skips. Existing functions/calls, if/repeat/break/return/vars/params retained. trace:false/true and fail:reason supported. All stable id values lowercase identifiers.  Named visual targets refer to PNG templates cropped from selected sample frames. Required waits only observe; actions must explicitly tap returned fresh observations. Optional waits use a bounded timeout. Every loop is bounded. Task success must explicitly assert its visual completion target, never just end of script. Native function schemas are authoritative; do not invent functions or DSL fields.";
+const DSL_GUIDE:&str="Canonical YAML: version: 2; targets: {claim: {template: claim.png, threshold: 0.8, region: [x,y,w,h]}, done: {template: done.png}}; run: [{id: claim_step, wait: claim, timeout: 10s, then: [{tap: claim}]}, {optional: {find: confirm, timeout: 0ms, then: [{tap: confirm}]}}, {finish: done, timeout: 10s}]. tap bare target uses last named observation. as:button then tap:$button also valid. wait default10s, optional default0ms, only absence skips. Existing functions/calls, if/repeat/break/return/vars/params retained. trace:false/true and fail:reason supported. All stable id values lowercase identifiers.  Named visual targets refer to PNG templates cropped from selected sample frames. Required waits only observe; actions must explicitly tap returned fresh observations. Optional waits use a bounded timeout. Every loop is bounded. Task success must explicitly assert its visual completion target, never just end of script. Generated template crops use {name,view_id,rect:[x,y,width,height]} with rect normalized to the selected view (0..1). The server resolves source sample/frame and original pixels. Prefer lossless detail views for button crops. For single-sample visual targets including END, the server derives original-frame search regions from the resolved crop plus 4 pixels to wait for a stable button position; multi-sample regions remain proposed and are validated across all samples. Never mix view_id with sample_id/frame_id. Existing original-pixel templates use {name,sample_id,frame_id,rect}. Named target.region [x,y,width,height] uses relative values in 0..1. Recorded taps are click points and may differ from button centers; crop a distinct control around the accepted point, keeping the template center within 8 original pixels of that point. For repair, templates from later edits are not available. Keep original templates read-only; give changed crops unique names prefixed by repair_ plus the first eight characters of candidate_id. Reuse unchanged original templates without recropping them. Preserve the original matching thresholds; do not loosen action validation or omit samples. Compare every branch across all demonstrations. Crop invariant control details and exclude changing badges, counters, text and scenery. Distinguish enabled from disabled controls; a template named with a trailing #1.png retains color and uses the existing color check. If an action and its popup occur only in some demonstrations, use an optional branch while keeping entry, exit and final success mandatory. Keep search regions near original controls and cover stable positions in every sample. Native function schemas are authoritative; do not invent functions or DSL fields.";
 
 fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
@@ -1920,7 +2057,7 @@ mod tests {
         let mut model = json!({"default_limits":defaults});
         let limits = Limits::from_ai_defaults(&model).unwrap();
         assert_eq!(limits.max_seconds, 600);
-        assert_eq!(limits.max_tokens, 100_000);
+        assert_eq!(limits.max_tokens, 0);
         assert_eq!(limits.max_attempts, 40);
         assert_eq!(limits.max_failures, 3);
         model["default_limits"]["max_turns"] = json!(2);
@@ -1983,6 +2120,7 @@ mod tests {
             .to_string()
             .contains("generation_time_budget"));
         stored.candidate.active_seconds = 0.0;
+        stored.candidate.limits.max_tokens = 100_000;
         stored.candidate.known_tokens = 100_000;
         service.inner.write(&stored).unwrap();
         assert!(service

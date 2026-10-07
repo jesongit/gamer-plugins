@@ -7,7 +7,7 @@ vi.mock('../../../web/src/api',()=>({api:{callExtension:mocks.call}}))
 import AgentConversation from './AgentConversation.vue'
 let wrappers,record,events,session,diagnostics,older,context
 const button=(wrapper,label)=>wrapper.findAll('button').find(item=>item.text()===label)
-const limits={max_turns:40,max_actions:120,max_seconds:600,max_tokens:100000,max_failures:3}
+const limits={max_turns:40,max_actions:120,max_seconds:600,max_tokens:0,max_failures:3}
 const ev=(seq,kind,data={},message='')=>({seq,kind,message,at:'2026-10-03T12:00:00Z',data:{turn_id:'turn-1',...data}})
 async function create(props={}){const wrapper=mount(AgentConversation,{props:{packageId:'default',...props},global:{provide:{[WORKSPACE_CONTEXT_KEY]:{getSnapshot:()=>context}}}});wrappers.push(wrapper);await flushPromises();return wrapper}
 beforeEach(()=>{
@@ -384,7 +384,7 @@ it.each(['running','paused'])('游玩 %s 引导提交独立game_limits，预算�
 })
 it('同一会话对话2轮与游玩17轮分别显示，活跃游玩优先真实Session且0上限不互相混用',async()=>{
   const gameLimits={max_turns:0,max_actions:0,max_seconds:0,max_tokens:0,max_failures:0}
-  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,actions:3,active_seconds:4,total_tokens:2000,consecutive_failures:0},game_usage:{turns:9,total_tokens:9000},game_limits:{...limits,max_tokens:50000}}
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits,max_tokens:100000},usage:{turns:2,actions:3,active_seconds:4,total_tokens:2000,consecutive_failures:0},game_usage:{turns:9,total_tokens:9000},game_limits:{...limits,max_tokens:50000}}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:gameLimits,usage:{turns:17,actions:18,active_seconds:19,total_tokens:17000,consecutive_failures:0}}]
   const wrapper=await create()
   expect(wrapper.get('.usage>summary').text()).toContain('游玩 17,000 / 不限')
@@ -416,7 +416,7 @@ it('已结束游玩使用持久game快照，运行时残留的历史Session不�
 
 it('对话与游玩预算同时可编辑且分别提交，无需切换消息模式',async()=>{
   const originalGameLimits={...limits,max_turns:200,max_tokens:200000}
-  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:originalGameLimits}
+  record={conversation_id:'s1',game_session_id:'s1',content_package:'default',state:'idle',limits:{...limits,max_tokens:100000},usage:{turns:2,total_tokens:2000},game_usage:{turns:17,total_tokens:17000},game_limits:originalGameLimits}
   session=[{session_id:'s1',device_id:'phone',content_package:'default',mode:'api',state:'paused',limits:originalGameLimits,usage:{turns:17,total_tokens:17000}}]
   const wrapper=await create()
   await button(wrapper,'预算').trigger('click')
