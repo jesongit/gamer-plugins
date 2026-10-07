@@ -53,6 +53,37 @@ pub(super) struct Engine {
     pub languages: Vec<String>,
 }
 
+// Anchor Config's relative data root once, without changing process CWD.
+pub(super) fn anchor_data_root(base: &Path, requested: &Path) -> Result<PathBuf> {
+    ensure!(base.is_absolute(), "OCR 工作目录必须是绝对路径");
+    let joined = if requested.is_absolute() {
+        requested.to_owned()
+    } else {
+        base.join(requested)
+    };
+    ensure!(joined.is_absolute(), "OCR 数据目录无效");
+    Ok(engine_argument_path(
+        &joined.canonicalize().unwrap_or(joined),
+    ))
+}
+
+// Tesseract appends `/lang.traineddata` itself. Its Windows CRT cannot open
+// that mixed spelling after Rust's canonical \\?\ prefix. Security checks keep
+// canonical paths; convert only the executable and final CLI arguments.
+pub(super) fn engine_argument_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", unc));
+        }
+        if let Some(disk) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(disk);
+        }
+    }
+    path.to_owned()
+}
+
 pub(super) fn checked_path(raw: &str, data_root: &Path, directory: bool) -> Result<PathBuf> {
     ensure!(raw.len() <= 4096 && !raw.contains('\0'), "OCR 路径无效");
     let requested = Path::new(raw);
@@ -104,7 +135,8 @@ pub(super) fn resolve(settings: &Settings, data_root: &Path) -> Result<Engine> {
         let bundled = data_root
             .parent()
             .unwrap_or(data_root)
-            .join("deps/tesseract")
+            .join("deps")
+            .join("tesseract")
             .join(file);
         let candidates =
             std::iter::once(bundled).chain(std::env::var_os("PATH").into_iter().flat_map(|path| {

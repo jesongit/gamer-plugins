@@ -1,5 +1,49 @@
 use super::*;
 
+#[test]
+fn relative_data_roots_discover_bundled_dependencies_without_changing_cwd() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("data")).unwrap();
+    let deps = root.path().join("deps").join("tesseract");
+    std::fs::create_dir_all(deps.join("tessdata")).unwrap();
+    let filename = if cfg!(windows) {
+        "tesseract.exe"
+    } else {
+        "tesseract"
+    };
+    std::fs::write(deps.join(filename), b"fixture engine; discovery only").unwrap();
+    std::fs::write(
+        deps.join("tessdata/eng.traineddata"),
+        b"fixture model; discovery only",
+    )
+    .unwrap();
+    let anchored = settings::anchor_data_root(root.path(), Path::new("data")).unwrap();
+    assert!(anchored.is_absolute());
+    let engine = settings::resolve(&settings::Settings::default(), &anchored).unwrap();
+    assert_eq!(
+        engine.executable,
+        deps.join(filename).canonicalize().unwrap()
+    );
+    assert_eq!(engine.languages, vec!["eng"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn engine_arguments_keep_windows_language_file_access_compatible() {
+    assert_eq!(
+        settings::engine_argument_path(Path::new(r"\\?\D:\deps\tesseract\tessdata")),
+        PathBuf::from(r"D:\deps\tesseract\tessdata")
+    );
+    assert_eq!(
+        settings::engine_argument_path(Path::new(r"\\?\UNC\host\share\tessdata")),
+        PathBuf::from(r"\\host\share\tessdata")
+    );
+    assert_eq!(
+        settings::engine_argument_path(Path::new(r"D:\deps\tesseract.exe")),
+        PathBuf::from(r"D:\deps\tesseract.exe")
+    );
+}
+
 const HEADER:&str="level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n";
 
 #[test]

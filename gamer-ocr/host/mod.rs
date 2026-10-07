@@ -187,15 +187,20 @@ impl Request {
 
 impl OcrService {
     pub fn new(data_root: &Path) -> Result<Self> {
+        let data_root = settings::anchor_data_root(
+            &std::env::current_dir().context("无法读取 OCR 工作目录")?,
+            data_root,
+        )?;
         let settings_path = data_root
             .join("extension-data")
             .join(ID)
-            .join("private/settings.dat");
+            .join("private")
+            .join("settings.dat");
         let _ = settings::Settings::load(&settings_path)?;
         let (generation, _) = watch::channel(0);
         Ok(Self {
             state: Arc::new(State {
-                data_root: data_root.into(),
+                data_root,
                 settings_path,
                 settings_gate: Mutex::new(()),
                 workers: Arc::new(Semaphore::new(1)),
@@ -299,10 +304,10 @@ impl OcrService {
             .context("OCR 图像处理任务异常")??;
             ensure!(Instant::now() < deadline, "OCR 图像处理超时");
             ensure!(*cancelled.borrow() == epoch, "OCR 已停止");
-            let mut command = Command::new(engine.executable);
+            let mut command = Command::new(settings::engine_argument_path(&engine.executable));
             command
                 .args(["stdin", "stdout", "--tessdata-dir"])
-                .arg(engine.tessdata)
+                .arg(settings::engine_argument_path(&engine.tessdata))
                 .args([
                     "-l",
                     &request.language,
