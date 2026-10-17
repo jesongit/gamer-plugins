@@ -1,14 +1,19 @@
 <script setup>
-import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '../../../web/src/api'
 import AudienceSettings from './AudienceSettings.vue'
 import InteractionPanel from './InteractionPanel.vue'
+import AutomaticLivePanel from './AutomaticLivePanel.vue'
+import UsersPanel from './UsersPanel.vue'
+import SenderSettings from './SenderSettings.vue'
 
 const devices = ref([]), status = ref({ stream: null, connection: {} })
 const feedback = ref(''), savedSettings = ref({ version: null, profiles: {} })
 const error = ref(''), busy = ref(false), copied = ref(false)
+const automaticOperation = ref('')
 const activeTab = ref('settings')
-const tabs = [{ key: 'settings', label: '直播设置' }, { key: 'rules', label: '互动规则' }, { key: 'logs', label: '触发日志' }]
+const outputKind = ref('device'), interactionQueue = ref({ waiting: [] })
+const tabs = [{ key: 'settings', label: '直播设置' }, { key: 'rules', label: '互动规则' }, { key: 'users', label: '用户管理' }, { key: 'logs', label: '触发日志' }]
 const output = reactive({ device_id: '', mode: 'local', push_url: '', audio: true, fps: 30, bitrate_kbps: 4000 })
 const credentials = reactive({ mode: 'open_live', access_key: '', access_secret: '', app_id: '', identity_code: '', access_token: '' })
 const savedProfile = computed(() => savedSettings.value.profiles?.[credentials.mode])
@@ -18,34 +23,55 @@ function applySettings(value, selectMode = false) { savedSettings.value = value;
 function submittedCredentials() { const value = { ...credentials }; if (value.mode === 'open_live') value.access_token = ''; else { value.app_id = ''; value.identity_code = '' }; return value }
 const canOutput = computed(() => devices.value.find(d => d.id === output.device_id)?.capabilities?.media_output !== false)
 const streamActive = computed(() => status.value.stream && !['failed', 'stopped'].includes(status.value.stream.state))
+const sourceUrl = computed(() => status.value.stream?.source_url || (output.mode === 'local' ? status.value.local_sources?.stream_url : '') || '')
+const automatic = computed(() => status.value.automatic || { state: 'stopped' })
+const automaticActive = computed(() => !['stopped', 'failed'].includes(automatic.value.state || 'stopped'))
+watch(automaticActive, active => { if (active) outputKind.value = 'automatic' })
 const connected = computed(() => ['connecting', 'connected', 'reconnecting'].includes(status.value.connection.state))
 const states = { preparing: '准备中', streaming: '输出中', connecting: '连接中', connected: '已连接', reconnecting: '正在重连', failed: '失败', stopped: '已停止', disconnected: '未连接' }
-let timer, disposed = false
+let timer, disposed = false, outputModeRestored = false, pendingActions = 0, actionSequence = 0, refreshSequence = 0
 const call = (action, values = {}) => api.callExtension('gamer-live', action, values)
 async function refresh() {
+  const sequence = ++refreshSequence
   const snapshot = await call('live.status')
-  if (disposed) return
+  if (disposed || sequence !== refreshSequence) return
   status.value = snapshot
+  if (!outputModeRestored) {
+    if (automatic.value.video_folder && (!streamActive.value || automaticActive.value)) outputKind.value = 'automatic'
+    outputModeRestored = true
+  }
   if (streamActive.value) {
     for (const key of ['device_id', 'mode', 'audio', 'fps', 'bitrate_kbps']) {
+      if (key === 'device_id' && automaticActive.value) continue
       if (snapshot.stream[key] != null) output[key] = snapshot.stream[key]
     }
   }
   if (connected.value && snapshot.connection.mode) credentials.mode = snapshot.connection.mode
 }
 async function poll() {
-  try { if (!busy.value) await refresh() } catch (e) { if (!disposed) error.value = e.message }
+  try { if (!busy.value || automaticOperation.value) await refresh() } catch (e) { if (!disposed) error.value = e.message }
   if (!disposed) timer = setTimeout(poll, 1500)
 }
 async function act(action, values = {}) {
-  if (busy.value) return
+  if (busy.value && action !== 'automatic.stop') return
+  const sequence = ++actionSequence
+  pendingActions++
+  if (action.startsWith('automatic.')) automaticOperation.value = action
   busy.value = true; error.value = ''; feedback.value = ''; copied.value = false
-  try { const result = await call(action, values); await refresh(); return result || true } catch (e) { error.value = e.message; return false } finally { busy.value = false }
+  try { const result = await call(action, values); await refresh(); return result || true }
+  catch (e) { if (sequence === actionSequence) error.value = e.message; return false }
+  finally { pendingActions--; busy.value = pendingActions > 0; if (!busy.value) automaticOperation.value = '' }
 }
 async function startOutput() {
+  if (automaticActive.value) return
   if (!canOutput.value) { error.value = '当前目标尚不支持音视频输出'; return }
   const ok = await act('stream.start', { ...output, push_url: output.mode === 'local' ? '' : output.push_url })
   if (ok) output.push_url = ''
+}
+function showExecutionTarget() {
+  const target = document.getElementById('live-execution-target')
+  target?.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+  target?.querySelector('select')?.focus()
 }
 async function connect() {
   const result = await act('connection.connect', { platform_id: 'bilibili', credentials: submittedCredentials(), expected_version: savedSettings.value.version })
@@ -66,7 +92,7 @@ async function saveSettings(clear = false) {
   } catch (e) { error.value = e.message } finally { busy.value = false }
 }
 async function copySource() {
-  try { await navigator.clipboard.writeText(status.value.stream.source_url); copied.value = true } catch { error.value = '复制失败，请手动选择并复制素材地址' }
+  try { await navigator.clipboard.writeText(sourceUrl.value); copied.value = true } catch { error.value = '复制失败，请手动选择并复制素材地址' }
 }
 onMounted(async () => {
   try { devices.value = await api.listDevices(); if (!output.device_id) output.device_id = devices.value[0]?.id || '' } catch (e) { error.value = e.message }
@@ -86,6 +112,9 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
       <div v-show="activeTab === 'settings'" id="live-settings" class="settings-content">
       <section aria-label="音视频输出">
         <h3>音视频输出</h3>
+        <label>直播模式<select v-model="outputKind" aria-label="直播模式" :disabled="busy || streamActive || automaticActive"><option value="device">设备直播</option><option value="automatic">自动直播 · 视频与弹幕互动</option></select></label>
+        <AutomaticLivePanel v-if="outputKind === 'automatic'" :status="automatic" :queue="interactionQueue" :devices="devices" :output="output" :busy="busy" :perform="act" @configure-target="showExecutionTarget" @open-rules="activeTab = 'rules'" @open-logs="activeTab = 'logs'" />
+        <template v-else>
         <p class="connection-status" role="status">{{ states[status.stream?.state] || '未输出' }}</p>
         <p class="hint">设备画面与游戏声音交给直播姬，麦克风和开播在直播姬中设置。</p>
         <form @submit.prevent="startOutput">
@@ -100,13 +129,16 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
           </fieldset>
           <button v-if="streamActive" type="button" :disabled="busy" @click="act('stream.stop')">停止输出</button>
         </form>
-        <div v-if="status.stream?.source_url" class="source">
-          <label>本机素材地址<input :value="status.stream.source_url" readonly aria-label="本机素材地址" @focus="$event.target.select()" /></label>
-          <button :disabled="!streamActive" @click="copySource">{{ copied ? '已复制' : '复制地址' }}</button>
-          <p class="hint">直播姬添加「多媒体」素材并粘贴此地址。仅限运行 Gamer 服务端的这台电脑；首次出画面需要几秒，重启输出后需重新粘贴地址。</p>
+        </template>
+        <div v-if="sourceUrl" class="source">
+          <label>本机素材地址<input :value="sourceUrl" readonly aria-label="本机素材地址" @focus="$event.target.select()" /></label>
+          <button @click="copySource">{{ copied ? '已复制' : '复制地址' }}</button>
+          <p class="hint">直播姬添加「多媒体」素材并粘贴此地址。地址固定，停止后再次启动或重启服务均沿用；开始输出后可读取画面。仅限运行 Gamer 服务端的这台电脑。</p>
+          <p v-if="automaticActive" class="hint">自动直播切换视频和设备画面时，素材地址保持不变。</p>
         </div>
-        <p v-if="status.stream" class="hint">输出设备：{{ devices.find(d => d.id === status.stream.device_id)?.name || status.stream.device_id }} · 视频 {{ status.stream.video_frames }} 帧 · 音频 {{ status.stream.audio_packets }} 包</p>
+        <p v-if="status.stream && !automaticActive" class="hint">输出设备：{{ devices.find(d => d.id === status.stream.device_id)?.name || status.stream.device_id }} · 视频 {{ status.stream.video_frames }} 帧 · 音频 {{ status.stream.audio_packets }} 包</p>
         <p v-if="status.stream?.error" class="error">{{ status.stream.error }}</p>
+        <p v-if="status.stream?.device_id?.startsWith('browser-')" class="hint">浏览器输出仅包含画面，声音为静音。</p>
       </section>
         <section aria-label="互动连接">
           <h3>互动连接</h3>
@@ -128,8 +160,10 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
           <p v-if="status.connection.error" class="error">{{ status.connection.error }}</p>
         </section>
       </div>
-      <InteractionPanel :devices="devices" :view="activeTab" :connected="connected" :connection-state="status.connection.state" :connection-error="status.connection.error" />
+      <InteractionPanel :devices="devices" :view="activeTab" :connected="connected" :connection-state="status.connection.state" :connection-error="status.connection.error" :automatic-active="automaticActive" @queue-change="interactionQueue = $event" />
       <AudienceSettings v-show="activeTab === 'settings'" />
+      <SenderSettings v-show="activeTab === 'settings'" />
+      <UsersPanel v-if="activeTab === 'users'" />
       <p class="hint">关闭此面板不会停止连接；停用插件或退出 Gamer 会停止全部输出和互动。</p>
     </div>
   </div>
@@ -137,7 +171,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
 
 <style scoped>
 .live-workspace{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;gap:8px;overflow:hidden;color:var(--text-0,#ddd)}
-.workbench-tabs{display:flex;gap:4px;flex-shrink:0;border-bottom:1px solid var(--border,#41444c);padding-bottom:6px}
+.workbench-tabs{display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;border-bottom:1px solid var(--border,#41444c);padding-bottom:6px}
 .workbench-tabs .tab-btn{height:28px;padding:3px 10px;border:1px solid transparent;border-radius:3px;background:transparent;color:var(--text-2,#aaa);font-size:13px}
 .workbench-tabs .tab-btn:hover{color:var(--text-0,#ddd)}
 .workbench-tabs .tab-btn.active{border-color:var(--border,#41444c);background:var(--bg-2,#292d35);color:var(--text-0,#ddd);font-weight:700}

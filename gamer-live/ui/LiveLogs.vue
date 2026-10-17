@@ -9,7 +9,10 @@ const error = ref(''), more = ref(false), next = ref(0), loading = ref(false), o
 let disposed = false, timer, generation = 0, searchTimer, latest = 0
 const gap = ref(false)
 const time = ms => ms ? new Date(ms).toLocaleString() : '—'
-function status(row) { return row.item ? states[row.item.state] || row.item.state : row.result }
+function status(row) {
+  if (row.item?.phase === 'cleanup') return `主任务${({ success: '成功', failed: '失败', cancelled: '已取消' })[row.item.main_result?.state] || '已结束'} · 收尾中`
+  return row.item ? states[row.item.state] || row.item.state : row.result
+}
 async function read(append = false) {
   if (loading.value) return
   loading.value = true
@@ -48,6 +51,7 @@ onBeforeUnmount(() => { disposed = true; generation++; clearTimeout(timer); clea
         <span class="meta"><time>{{ time(row.at) }}</time><span>{{ kinds[row.event.kind] || row.event.kind }}</span><span v-if="row.item?.event?.test">模拟测试</span></span>
         <span class="main"><strong>{{ row.event.kind === 'message.mirror' ? '跨房消息' : row.event.actor?.name || '未提供观众信息' }}</strong><span v-for="badge in badges(row.event.actor)" :key="badge" class="badge">{{ badge }}</span></span>
         <span class="content">{{ eventText(row.event) }}</span><span class="outcome"><span>{{ row.rule || '—' }}<template v-if="row.item"> · #{{ row.item.number }}</template></span><b :class="row.item?.state">{{ status(row) }}</b></span>
+        <span v-if="row.item?.cleanup_warning" class="warning">收尾警告：{{ row.item.cleanup_warning }}</span>
       </button>
       <div v-if="selected?.seq === row.seq" class="detail">
         <p v-if="badges(row.event.actor, true).length">{{ badges(row.event.actor, true).join(' · ') }}</p>
@@ -59,13 +63,15 @@ onBeforeUnmount(() => { disposed = true; generation++; clearTimeout(timer); clea
         <p v-if="row.event.kind === 'gift'">礼物 ID：{{ row.event.payload.gift_id }}</p>
         <ol class="timeline"><li>{{ time(row.at) }} · 收到互动</li><li>{{ row.rule ? '命中「' + row.rule + '」' : '规则判定' }} · {{ row.result }}</li><li v-if="row.item">{{ time(row.item.created_at) }} · 加入队列 #{{ row.item.number }}</li><li v-if="row.item?.started_at">{{ time(row.item.started_at) }} · 开始执行</li><li v-if="row.item?.finished_at">{{ time(row.item.finished_at) }} · {{ status(row) }}</li></ol>
         <p v-if="row.item?.error" class="error">{{ row.item.error }}</p>
+        <p v-if="row.item?.cleanup?.started_at" class="hint">{{ time(row.item.cleanup.started_at) }} · 开始收尾<template v-if="row.item.cleanup.finished_at">；{{ time(row.item.cleanup.finished_at) }} · 收尾{{ states[row.item.cleanup.state] || row.item.cleanup.state }}</template></p>
         <p v-if="row.item?.retry_of" class="hint">这是一次手动重试，已重新排到队尾。</p>
-        <div v-if="row.item" class="toolbar"><button @click="emit('run-log', row.item)">查看运行日志</button><button v-if="['failed','cancelled','acknowledged'].includes(row.item.state)" :disabled="busy" @click="emit('retry', row.item)">重新执行并排到队尾</button></div>
+        <div v-if="row.item" class="toolbar"><button @click="emit('run-log', row.item)">查看运行日志</button><button v-if="row.item.cleanup?.run_id" @click="emit('run-log', { ...row.item, name: `${row.item.name || row.rule} · 收尾`, run_id: row.item.cleanup.run_id })">查看收尾日志</button><button v-if="['failed','cancelled','acknowledged'].includes(row.item.state)" :disabled="busy" @click="emit('retry', row.item)">重新执行并排到队尾</button></div>
       </div>
     </article>
     <button v-if="more && rows.length < 500" :disabled="loading" @click="read(true)">加载更早记录</button><p v-if="rows.length >= 500" class="hint">已显示 500 条，请用搜索或筛选缩小范围。</p>
   </div>
 </template>
 <style scoped>
+.warning{color:var(--warning,#e5c480);font-size:12px;line-height:1.6}
 .journal{display:grid;gap:10px;min-width:0}.toolbar,.meta,.main,.outcome{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.toolbar input{flex:1;min-width:120px}.hint,.meta{font-size:12px;color:var(--text-2,#9aa6b5);line-height:1.6}.record{display:grid;gap:8px;width:100%;text-align:left;padding:14px;border:0;background:transparent;color:inherit;cursor:pointer}.main{font-size:14px}.badge{font-size:11px;padding:2px 6px;border-radius:4px;background:#278a7426;color:#77cbb4}.outcome{justify-content:space-between;font-size:12px}.outcome b{font-weight:500;color:#9fb5c8}.outcome .success{color:#77cbb4}.outcome .running,.outcome .waiting{color:#e5c480}.content{font-size:14px;line-height:1.6}article{border:1px solid var(--border,#41444c);border-radius:8px;overflow-wrap:anywhere}.bad{border-color:#905757}.detail{border-top:1px solid var(--border,#41444c);padding:14px;display:grid;gap:10px;font-size:13px}.detail img{max-width:72px;max-height:72px}.timeline{padding-left:20px;margin:0;line-height:1.9}.error{color:#f19494}.empty{padding:24px 10px;opacity:.7;text-align:center}p{margin:0}input,select,.toolbar button,.journal>button{background:var(--bg-1,#24262c);color:inherit;border:1px solid var(--border,#41444c);border-radius:5px;padding:7px;font-size:12px;max-width:100%;box-sizing:border-box}button:disabled{opacity:.45}
 </style>

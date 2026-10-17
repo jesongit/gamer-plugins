@@ -11,7 +11,7 @@ export const fields = [
   ['count', '礼物数量'], ['actor_name', '观众名字'], ['actor_id', '观众 ID'],
 ]
 export function newRule(example = {}) {
-  return { id: crypto.randomUUID(), name: example.name || '新规则', enabled: false, kind: example.kind || 'message', operator: 'equals', value: example.value || '', min_count: 1, entrypoint: '', args: {}, cooldown_secs: 0, timeout_secs: 0 }
+  return { id: crypto.randomUUID(), name: example.name || '新规则', enabled: false, kind: example.kind || 'message', operator: 'equals', value: example.value || '', min_count: 1, cost: 1, entrypoint: '', args: {}, cooldown_secs: 0, timeout_secs: 0 }
 }
 export function fixedValue(text, type) {
   if (type === 'boolean') return text === 'true'

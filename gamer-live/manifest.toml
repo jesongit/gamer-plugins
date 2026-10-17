@@ -1,9 +1,9 @@
 manifest_version = 2
 id = "gamer-live"
-version = "0.2.5"
+version = "0.2.15"
 name = "直播助手"
-description = "向直播姬提供设备音视频素材，接收 B 站直播互动；支持手动 RTMP 输出"
-permissions = ["ui.host", "media.stream", "live.connect", "resource.read", "run.submit", "run.control"]
+description = "设备直播与文件夹视频自动直播，弹幕排队执行脚本并自动切换画面；支持直播姬与手动 RTMP 输出"
+permissions = ["ui.host", "media.stream", "media.read", "live.connect", "resource.read", "resource.write", "run.submit", "run.control"]
 
 [host_api]
 ui = "^1.0"
@@ -22,7 +22,7 @@ required = false
 [execution]
 kind = "builtin"
 builtin_id = "gamer-live"
-host_version = ">=0.2.5"
+host_version = ">=0.3.0"
 
 [[ui.contributions]]
 panel_id = "live"
@@ -33,3 +33,87 @@ runtime = "core"
 entry = "ui/plugin.js"
 requires_device = false
 component = "LiveWorkspace"
+
+# External tools are explicit; UI/internal actions are never exported automatically.
+[[tools]]
+tool_id = "status"
+action = "external.status"
+description = "查询授权设备和配置包的本机输出及队列状态，不返回凭据、路径或推流地址。"
+input_schema = "schemas/mcp/status.json"
+required_scopes = ["plugin.gamer-live.status.read"]
+required_permissions = ["media.read", "resource.read"]
+effect = "read"
+[tools.context]
+device_field = "device_id"
+package_field = "package_id"
+
+[[tools]]
+tool_id = "queue_status"
+action = "external.queue_status"
+description = "仅读取实际绑定授权目标的队列项，先过滤目标再分页，不返回原始观众事件。"
+input_schema = "schemas/mcp/queue_status.json"
+required_scopes = ["plugin.gamer-live.queue.read"]
+required_permissions = ["resource.read"]
+effect = "read"
+[tools.context]
+device_field = "device_id"
+package_field = "package_id"
+
+[[tools]]
+tool_id = "rules_read"
+action = "external.rules_read"
+description = "读取配置包互动规则与资源版本。"
+input_schema = "schemas/mcp/rules_read.json"
+required_scopes = ["plugin.gamer-live.rules.read","resource.read"]
+required_permissions = ["resource.read"]
+effect = "read"
+[tools.context]
+package_field = "package_id"
+
+[[tools]]
+tool_id = "rules_preview"
+action = "external.rules_preview"
+description = "用模拟弹幕或礼物检验规则匹配与参数绑定，不入队、不运行。"
+input_schema = "schemas/mcp/rules_preview.json"
+required_scopes = ["plugin.gamer-live.rules.read","resource.read"]
+required_permissions = ["resource.read"]
+effect = "read"
+[tools.context]
+package_field = "package_id"
+
+[[tools]]
+tool_id = "rules_save"
+action = "external.rules_save"
+description = "显式保存互动规则并冻结当前令牌的受限执行授权与目标；后续入队、主脚本和收尾继续沿用该授权，令牌过期不自动停用规则。"
+input_schema = "schemas/mcp/rules_save.json"
+required_scopes = ["plugin.gamer-live.rules.write","resource.write","task.write","run.submit"]
+required_permissions = ["resource.write","run.submit"]
+effect = "task_write"
+[tools.context]
+device_field = "device_id"
+package_field = "package_id"
+
+[[tools]]
+tool_id = "stream_start"
+action = "external.stream_start"
+description = "开启授权设备本机输出，冻结目标后独立继续；不启用连接、自动运行或发送器。"
+input_schema = "schemas/mcp/stream_start.json"
+required_scopes = ["plugin.gamer-live.stream.control","media.record"]
+required_permissions = ["media.stream"]
+effect = "media_write"
+[tools.context]
+device_field = "device_id"
+package_field = "package_id"
+
+[[tools]]
+tool_id = "stream_stop"
+action = "external.stream_stop"
+description = "停止同一冻结设备、配置包和 stream_id 的本机输出。"
+input_schema = "schemas/mcp/stream_stop.json"
+required_scopes = ["plugin.gamer-live.stream.control","media.record"]
+required_permissions = ["media.stream"]
+effect = "media_write"
+[tools.context]
+device_field = "device_id"
+package_field = "package_id"
+

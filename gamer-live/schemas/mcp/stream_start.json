@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "package_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "operation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "audio": {
+      "type": "boolean",
+      "default": true
+    },
+    "fps": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 60,
+      "default": 30
+    },
+    "bitrate_kbps": {
+      "type": "integer",
+      "minimum": 500,
+      "maximum": 20000,
+      "default": 4000
+    }
+  },
+  "required": [
+    "device_id",
+    "package_id",
+    "operation_id"
+  ],
+  "additionalProperties": false
+}

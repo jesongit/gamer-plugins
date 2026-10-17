@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "package_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "maxLength": 128
+    }
+  },
+  "required": [
+    "device_id",
+    "package_id"
+  ],
+  "additionalProperties": false
+}

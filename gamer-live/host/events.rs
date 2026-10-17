@@ -8,6 +8,8 @@ pub struct LiveEvent {
     pub seq: u64,
     pub platform_id: String,
     pub connection_id: String,
+    #[serde(default)]
+    pub identity_namespace: String,
     pub room_id: String,
     pub event_id: Option<String>,
     pub kind: String,
@@ -44,6 +46,14 @@ fn scalar(value: Option<&Value>) -> String {
 }
 impl EventBuffer {
     pub fn push(&mut self, connection: &str, raw: Value) -> Option<LiveEvent> {
+        self.push_scoped(connection, "", raw)
+    }
+    pub fn push_scoped(
+        &mut self,
+        connection: &str,
+        namespace: &str,
+        raw: Value,
+    ) -> Option<LiveEvent> {
         // Bound retained raw payloads as well as event count.
         if raw.to_string().len() > 64 * 1024 {
             return None;
@@ -110,6 +120,7 @@ impl EventBuffer {
             seq: self.next,
             platform_id: "bilibili".into(),
             connection_id: connection.into(),
+            identity_namespace: namespace.into(),
             room_id: room,
             event_id: id,
             kind,
@@ -147,6 +158,18 @@ impl EventBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn application_identity_is_host_scoped_and_never_taken_from_platform_payload() {
+        let mut b = EventBuffer::default();
+        let raw = json!({"cmd":"OPEN_LIVEROOM_DM","identity_namespace":"forged","data":{"open_id":"viewer","room_id":123,"msg":"确认","identity_namespace":"forged"}});
+        let first = b
+            .push_scoped("connection-one", "app-owned", raw.clone())
+            .unwrap();
+        let second = b.push_scoped("connection-two", "app-owned", raw).unwrap();
+        assert_eq!(first.identity_namespace, "app-owned");
+        assert_eq!(first.identity_namespace, second.identity_namespace);
+        assert_ne!(first.connection_id, second.connection_id);
+    }
     #[test]
     fn official_variants_keep_optional_badges_gifts_and_nested_guard_identity() {
         for prefix in ["LIVE_OPEN_PLATFORM_", "OPEN_LIVEROOM_"] {

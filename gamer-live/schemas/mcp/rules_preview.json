@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "properties": {
+    "package_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "kind": {
+      "enum": [
+        "message",
+        "gift"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "gift_id": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "gift_name": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "package_id",
+    "kind",
+    "payload"
+  ],
+  "additionalProperties": false
+}

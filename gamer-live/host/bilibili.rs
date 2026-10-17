@@ -403,7 +403,10 @@ async fn listen(
                         if op==8 {ensure!(event["code"].as_i64()==Some(0),"平台拒绝了长连授权");authorized=true;let mut s=status.lock();s.state="connected".into();s.error=None;}
                         else if authorized {
                             let ended=event["cmd"].as_str().is_some_and(|c|c.ends_with("INTERACTION_END"));
-                            let normalized = events.lock().push(id,event);
+                            use sha2::{Digest, Sha256};
+                            let c = &client.credentials;
+                            let namespace = format!("{:x}", Sha256::digest(format!("{}\0{}\0{}", c.mode, c.access_key, c.app_id).as_bytes()));
+                            let normalized = events.lock().push_scoped(id,&namespace,event);
                             if let (Some(event), Some(queue)) = (normalized, queue) { queue.receive(event).await; }
                             if ended {bail!("平台消息推送已结束，需要重新建立连接");}
                         }

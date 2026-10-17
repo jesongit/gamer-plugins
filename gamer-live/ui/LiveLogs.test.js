@@ -35,3 +35,28 @@ it('固定阅读时仍更新执行状态，恢复后合并新消息，加载历�
   expect(wrapper.findAll('.record')).toHaveLength(3)
   expect(wrapper.findAll('.detail')).toHaveLength(1)
 })
+
+it('主任务成功保留成功状态，收尾警告与独立日志可查看', async () => {
+  const completed = row(4, 'success')
+  completed.item = { ...completed.item, id: 'q4', name: '日常', run_id: 'main-run', cleanup_warning: '退出账号等待超时', cleanup: { state: 'failed', run_id: 'cleanup-run', started_at: Date.now() - 1000, finished_at: Date.now() } }
+  call.mockReset().mockResolvedValue({ rows: [completed], updates: [], next: 4, has_more: false })
+  wrapper = mount(LiveLogs); await flushPromises()
+  expect(wrapper.get('.outcome b').text()).toBe('已完成')
+  expect(wrapper.get('article').classes()).not.toContain('bad')
+  expect(wrapper.get('.warning').text()).toContain('退出账号等待超时')
+  await wrapper.get('.record').trigger('click')
+  const action = text => wrapper.findAll('button').find(button => button.text() === text)
+  expect(action('重新执行并排到队尾')).toBeUndefined()
+  await action('查看收尾日志').trigger('click')
+  expect(wrapper.emitted('run-log')[0][0]).toMatchObject({ run_id: 'cleanup-run', name: '日常 · 收尾' })
+  await action('查看运行日志').trigger('click')
+  expect(wrapper.emitted('run-log')[1][0].run_id).toBe('main-run')
+})
+
+it('收尾期间保持当前项并显示主任务结果', async () => {
+  const cleaning = row(5, 'running')
+  cleaning.item.phase = 'cleanup'; cleaning.item.main_result = { state: 'success' }
+  call.mockReset().mockResolvedValue({ rows: [cleaning], updates: [], next: 5, has_more: false })
+  wrapper = mount(LiveLogs); await flushPromises()
+  expect(wrapper.get('.outcome b').text()).toBe('主任务成功 · 收尾中')
+})

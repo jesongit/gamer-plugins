@@ -11,16 +11,24 @@ async fn mock_server(
     data: Value,
     status: StatusCode,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    mock_server_content(data, status, false).await
+}
+async fn mock_server_content(
+    data: Value,
+    status: StatusCode,
+    run_summary: bool,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let state = (data, status, hits.clone());
+    let state = (data, status, hits.clone(), run_summary);
     let router = Router::new()
         .route(
             "/api/v1/notify",
             post(
-                |AxumState((data, status, hits)): AxumState<(
+                |AxumState((data, status, hits, run_summary)): AxumState<(
                     Value,
                     StatusCode,
                     Arc<AtomicUsize>,
+                    bool,
                 )>,
                  headers: HeaderMap,
                  Json(body): Json<Value>| async move {
@@ -29,7 +37,20 @@ async fn mock_server(
                         .to_str()
                         .unwrap()
                         .starts_with("gamer-"));
-                    assert_eq!(body["content"], "测试正文");
+                    if run_summary {
+                        let content = body["content"].as_str().unwrap();
+                        assert!(body["title"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("浏览器账号 · hsr/daily.yaml："));
+                        assert!(
+                            content.starts_with("脚本：hsr/daily.yaml\n目标：浏览器账号\n结果：")
+                        );
+                        assert!(content.contains("\n运行：outcome-"));
+                        assert!(content.contains("\n错误："));
+                    } else {
+                        assert_eq!(body["content"], "测试正文");
+                    }
                     hits.fetch_add(1, Ordering::SeqCst);
                     (status, Json(data))
                 },
@@ -43,6 +64,95 @@ async fn mock_server(
 }
 async fn save_channel(service: &NotifyService) {
     service.dispatch("channels.save", json!({"channel":{"id":"wechat","name":"我的微信","kind":"wecomlink","enabled":true,"key":"fixture-notify-key"},"expected_version":null})).await.unwrap();
+}
+fn save_browser_target(db: &crate::store::Db) {
+    db.save_browser_target(crate::browser::BrowserTarget {
+        id: "browser-notify-test".into(),
+        name: "浏览器账号".into(),
+        url: "https://example.com/".into(),
+        profile_id: "notify-test".into(),
+        width: 1920,
+        height: 1080,
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn notification_target_names_cover_android_browser_and_missing_targets() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        crate::store::Store::open(&crate::config::Config {
+            data_dir: root.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    save_browser_target(&db);
+    db.upsert_device(&crate::store::Device {
+        id: "android-notify-test".into(),
+        name: "测试手机".into(),
+        addr: "serial".into(),
+        screen_mode: crate::store::ScreenMode::Mirror,
+        vd_res: None,
+        vd_dpi: None,
+        pkg: None,
+        fps: None,
+        created_at: "now".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        target_name(&db, "browser-notify-test").await.unwrap(),
+        "浏览器账号"
+    );
+    assert_eq!(
+        target_name(&db, "android-notify-test").await.unwrap(),
+        "测试手机"
+    );
+    let notify = NotifyService::new(root.path()).unwrap().with_db(db.clone());
+    for (id, name) in [
+        ("browser-notify-test", "浏览器账号"),
+        ("android-notify-test", "测试手机"),
+    ] {
+        // No channel is configured: exercise label binding without external I/O.
+        let result = notify
+            .dispatch(
+                SEND,
+                json!({"target_id":id,"title":"日常成功","content":"执行成功"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["record"]["status"], "skipped");
+        assert_eq!(result["record"]["title"], format!("{name} · 日常成功"));
+        assert_eq!(
+            result["record"]["content"],
+            format!("目标：{name}\n执行成功")
+        );
+    }
+    assert!(notify
+        .dispatch(
+            SEND,
+            json!({"target_id":"browser-notify-test","title":42,"content":"正文"})
+        )
+        .await
+        .is_err());
+    let empty = notify
+        .dispatch(
+            SEND,
+            json!({"target_id":"browser-notify-test","content":" "}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty["record"]["status"], "failed");
+    assert_eq!(empty["record"]["content"], " ");
+    db.delete_browser_target("browser-notify-test").unwrap();
+    assert_eq!(
+        target_name(&db, "browser-notify-test").await.unwrap(),
+        "browser-notify-test"
+    );
+    assert_eq!(
+        target_name(&db, "removed-device").await.unwrap(),
+        "removed-device"
+    );
 }
 async fn wait_terminal(service: &NotifyService, id: &str) -> Record {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -62,6 +172,54 @@ async fn wait_terminal(service: &NotifyService, id: &str) -> Record {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn deferred_notifications_inherit_script_channels_without_default() {
+    let (endpoint, hits, server) = mock_server(json!({"status":"sent"}), StatusCode::OK).await;
+    let root = tempfile::tempdir().unwrap();
+    let notify = NotifyService::open(root.path(), endpoint).unwrap();
+    save_channel(&notify).await;
+    let settings = notify.dispatch("channels.read", json!({})).await.unwrap();
+    assert!(settings["default_channel"].is_null());
+    notify.dispatch("channels.save", json!({"expected_version":settings["version"],"channel":{"id":"second","name":"第二微信","kind":"wecomlink","enabled":true,"key":"fixture-notify-key"}})).await.unwrap();
+    let rule = json!({"package_id":"hsr","entrypoint":"hsr/daily.yaml","runner_ids":["gamer-yaml","gamer-yaml-version"],"channels":["wechat","second"],"enabled":true});
+    let rules = notify
+        .dispatch("runs.save", json!({"expected_version":null,"rule":rule}))
+        .await
+        .unwrap();
+    let values = json!({"content":"测试正文","source":"script","source_id":"scope-result","result_scope":{"package_id":"hsr","entrypoint":"hsr/daily.yaml"}});
+    let submitted = notify.dispatch(SEND, values.clone()).await.unwrap();
+    assert_eq!(submitted["accepted"], true);
+    assert_eq!(submitted["records"].as_array().unwrap().len(), 2);
+    for record in submitted["records"].as_array().unwrap() {
+        assert_eq!(
+            wait_terminal(&notify, record["id"].as_str().unwrap())
+                .await
+                .status,
+            "sent"
+        );
+    }
+    notify.dispatch(SEND, values).await.unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(
+        notify.dispatch("channels.read", json!({})).await.unwrap()["default_channel"].is_null()
+    );
+    let missing = notify.dispatch(SEND,json!({"content":"测试正文","result_scope":{"package_id":"hsr","entrypoint":"hsr/other.yaml"}})).await.unwrap();
+    assert_eq!(missing["record"]["status"], "skipped");
+    let mut disabled = rule;
+    disabled["enabled"] = json!(false);
+    notify
+        .dispatch(
+            "runs.save",
+            json!({"expected_version":rules["version"],"rule":disabled}),
+        )
+        .await
+        .unwrap();
+    let skipped = notify.dispatch(SEND,json!({"content":"测试正文","result_scope":{"package_id":"hsr","entrypoint":"hsr/daily.yaml"}})).await.unwrap();
+    assert_eq!(skipped["record"]["status"], "skipped");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    server.abort();
 }
 
 #[test]
@@ -379,17 +537,18 @@ async fn task_policy_delivers_through_global_channels_without_package_resources(
         })
         .unwrap(),
     );
+    save_browser_target(&db);
     let mut task = Task::new(
         "task",
         "完成任务",
-        AppContext::for_test("device", "com.game").unwrap(),
+        AppContext::for_test("browser-notify-test", "com.game").unwrap(),
         "runner",
         "entry",
         json!({}),
         TaskSchedule::new("cron", json!({"expression":"0 8 * * *"})).unwrap(),
     )
     .unwrap();
-    task.extensions = json!({ID:{"enabled":true,"results":{"success":{"enabled":true,"channels":["wechat","wechat"],"title":"{{task.name}}：{{result}}","content":"测试正文"}}}});
+    task.extensions = json!({ID:{"enabled":true,"results":{"success":{"enabled":true,"channels":["wechat","wechat"],"title":"{{target.name}} · {{task.name}}：{{result}}","content":"测试正文"}}}});
     let hook = super::task::result_hook(Arc::downgrade(&extensions), db);
     hook(
         task,
@@ -419,10 +578,123 @@ async fn task_policy_delivers_through_global_channels_without_package_resources(
     })
     .await
     .unwrap();
-    assert_eq!(record.title, "完成任务：成功");
+    assert_eq!(record.title, "浏览器账号 · 完成任务：成功");
     assert_eq!(record.source, "task");
     assert_eq!(record.source_id.as_deref(), Some("run:task-test"));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn script_result_rules_cover_private_manual_and_scheduled_outcomes() {
+    use crate::{
+        capabilities::CapabilityRegistry,
+        extensions::{ExtensionId, ExtensionService},
+        run_manager::{RunOutcome, RunRecord, RunSource, RunState},
+    };
+    let (endpoint, hits, server) =
+        mock_server_content(json!({"status":"sent"}), StatusCode::OK, true).await;
+    let root = tempfile::tempdir().unwrap();
+    let notify = Arc::new(NotifyService::open(root.path(), endpoint).unwrap());
+    save_channel(&notify).await;
+    let saved = notify.dispatch("runs.save", json!({"expected_version":null,"rule":{
+        "package_id":"hsr","entrypoint":"hsr/daily.yaml","runner_ids":["gamer-yaml","gamer-yaml-version"],
+        "channels":["wechat","wechat"],"enabled":true}})).await.unwrap();
+    assert_eq!(saved["rules"][0]["channels"], json!(["wechat"]));
+    assert!(notify
+        .dispatch(
+            "runs.delete",
+            json!({"expected_version":"stale","rule":{
+        "package_id":"hsr","entrypoint":"hsr/daily.yaml"}})
+        )
+        .await
+        .is_err());
+    let extensions = Arc::new(
+        ExtensionService::for_data_root(root.path(), CapabilityRegistry::default())
+            .with_builtin_service(notify.clone()),
+    );
+    let id = ExtensionId::parse(ID).unwrap();
+    extensions.install(&archive(true)).await.unwrap();
+    extensions.enable(&id).await.unwrap();
+    extensions.start(&id).await.unwrap();
+    let db = Arc::new(
+        crate::store::Store::open(&crate::config::Config {
+            data_dir: root.path().to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    save_browser_target(&db);
+    let hook = super::run::result_hook(
+        Arc::downgrade(&extensions),
+        db.clone(),
+        root.path().to_path_buf(),
+    );
+    for (index, state, source, runner) in [
+        (
+            0,
+            RunState::Success,
+            RunSource::Manual,
+            "gamer-yaml-version",
+        ),
+        (1, RunState::Failed, RunSource::Scheduled, "gamer-yaml"),
+        (2, RunState::Cancelled, RunSource::TaskNow, "gamer-yaml"),
+    ] {
+        let record = RunRecord {
+            run_id: format!("outcome-{index}"),
+            device_id: "browser-notify-test".into(),
+            runner_id: runner.into(),
+            entrypoint: "hsr/daily.yaml".into(),
+            content_package: Some("hsr".into()),
+            script_id: "hsr/daily.yaml".into(),
+            source,
+            task_id: None,
+            scheduled_at: None,
+            state,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            error: (state == RunState::Failed).then(|| "NUMBER_INVALID / TIMEOUT".into()),
+        };
+        hook(&record, &RunOutcome::Success(vec![]));
+        // Delivery idempotency applies even if an observer is invoked again.
+        hook(&record, &RunOutcome::Success(vec![]));
+        let mut foreign = record.clone();
+        foreign.content_package = Some("other".into());
+        foreign.run_id = format!("foreign-{index}");
+        hook(&foreign, &RunOutcome::Success(vec![]));
+        // Explicit script policies own both enabled and disabled outcomes.
+        // The existing global rule stays available for earlier prepare errors.
+        let mut policy_owned = record.clone();
+        policy_owned.run_id = format!("policy-owned-{index}");
+        db.save_run_record(&policy_owned).unwrap();
+        db.append_run_event(policy_owned.run_id.clone(), json!({"ev":"detail","name":"notification_policy","data":{"frame_id":0,"when":"success","enabled":false}})).await.unwrap();
+        hook(&policy_owned, &RunOutcome::Success(vec![]));
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if notify
+                .state
+                .records
+                .lock()
+                .iter()
+                .filter(|record| record.status == "sent")
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    let records = notify.state.records.lock();
+    assert_eq!(records.len(), 3);
+    assert!(records
+        .iter()
+        .any(|record| record.content.contains("NUMBER_INVALID / TIMEOUT")));
+    assert!(records.iter().all(|record| record.source == "run"));
     server.abort();
 }
 

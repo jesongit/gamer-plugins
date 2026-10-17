@@ -24,6 +24,50 @@ pub struct Binding {
     #[serde(default)]
     pub field: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupSpec {
+    pub entrypoint: String,
+    #[serde(default)]
+    pub args: Map<String, Value>,
+    #[serde(default = "cleanup_timeout")]
+    pub timeout_secs: u64,
+}
+fn cleanup_timeout() -> u64 {
+    180
+}
+impl CleanupSpec {
+    pub fn validate(&self, package: &str) -> Result<()> {
+        validate_entrypoint(package, &self.entrypoint)?;
+        ensure!(
+            (1..=3600).contains(&self.timeout_secs) && self.args.len() <= 64,
+            "收尾参数超出限制（超时须为 1..3600 秒）"
+        );
+        ensure!(
+            self.args
+                .values()
+                .all(|value| value.to_string().len() <= 4096),
+            "收尾参数值过大"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationSpec {
+    #[serde(default = "confirmation_timeout")]
+    pub timeout_secs: u64,
+    pub cancel_cleanup: CleanupSpec,
+}
+fn confirmation_timeout() -> u64 {
+    300
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionSpec {
+    pub entrypoint: String,
+    pub checkpoint_id: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -48,6 +92,14 @@ pub struct Rule {
     pub cooldown_secs: u64,
     #[serde(default)]
     pub timeout_secs: u64,
+    #[serde(default = "one")]
+    pub cost: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<CompletionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupSpec>,
 }
 fn equals() -> String {
     "equals".into()
@@ -60,17 +112,49 @@ fn one() -> u64 {
 pub struct RuleSet {
     pub schema_version: u8,
     pub rules: Vec<Rule>,
+    /// Host-minted source of externally edited rules. Older user-authored
+    /// files omit it and retain their management execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_origin: Option<ExternalRuleOrigin>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalRuleOrigin {
+    pub policy: crate::core::ExecutionPolicy,
+    pub device_id: String,
+    pub package_id: String,
+    pub runner_id: String,
+}
+impl ExternalRuleOrigin {
+    pub fn authorize_target(&self, device: &str, package: &str) -> Result<()> {
+        ensure!(
+            self.device_id == device && self.package_id == package && self.runner_id == RUNNER,
+            "external_execution_denied: live target differs from frozen rule authority"
+        );
+        ensure!(
+            !device.is_empty()
+                && !device.chars().any(char::is_control)
+                && self.policy.has_scope("run.submit")
+                && self.policy.allows_plugin(RUNNER),
+            "external_execution_denied: rule authority does not permit the Runner"
+        );
+        Ok(())
+    }
 }
 impl Default for RuleSet {
     fn default() -> Self {
         Self {
             schema_version: 1,
             rules: vec![],
+            external_origin: None,
         }
     }
 }
 impl RuleSet {
     pub fn validate(&self, package: &str) -> Result<()> {
+        if let Some(origin) = &self.external_origin {
+            origin.authorize_target(&origin.device_id, package)?;
+        }
         ensure!(
             self.schema_version == 1 && self.rules.len() <= 100,
             "规则格式无效或超过 100 条"
@@ -99,7 +183,8 @@ impl RuleSet {
                     && r.min_count > 0
                     && r.args.len() <= 64
                     && r.cooldown_secs <= 86400
-                    && r.timeout_secs <= 86400,
+                    && r.timeout_secs <= 86400
+                    && (1..=1_000_000).contains(&r.cost),
                 "规则超出限制"
             );
             for b in r.args.values() {
@@ -109,6 +194,33 @@ impl RuleSet {
                     "参数来源无效"
                 );
                 ensure!(b.value.to_string().len() <= 4096, "参数值过大");
+            }
+            if let Some(cleanup) = &r.cleanup {
+                cleanup.validate(package)?;
+            }
+            if let Some(confirmation) = &r.confirmation {
+                ensure!(
+                    (1..=300).contains(&confirmation.timeout_secs),
+                    "本人确认须在 1..300 秒内"
+                );
+                confirmation.cancel_cleanup.validate(package)?;
+            }
+            if let Some(completion) = &r.completion {
+                validate_entrypoint(package, &completion.entrypoint)?;
+                ensure!(
+                    completion.entrypoint.ends_with(".yaml")
+                        && !completion.entrypoint.contains('#'),
+                    "完成入口必须是配置包内完整脚本"
+                );
+                ensure!(
+                    !completion.checkpoint_id.is_empty()
+                        && completion.checkpoint_id.len() <= 128
+                        && completion
+                            .checkpoint_id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+                    "完成检查点 ID 无效"
+                );
             }
             if r.enabled {
                 ensure!(
@@ -229,4 +341,83 @@ pub fn bind_schema(mut args: Map<String, Value>, descriptor: &Value) -> Result<M
         ensure!(valid, "参数 {name} 类型不匹配，要求 {}", d["type"]);
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rule() -> Value {
+        json!({"id":"daily","name":"日常","enabled":true,"kind":"message",
+            "value":"日常","entrypoint":"hsr/main.yaml"})
+    }
+
+    #[test]
+    fn cleanup_is_opt_in_and_retains_static_args_and_default_timeout() {
+        let ordinary: Rule = serde_json::from_value(rule()).unwrap();
+        assert!(ordinary.cleanup.is_none());
+        assert!(serde_json::to_value(ordinary)
+            .unwrap()
+            .get("cleanup")
+            .is_none());
+        let mut value = rule();
+        value["cleanup"] = json!({"entrypoint":"hsr/cleanup.yaml","args":{"notify_failure":false}});
+        let configured: Rule = serde_json::from_value(value).unwrap();
+        let cleanup = configured.cleanup.as_ref().unwrap();
+        assert_eq!(cleanup.timeout_secs, 180);
+        assert_eq!(cleanup.args["notify_failure"], false);
+        RuleSet {
+            schema_version: 1,
+            rules: vec![configured],
+            external_origin: None,
+        }
+        .validate("hsr")
+        .unwrap();
+        let empty: CleanupSpec =
+            serde_json::from_value(json!({"entrypoint":"hsr/cleanup.yaml"})).unwrap();
+        assert!(empty.args.is_empty());
+    }
+
+    #[test]
+    fn cleanup_rejects_other_packages_traversal_unknown_fields_and_unbounded_settings() {
+        for entry in [
+            "other/cleanup.yaml",
+            "hsr/../cleanup.yaml",
+            "hsr\\cleanup.yaml",
+            "hsr//cleanup.yaml",
+        ] {
+            let cleanup: CleanupSpec = serde_json::from_value(json!({"entrypoint":entry})).unwrap();
+            assert!(cleanup.validate("hsr").is_err(), "{entry}");
+        }
+        for timeout in [0, 3601] {
+            let cleanup: CleanupSpec = serde_json::from_value(
+                json!({"entrypoint":"hsr/cleanup.yaml","timeout_secs":timeout}),
+            )
+            .unwrap();
+            assert!(cleanup.validate("hsr").is_err());
+        }
+        let mut cleanup: CleanupSpec =
+            serde_json::from_value(json!({"entrypoint":"hsr/cleanup.yaml","timeout_secs":3600}))
+                .unwrap();
+        cleanup.validate("hsr").unwrap();
+        cleanup
+            .args
+            .insert("message".into(), json!("x".repeat(4097)));
+        assert!(cleanup.validate("hsr").is_err());
+        assert!(serde_json::from_value::<CleanupSpec>(
+            json!({"entrypoint":"hsr/cleanup.yaml","arbitrary":true})
+        )
+        .is_err());
+        let mut disabled = rule();
+        disabled["enabled"] = json!(false);
+        disabled["cleanup"] = json!({"entrypoint":"other/cleanup.yaml"});
+        assert!(RuleSet {
+            schema_version: 1,
+            rules: vec![serde_json::from_value(disabled).unwrap()],
+            external_origin: None,
+        }
+        .validate("hsr")
+        .is_err());
+    }
 }

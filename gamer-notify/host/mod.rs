@@ -1,4 +1,5 @@
 //! Notification business: global channels, bounded asynchronous delivery and local history.
+pub mod run;
 mod settings;
 pub mod task;
 #[cfg(test)]
@@ -30,6 +31,9 @@ pub const ACTIONS: &[&str] = &[
     "channels.delete",
     "channels.default",
     "notification.send",
+    "runs.read",
+    "runs.save",
+    "runs.delete",
     "records.read",
     "records.query",
 ];
@@ -73,11 +77,34 @@ fn manual_source() -> String {
     "manual".into()
 }
 
+async fn target_name(db: &crate::store::Db, id: &str) -> Result<String> {
+    let name = if crate::targets::is_browser(id) {
+        let db = db.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>(
+                db.browser_targets()?
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.name),
+            )
+        })
+        .await??
+    } else {
+        db.get_device_async(id).await?.map(|d| d.name)
+    };
+    Ok(name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| id.to_owned()))
+}
+
 pub struct NotifyService {
     state: Arc<State>,
+    db: Option<crate::store::Db>,
 }
 struct State {
     private_path: PathBuf,
+    run_rules_path: PathBuf,
     history_path: PathBuf,
     gate: Mutex<()>,
     records: Mutex<Vec<Record>>,
@@ -115,6 +142,7 @@ impl NotifyService {
         }
         let state = Arc::new(State {
             private_path: root.join("private/channels.dat"),
+            run_rules_path: root.join("run-notifications.json"),
             history_path,
             gate: Mutex::new(()),
             records: Mutex::new(records),
@@ -133,12 +161,92 @@ impl NotifyService {
         if state.history_path.exists() {
             state.persist(&mut state.records.lock())?;
         }
-        Ok(Self { state })
+        Ok(Self { state, db: None })
+    }
+
+    pub fn with_db(mut self, db: crate::store::Db) -> Self {
+        self.db = Some(db);
+        self
     }
 
     async fn dispatch(&self, action: &str, values: Value) -> Result<Value> {
         match action {
-            "notification.send" => self.submit(values),
+            "runs.read" | "runs.save" | "runs.delete" => {
+                let _gate = self.state.gate.lock();
+                run::dispatch(
+                    &self.state.run_rules_path,
+                    &self.state.private_path,
+                    action,
+                    values,
+                )
+            }
+            "notification.send" => {
+                let mut values = values;
+                let scope = values
+                    .as_object_mut()
+                    .and_then(|values| values.remove("result_scope"));
+                if let Some(id) = values
+                    .as_object_mut()
+                    .and_then(|values| values.remove("target_id"))
+                {
+                    let id = id
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 256)
+                        .context("通知目标 ID 无效")?;
+                    // Target decoration must not hide invalid original fields or
+                    // turn an empty business message into a deliverable message.
+                    let original: SendRequest =
+                        serde_json::from_value(values.clone()).context("通知参数无效")?;
+                    if original.content.trim().is_empty() {
+                        return self.submit(values);
+                    }
+                    let target = match &self.db {
+                        Some(db) => target_name(db, id).await?,
+                        None => id.to_string(),
+                    };
+                    let target = truncate(&target, 256);
+                    let title = &original.title;
+                    values["title"] = json!(if title.is_empty() {
+                        target.clone()
+                    } else {
+                        format!("{target} · {title}")
+                    });
+                    values["content"] = json!(format!("目标：{target}\n{}", original.content));
+                }
+                let inherited = if values["channel"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .is_none()
+                {
+                    scope
+                        .as_ref()
+                        .map(|scope| run::channels_for_scope(&self.state.run_rules_path, scope))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
+                if let Some(channels) = inherited.filter(|channels| !channels.is_empty()) {
+                    let mut responses = Vec::new();
+                    for channel in channels {
+                        let mut values = values.clone();
+                        values["channel"] = json!(channel);
+                        responses.push(self.submit(values)?);
+                    }
+                    let accepted = responses
+                        .iter()
+                        .all(|response| response["accepted"] == true);
+                    let primary = responses
+                        .iter()
+                        .find(|response| response["accepted"] != true)
+                        .unwrap_or(&responses[0]);
+                    Ok(
+                        json!({"accepted":accepted,"record":primary["record"],"records":responses.iter().map(|response| response["record"].clone()).collect::<Vec<_>>()}),
+                    )
+                } else {
+                    self.submit(values)
+                }
+            }
             "records.read" => Ok(
                 json!({"records":self.state.records.lock().iter().rev().take(200).collect::<Vec<_>>()}),
             ),
