@@ -365,7 +365,33 @@ fn archive(manifest: &str) -> Vec<u8> {
         .start_file("manifest.toml", zip::write::SimpleFileOptions::default())
         .unwrap();
     writer.write_all(manifest.as_bytes()).unwrap();
+    for (name, bytes) in [
+        (
+            "schemas/mcp/status.json",
+            include_bytes!("../schemas/mcp/status.json").as_slice(),
+        ),
+        (
+            "schemas/mcp/recognize.json",
+            include_bytes!("../schemas/mcp/recognize.json").as_slice(),
+        ),
+    ] {
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+    }
     writer.finish().unwrap().into_inner()
+}
+fn official_version() -> String {
+    let manifest: toml::Value = toml::from_str(include_str!("../manifest.toml")).unwrap();
+    manifest["version"].as_str().unwrap().to_owned()
+}
+fn official_manifest_with_version(version: &str) -> String {
+    include_str!("../manifest.toml").replacen(
+        &format!("version = \"{}\"", official_version()),
+        &format!("version = \"{version}\""),
+        1,
+    )
 }
 
 async fn managed_fixture() -> (
@@ -414,6 +440,44 @@ async fn managed_fixture() -> (
 
 fn slow_request() -> Value {
     json!({"png_base64":png(2,2),"language":"eng","timeout_ms":15000})
+}
+
+#[tokio::test]
+async fn cancelling_one_external_ocr_joins_its_child_without_cancelling_another_caller() {
+    let (_root, ocr, _manager, _id) = managed_fixture().await;
+    let (cancel, cancelled) = watch::channel(false);
+    let active = {
+        let ocr = ocr.clone();
+        tokio::spawn(async move {
+            ocr.recognize_cancellable(slow_request(), Some(cancelled))
+                .await
+        })
+    };
+    let first_pid = running(&ocr.state).await;
+    let queued = {
+        let ocr = ocr.clone();
+        tokio::spawn(async move { ocr.recognize(slow_request()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ocr.state.pending.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.send_replace(true);
+    assert!(tokio::time::timeout(Duration::from_secs(5), active)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_exited(first_pid).await;
+    let next_pid = running(&ocr.state).await;
+    assert_ne!(next_pid, first_pid);
+    assert!(!queued.is_finished());
+    ocr.stop().await;
+    assert!(queued.await.unwrap().is_err());
+    assert_exited(next_pid).await;
 }
 
 #[tokio::test]
@@ -564,8 +628,7 @@ async fn shutdown_update_and_active_uninstall_cancel_real_children_before_manage
             match action {
                 "shutdown" => manager.shutdown_builtin_service().await,
                 "update" => {
-                    let manifest = include_str!("../manifest.toml")
-                        .replace("version = \"0.1.0\"", "version = \"0.1.1\"");
+                    let manifest = official_manifest_with_version("0.1.2");
                     manager.update(&archive(&manifest)).await.unwrap();
                 }
                 "uninstall" => assert!(manager.uninstall(&id, &active).await.unwrap()),
@@ -623,12 +686,10 @@ async fn invalid_updates_and_uninstalls_reject_before_interrupting_work() {
         .update(&archive(include_str!("../manifest.toml")))
         .await
         .is_err());
-    let increased_permissions = include_str!("../manifest.toml")
-        .replace("version = \"0.1.0\"", "version = \"0.1.1\"")
-        .replace(
-            "\"ui.host\", \"vision.ocr\"",
-            "\"ui.host\", \"vision.ocr\", \"notify.send\"",
-        );
+    let increased_permissions = official_manifest_with_version("0.1.2").replace(
+        "\"ui.host\", \"vision.ocr\"",
+        "\"ui.host\", \"vision.ocr\", \"notify.send\"",
+    );
     assert!(manager
         .update_with_context(
             &archive(&increased_permissions),
@@ -657,8 +718,7 @@ async fn invalid_updates_and_uninstalls_reject_before_interrupting_work() {
 #[tokio::test]
 async fn incompatible_updates_and_inactive_uninstalls_do_not_cancel_active_provider() {
     let (_root, ocr, manager, id) = managed_fixture().await;
-    let older =
-        include_str!("../manifest.toml").replace("version = \"0.1.0\"", "version = \"0.0.9\"");
+    let older = official_manifest_with_version("0.0.9");
     manager.install(&archive(&older)).await.unwrap();
     manager.install(&archive("manifest_version=2\nid=\"gamer-notify\"\nversion=\"0.1.0\"\nname=\"Required provider fixture\"\n[execution]\nkind=\"builtin\"\nbuiltin_id=\"gamer-notify\"\n[[dependencies]]\nid=\"gamer-ocr\"\nversion=\"^0.1.0\"\nrequired=true\n")).await.unwrap();
     let dependent = crate::extensions::ExtensionId::parse("gamer-notify").unwrap();
@@ -674,10 +734,9 @@ async fn incompatible_updates_and_inactive_uninstalls_do_not_cancel_active_provi
         })
     };
     let pid = running(&ocr.state).await;
-    let incompatible =
-        include_str!("../manifest.toml").replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+    let incompatible = official_manifest_with_version("0.2.0");
     assert!(manager.update(&archive(&incompatible)).await.is_err());
-    let active = crate::extensions::ExtensionVersion::parse("0.1.0").unwrap();
+    let active = crate::extensions::ExtensionVersion::parse(&official_version()).unwrap();
     assert!(manager.uninstall(&id, &active).await.is_err());
     let removing = {
         let manager = manager.clone();

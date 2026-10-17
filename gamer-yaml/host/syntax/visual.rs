@@ -1,4 +1,4 @@
-//! Version 2 is a source frontend, not another interpreter. Every visual step
+//! The source frontend lowers every visual step to the single interpreter.
 //! lowers to existing function/if wire instructions; both live and replay runs
 //! consume precisely the same program and native observation implementation.
 use super::*;
@@ -21,17 +21,10 @@ fn error(path: &str, msg: impl Into<String>) -> Vec<Diagnostic> {
 }
 fn document(source: &str) -> Result<Mapping, Vec<Diagnostic>> {
     let value: YamlValue = serde_yaml::from_str(source).map_err(yaml_to_diagnostic)?;
-    let mut doc = value
+    let doc = value
         .as_mapping()
         .cloned()
         .ok_or_else(|| error("", "文档必须是映射"))?;
-    if doc.remove(key("version")).and_then(|v| v.as_u64()) != Some(2) {
-        return Err(one_diagnostic(
-            "yaml.version.unsupported",
-            "version",
-            "仅支持 version: 2；旧脚本必须升级，不会按新语法静默运行",
-        ));
-    }
     Ok(doc)
 }
 fn targets(doc: &mut Mapping) -> Result<Mapping, Vec<Diagnostic>> {
@@ -69,6 +62,24 @@ pub(super) fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
     let original: YamlValue = serde_yaml::from_str(source).map_err(yaml_to_diagnostic)?;
     let mut doc = document(source)?;
     let targets = targets(&mut doc)?;
+    let functions = if let Some(defs) = doc.remove(key("functions")) {
+        let mut library_doc = Mapping::new();
+        library_doc.insert(key("targets"), YamlValue::Mapping(targets.clone()));
+        library_doc.insert(key("functions"), defs);
+        let functions = parse_library(&serde_yaml::to_string(&library_doc).unwrap())?;
+        for (name, _) in &functions {
+            if super::super::native_funcs::native_names().contains(name) {
+                return Err(one_diagnostic(
+                    "yaml.function.conflict",
+                    &format!("functions.{name}"),
+                    "脚本函数不能与原生函数同名",
+                ));
+            }
+        }
+        functions
+    } else {
+        Vec::new()
+    };
     if let Some(field) = doc
         .keys()
         .find(|k| !matches!(k.as_str(), Some("name" | "params" | "vars" | "run")))
@@ -92,6 +103,7 @@ pub(super) fn parse_script(source: &str) -> Result<Script, Vec<Diagnostic>> {
             ds
         })?;
     script.original = Some(original);
+    script.functions = functions;
     script.source_map = sources;
     Ok(script)
 }
@@ -106,7 +118,7 @@ pub(super) fn parse_library(source: &str) -> Result<FunctionLibrary, Vec<Diagnos
                 "yaml.functions.missing"
             },
             "functions",
-            "函数库须包含 functions 包装，仅支持 version/targets/functions",
+            "函数库须包含 functions 包装，仅支持 targets/functions",
         ));
     }
     if !doc.contains_key(key("functions")) {
@@ -198,8 +210,8 @@ fn duration(value: &YamlValue, path: &str) -> Result<(), Vec<Diagnostic>> {
         YamlValue::String(s) => parse_duration_ms(s),
         _ => None,
     };
-    if !n.is_some_and(|v| v.is_finite() && (0.0..=3_600_000.0).contains(&v)) {
-        return Err(error(path, "等待时长须为 0..3600000ms 的有限 duration"));
+    if !n.is_some_and(|v| v.is_finite() && (0.0..=7_200_000.0).contains(&v)) {
+        return Err(error(path, "等待时长须为 0..7200000ms 的有限 duration"));
     }
     Ok(())
 }
@@ -475,7 +487,7 @@ mod tests {
     use super::*;
     #[test]
     fn visual_lowering_keeps_observation_and_action_separate() {
-        let s=parse_script("version: 2\ntargets:\n  claim: {template: claim.png}\n  done: {template: done.png}\nrun:\n  - id: claim_button\n    wait: claim\n    then:\n      - tap: claim\n  - optional: {find: claim, then: [{tap: claim}]}\n  - finish: done\n").unwrap();
+        let s=parse_script("targets:\n  claim: {template: claim.png}\n  done: {template: done.png}\nrun:\n  - id: claim_button\n    wait: claim\n    then:\n      - tap: claim\n  - optional: {find: claim, then: [{tap: claim}]}\n  - finish: done\n").unwrap();
         let p = build_program(&s, &vec![], JsonMap::new(), 0);
         assert_eq!(p["run"][0]["fn"], "observe");
         assert_eq!(p["run"][0]["source_id"], "claim_button");
@@ -486,11 +498,10 @@ mod tests {
     #[test]
     fn rejects_legacy_unknown_and_unbounded_waits() {
         for s in [
-            "run: []",
             "version: 1\nrun: []",
-            "version: 2\nrun: [{wait: missing}]",
-            "version: 2\nrun: [{wait: {template: x}, timeout: 999999999s}]",
-            "version: 2\nrun: [{optional: {find: {template: x}, typo: true}}]",
+            "run: [{wait: missing}]",
+            "run: [{wait: {template: x}, timeout: 999999999s}]",
+            "run: [{optional: {find: {template: x}, typo: true}}]",
         ] {
             assert!(parse_script(s).is_err(), "{s}");
         }

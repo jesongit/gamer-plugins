@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "package_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "script_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "expected_version": {
+      "type": "string",
+      "maxLength": 40
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40
+    },
+    "yaml": {
+      "type": "string",
+      "maxLength": 524288
+    },
+    "instruction": {
+      "type": "string",
+      "maxLength": 32000
+    },
+    "material_refs": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "plugin_id": {
+            "enum": [
+              "gamer-video",
+              "gamer-yaml"
+            ]
+          },
+          "sample_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "content_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "candidate_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "plugin_id",
+          "sample_id",
+          "content_sha256"
+        ]
+      }
+    },
+    "template_refs": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200
+      }
+    }
+  },
+  "required": [
+    "package_id",
+    "script_id",
+    "expected_version",
+    "yaml"
+  ]
+}

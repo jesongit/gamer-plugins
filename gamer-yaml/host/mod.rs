@@ -12,7 +12,6 @@
 //!   （原生 + 当前 Package）并绑定参数；
 //! - [`timer_yaml`]：Timer Core 的 gamer-yaml runner + 扩展生命周期注册器；
 //! - [`task_params`]：任务/手动运行参数绑定（按当前 Schema 重绑，无签名门禁）；
-//! - [`video_draft`]：视频工作台草稿动作（`automation.create_draft`）；
 //! - [`wasm_host`]：YAML world 的 Wasmtime 宿主（feature = "wasm-runtime"）。
 //!
 //! 执行权威在 `yaml-interp` crate（WASM guest 与 server 测试同源；计划
@@ -23,12 +22,19 @@
 //! 窄 trait（`TimerRunner`、`ResourceHandler` 等）与本文件显式导出的门面。
 
 pub(crate) mod actions;
+#[path = "generation/authoring.rs"]
+pub(crate) mod authoring;
+mod authoring_materials;
+mod authoring_support;
 pub(crate) mod error;
+pub(crate) mod external_tools;
 pub(crate) mod generation;
+pub(crate) mod live_bridge;
 pub(crate) mod native_funcs;
 pub(crate) mod notification;
 pub(crate) mod ocr_bridge;
 pub(crate) mod offline_validation;
+mod private_trial;
 mod reference_types;
 pub(crate) mod resources;
 pub(crate) mod revisions;
@@ -38,7 +44,6 @@ pub(crate) mod settings;
 pub(crate) mod syntax;
 pub(crate) mod task_params;
 pub(crate) mod timer_yaml;
-pub(crate) mod video_draft;
 pub(crate) mod yaml_extension;
 
 /// native_call_action 缝的分发入口在 [`actions`]（版本化公开动作清单：
@@ -63,7 +68,6 @@ pub(crate) fn public_action_catalog(extension_id: &str) -> Vec<serde_json::Value
                 "surface": match action.surface {
                     actions::ActionSurface::Native => "native",
                     actions::ActionSurface::Rest => "rest",
-                    actions::ActionSurface::Frontend => "frontend",
                 },
                 "summary": action.summary,
                 "caller": action.caller,
@@ -98,7 +102,7 @@ pub(crate) fn yaml_runtime() -> std::sync::Arc<dyn yaml_extension::YamlWasmRunti
     }
 }
 
-/// Execute a lowered YAML V2 program in the installed `gamer-yaml` Component
+/// Execute a lowered YAML program in the installed `gamer-yaml` Component
 /// guest. Extension → Core direction only: the guest bytes and host API come
 /// from the generic [`crate::extensions::ExtensionService`] lookup; the YAML
 /// runtime itself lives behind this boundary.
@@ -111,6 +115,28 @@ pub(crate) async fn run_yaml_program(
     context: crate::core::AppContext,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     sink: Option<std::sync::Arc<dyn crate::core::events::EventSink>>,
+    execution_policy: Option<crate::core::ExecutionPolicy>,
+) -> Result<serde_json::Value, crate::extensions::ExtensionError> {
+    run_yaml_program_with_templates(
+        service,
+        program,
+        context,
+        stop,
+        sink,
+        None,
+        execution_policy,
+    )
+    .await
+}
+
+pub(crate) async fn run_yaml_program_with_templates(
+    service: &std::sync::Arc<crate::extensions::ExtensionService>,
+    program: serde_json::Value,
+    context: crate::core::AppContext,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sink: Option<std::sync::Arc<dyn crate::core::events::EventSink>>,
+    private_templates: Option<std::collections::BTreeMap<String, Vec<u8>>>,
+    execution_policy: Option<crate::core::ExecutionPolicy>,
 ) -> Result<serde_json::Value, crate::extensions::ExtensionError> {
     use crate::extensions::ExtensionId;
     let id = ExtensionId::parse(YAML_EXTENSION_ID).expect("built-in YAML extension id is valid");
@@ -126,10 +152,20 @@ pub(crate) async fn run_yaml_program(
         .await
         .ok()
         .map(|caller| ocr_bridge::recognizer(std::sync::Arc::downgrade(service), caller));
+    let live_switcher = service.plugin_call_context(&id).await.ok().map(|caller| {
+        live_bridge::switcher(
+            std::sync::Arc::downgrade(service),
+            caller,
+            program["trace"]["run_id"].as_str().map(str::to_string),
+            &context,
+        )
+    });
     service
         .with_guest_for_run(&id, move |wasm, host| async move {
             yaml_runtime()
                 .run(yaml_extension::YamlWasmRunRequest {
+                    execution_policy,
+                    private_templates,
                     wasm,
                     program,
                     host,
@@ -138,6 +174,7 @@ pub(crate) async fn run_yaml_program(
                     sink,
                     notification,
                     ocr,
+                    live_switcher,
                 })
                 .await
                 .map(|result| result.value)
@@ -151,3 +188,6 @@ pub(crate) mod wasm_host;
 
 #[cfg(test)]
 mod resource_completion_tests;
+
+#[cfg(test)]
+pub(crate) mod external_schemas;

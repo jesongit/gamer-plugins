@@ -543,7 +543,7 @@ function cancelEdit() {
 </script>
 
 <style scoped>
-.keymap-panel { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 10px; overflow: hidden; }
+.keymap-panel { display: flex; flex: 1; min-height: 0; min-width:0; flex-direction: column; gap: 10px; padding:var(--workspace-inset,8px); box-sizing:border-box; overflow: hidden; }
 .keymap-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-shrink: 0; }
 .keymap-title { font-size: 16px; font-weight: 700; }
 .keymap-sub { margin-top: 3px; color: var(--text-2); }

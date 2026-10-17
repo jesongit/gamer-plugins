@@ -1,5 +1,5 @@
 /**
- * 字段、类型与字面量约束（YAML V1，与 server gamer_yaml/syntax.rs 对齐）。
+ * 字段、类型与字面量约束（当前 YAML，与 server gamer_yaml/syntax.rs 对齐）。
  *
  * 集中提供：
  * - 标识符 / 引用路径 / 时间串 / 坐标的基础判定（codec 与校验层共用）；

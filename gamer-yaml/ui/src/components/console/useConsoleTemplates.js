@@ -12,6 +12,7 @@ import {
   toDeviceCoord as mapToDeviceCoord,
 } from '../../../../../../web/src/console/geometry'
 import { composeTemplateName, putTemplateBytes, resolveTemplateVersion } from '../../console/template-resource'
+import { yamlResourcesChanged } from './resource-changes'
 
 /**
  * 模板面板（console.templates 扩展面板实现）：模板列表/模糊搜索、框选与二次裁切、
@@ -46,6 +47,7 @@ export function useConsoleTemplates({
   const testThreshold = ref(0.8)
   // 模板匹配区域：'' = 默认（按模板名自动识别），否则 a/u/d/l/r/ul/ur/dl/dr（测试匹配与生成记录共用）
   const testRegion = ref('')
+  const matchTest = ref(null)
   const selecting = ref(false)
   const selStart = reactive({ x: 0, y: 0 })
   const selEnd = reactive({ x: 0, y: 0 })
@@ -522,6 +524,7 @@ export function useConsoleTemplates({
   }
   // Package 在页面挂载后异步恢复，初始为空时不能把一次空请求当作已加载。
   watch(packageId, () => { void refreshTemplatesData() }, { immediate: true })
+  watch(() => yamlResourcesChanged.seq, () => { if (yamlResourcesChanged.packageId === packageId.value) void refreshTemplatesData() })
   watch(packageId, () => {
     if (!saving.value) {
       picking.value = false
@@ -687,6 +690,7 @@ export function useConsoleTemplates({
       return toast('请先连接设备', 'error')
     }
     picking.value = !picking.value
+    if (picking.value) toast('在左侧画面按住鼠标左键拖动框选，松开后进入裁切；Esc 取消', 'info')
     if (!picking.value) {
       hideLoupe()
       if (bridgeRegionResolve) { bridgeRegionResolve(null); bridgeRegionResolve = null }
@@ -1132,17 +1136,26 @@ export function useConsoleTemplates({
   }
 
   let matchRequestSeq = 0
-  watch([packageId, () => store.deviceId], () => { matchRequestSeq++; showHit.value = false })
-  watch(() => stage?.generation?.(), () => { matchRequestSeq++; showHit.value = false })
-  watch(() => stage?.frameAt?.(), () => { showHit.value = false })
+  watch([packageId, () => store.deviceId], () => { matchRequestSeq++; showHit.value = false; matchTest.value = null })
+  watch(() => stage?.generation?.(), () => { matchRequestSeq++; showHit.value = false; matchTest.value = null })
+  watch(() => stage?.frameAt?.(), () => { showHit.value = false; matchTest.value = null })
   async function testMatch(name, { stepSemantics = false, matchOptions = {} } = {}) {
     const requestSeq = ++matchRequestSeq
     const toast = beginReport()
-    if (stepSemantics && matchOptions.error) return toast(matchOptions.error, 'error')
+    const fail = message => {
+      if (requestSeq !== matchRequestSeq) return
+      matchTest.value = { name, state: 'error', message }
+      toast(message, 'error')
+    }
+    if (stepSemantics && matchOptions.error) return fail(matchOptions.error)
     const mediaMode = stage?.kind?.() === 'media'
     if (mediaMode ? !stage.ready() : !connected.value) {
-      return toast(mediaMode ? '请先选择并加载视频素材' : '请先连接设备', 'error')
+      return fail(mediaMode ? '请先选择并加载视频素材' : '请先连接设备')
     }
+    const rawThreshold = stepSemantics ? (matchOptions.threshold ?? editorMatchThreshold()) : testThreshold.value
+    const threshold = Number(rawThreshold)
+    if (rawThreshold === '' || rawThreshold == null || !Number.isFinite(threshold) || threshold < 0 || threshold > 1) return fail('相似度阈值必须是 0 到 1 之间的数字')
+    matchTest.value = { name, state: 'checking', threshold, source: mediaMode ? '视频画面' : '设备画面' }
     const sourceGeneration = stage?.generation?.()
     let frame = null
     const isCurrent = () => {
@@ -1156,7 +1169,7 @@ export function useConsoleTemplates({
       if (mediaMode) {
         const captured = await stage.capturePreviewFrame()
         if (requestSeq !== matchRequestSeq || sourceGeneration !== stage.generation()) return
-        if (!captured) return toast('当前视频画面尚未就绪，请等待跳转完成后重试', 'error')
+        if (!captured) return fail('当前视频画面尚未就绪，请等待跳转完成后重试')
         frame = captured
         if (!isCurrent()) return
       }
@@ -1168,11 +1181,11 @@ export function useConsoleTemplates({
       const region = stepSemantics
         ? matchOptions.region?.map((v, i) => Math.round(v * (i % 2 ? height : width)))
         : templateRegionPixels(name)
-      const threshold = stepSemantics ? (matchOptions.threshold ?? editorMatchThreshold()) : (Number(testThreshold.value) || 0.8)
       const r = mediaMode
         ? await api.testTemplate(name, null, threshold, region, packageId.value, frame)
         : await api.testTemplate(name, store.deviceId, threshold, region, packageId.value)
       if (!isCurrent()) return
+      matchTest.value = { name, state: r.hit ? 'hit' : 'miss', threshold, source: mediaMode ? '视频画面' : '设备画面', score: Number.isFinite(r.score) ? r.score : null }
       if (r.hit) {
         hit.x = r.x; hit.y = r.y; hit.w = r.width; hit.h = r.height
         hitLabel.value = `${name} ${r.score.toFixed(2)}`
@@ -1180,7 +1193,7 @@ export function useConsoleTemplates({
         showHit.value = true
         // 匹配框只展示 3 秒，避免一直留在画面上
         hitTimer = setTimeout(() => { showHit.value = false }, 3000)
-        toast(`匹配成功：${name} 置信度 ${r.score.toFixed(2)}`, 'success')
+        toast(`匹配成功：${name} 相似度 ${r.score.toFixed(2)}`, 'success')
       } else {
         // 未命中也画框：显示本次搜索区域（与引擎 miss 可视化同语义，便于发现区域配错）
         const el = surface()
@@ -1195,7 +1208,7 @@ export function useConsoleTemplates({
         toast(`未找到：${name}`, 'warn')
       }
     } catch (e) {
-      if (isCurrent()) toast('匹配失败：' + e.message, 'error')
+      if (isCurrent()) fail('匹配失败：' + e.message)
     }
   }
 
@@ -1214,6 +1227,7 @@ export function useConsoleTemplates({
   // 卸载清理：测试匹配命中框定时器、进行中的 bridge 框选/单元格回填请求按取消收尾
   onUnmounted(() => {
     templateRequestSeq += 1
+    matchRequestSeq++
     if (hitTimer) { clearTimeout(hitTimer); hitTimer = null }
     if (bridgeRegionResolve) { bridgeRegionResolve(null); bridgeRegionResolve = null }
     if (cellCaptureResolve) { cellCaptureResolve(null); cellCaptureResolve = null }
@@ -1224,7 +1238,7 @@ export function useConsoleTemplates({
   const stageReady = computed(() => (stage ? stage.ready() : !!connected.value))
 
   const templateCaptureContext = {
-    packageId, crop, testThreshold, testRegion, tplSearch,
+    packageId, crop, testThreshold, testRegion, tplSearch, matchTest,
     picking, connected, stageReady, togglePick, templates, confirmDelTpl, renaming, onTplRowClick, onTplThumbClick,
     tplThumbUrl, onTplNameClick, setRenameInputEl, renameVal, confirmRename, cancelRename, startRename,
     onTplDeleteClick, onTplMatchClick, onTplUpload, tplShortName, tplRegionBadge, cropSize, cropZoomPct,
@@ -1235,7 +1249,7 @@ export function useConsoleTemplates({
   return {
     // 状态
     picking, selecting, selStart, selEnd, showHit, hitLabel, hitMiss, hitStyle, selStyle,
-    testThreshold, testRegion, tplSearch, templates, templateNames, stageReady,
+    testThreshold, testRegion, tplSearch, matchTest, templates, templateNames, stageReady,
     viewTpl, confirmDelTpl, renaming, renameVal, crop, cropSize, cropZoomPct, saving,
     loupe, loupeCanvas, cellPick,
     // 视图挂载

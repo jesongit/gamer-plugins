@@ -205,7 +205,7 @@ fn walk(
                         check(
                             arg,
                             *ty,
-                            name == "tap" && param == "position",
+                            matches!(name.as_str(), "tap" | "hover") && param == "position",
                             &field,
                             env,
                             out,
@@ -326,6 +326,9 @@ fn walk(
 }
 
 pub(super) fn script(script: &Script, library: &FunctionLibrary) -> Vec<Diagnostic> {
+    let mut combined = library.clone();
+    combined.extend(script.functions.clone());
+    let library = &combined;
     let mut out = Vec::new();
     walk(
         &script.run,
@@ -335,6 +338,7 @@ pub(super) fn script(script: &Script, library: &FunctionLibrary) -> Vec<Diagnost
         &mut out,
     );
     script.remap_diagnostics(&mut out);
+    out.extend(functions(&script.functions, library));
     out
 }
 
@@ -359,11 +363,28 @@ pub(super) fn functions(functions: &FunctionLibrary, library: &FunctionLibrary) 
 mod tests {
     use super::*;
     #[test]
+    fn hover_accepts_observed_match_without_relaxing_other_point_arguments() {
+        let good = super::super::syntax::parse_script(
+            "targets:\n  more: {template: more.png}\nrun:\n  - wait: more\n  - hover: $more\n",
+        )
+        .unwrap();
+        assert!(script(&good, &vec![]).is_empty());
+
+        let bad = super::super::syntax::parse_script(
+            "targets:\n  more: {template: more.png}\nrun:\n  - wait: more\n  - swipe: {from: $more, to: [0.5, 0.5]}\n",
+        ).unwrap();
+        let diagnostics = script(&bad, &vec![]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "yaml.args.ref_type");
+        assert_eq!(diagnostics[0].path, "run[1].from");
+    }
+
+    #[test]
     fn reference_types_shared_editor_fixtures() {
         let fixtures: Value =
             serde_json::from_str(include_str!("../tests/reference-types.json")).unwrap();
         for fixture in fixtures.as_array().unwrap() {
-            let source = format!("version: 2\n{}", fixture["source"].as_str().unwrap());
+            let source = format!("{}", fixture["source"].as_str().unwrap());
             let source = source.as_str();
             let diagnostics = if fixture["kind"] == "function_library" {
                 let library = super::super::syntax::parse_function_library(source).unwrap();

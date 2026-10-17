@@ -110,7 +110,22 @@ fn yaml_acceptance_export_native_catalog() {
     // Visual completion, intentional failure, and local OCR providers have
     // separate success/failure fixtures. The generic primitive flow must not
     // depend on an externally installed engine or language model.
-    called.extend(["observe", "finish", "trace", "fail", "ocr", "find_text"].map(str::to_string));
+    called.extend(
+        [
+            "observe",
+            "finish",
+            "checkpoint",
+            "trace",
+            "fail",
+            "ocr",
+            "find_text",
+            "switch_live_device",
+            "wait_live_confirmation",
+            // Browser-only execution is covered by tools/live-workflow/local-e2e.mjs.
+            "hover",
+        ]
+        .map(str::to_string),
+    );
     assert_eq!(
         called,
         crate::extensions::gamer_yaml::native_funcs::native_names(),
@@ -193,7 +208,7 @@ async fn yaml_acceptance_all_native_functions_run_real_wasm() {
         json!({
             "center": {"x": 0.11, "y": 0.07}, "appeared": {"x": 0.11, "y": 0.07},
             "clicked": {"x": 0.11, "y": 0.07}, "gone": true,
-            "comparisons": [true, true, true, true, true, true]
+            "comparisons": [true, true, true, true, true, true], "stamina": 60, "batches": 6
         })
     );
     assert_eq!(
@@ -205,7 +220,8 @@ async fn yaml_acceptance_all_native_functions_run_real_wasm() {
         *trace.apps.lock().unwrap(),
         [
             ("launch".into(), "+com.example.game".into()),
-            ("stop_app".into(), "com.example.game".into())
+            ("stop_app".into(), "com.example.game".into()),
+            ("reset_input".into(), "com.example.game".into())
         ]
     );
     let swipe = trace.swipes.lock().unwrap()[0];
@@ -219,6 +235,17 @@ async fn yaml_acceptance_all_native_functions_run_real_wasm() {
         [100, 900, 900, 100]
     );
     assert_eq!(swipe.duration().as_millis(), 1);
+    let press = trace.swipes.lock().unwrap()[1];
+    assert_eq!(
+        [
+            press.start().x(),
+            press.start().y(),
+            press.end().x(),
+            press.end().y()
+        ],
+        [110, 70, 110, 70]
+    );
+    assert_eq!(press.duration().as_millis(), 800);
     assert_eq!(trace.keys.lock().unwrap()[0].code().value(), 3);
     assert_eq!(
         vision

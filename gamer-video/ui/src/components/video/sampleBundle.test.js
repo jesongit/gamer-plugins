@@ -6,7 +6,7 @@ beforeAll(() => { Object.defineProperty(globalThis, 'crypto', { value: webcrypto
 const hash = async b => [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))].map(n => n.toString(16).padStart(2, '0')).join('')
 async function fixture() {
   const bytes = new Uint8Array([1, 2, 3])
-  const manifest = { schema_version: 1, id: 'sample-1', content_sha256: '', frames: [{ path: 'frames/a.png' }], files: [{ path: 'frames/a.png', size: bytes.length, sha256: await hash(bytes) }] }
+  const manifest = { schema_version: 2, id: 'sample-1', content_sha256: '', frames: [{ path: 'frames/a.png' }], files: [{ path: 'frames/a.png', size: bytes.length, sha256: await hash(bytes) }] }
   manifest.content_sha256 = await hash(strToU8(canonicalSampleJson(manifest)))
   return zipSync({ 'manifest.json': strToU8(JSON.stringify(manifest)), 'frames/a.png': bytes })
 }
@@ -33,7 +33,7 @@ describe('portable sample import', () => {
   })
   it('rejects real deflate output larger than its forged advertised size', async () => {
     const body = new Uint8Array(1024 * 1024)
-    const manifest = { schema_version: 1, id: 'sample-1', content_sha256: '', frames: [{ path: 'frames/a.png' }], files: [{ path: 'frames/a.png', size: 1, sha256: await hash(new Uint8Array([0])) }] }
+    const manifest = { schema_version: 2, id: 'sample-1', content_sha256: '', frames: [{ path: 'frames/a.png' }], files: [{ path: 'frames/a.png', size: 1, sha256: await hash(new Uint8Array([0])) }] }
     manifest.content_sha256 = await hash(strToU8(canonicalSampleJson(manifest)))
     const bytes = zipSync({ 'manifest.json': strToU8(JSON.stringify(manifest)), 'frames/a.png': body })
     const view = new DataView(bytes.buffer)

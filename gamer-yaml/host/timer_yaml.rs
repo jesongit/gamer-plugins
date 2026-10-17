@@ -115,6 +115,9 @@ impl TimerRunner for YamlTimerRunner {
     fn runner_id(&self) -> &str {
         "gamer-yaml"
     }
+    fn supports_external_execution(&self, runner_id: &str) -> bool {
+        runner_id == "gamer-yaml"
+    }
 
     async fn submit(
         &self,
@@ -196,7 +199,7 @@ impl TimerRunner for YamlTimerRunner {
             params = %resolved.keys().cloned().collect::<Vec<_>>().join(","),
             "YAML timer task parameters confirmed"
         );
-        let req = crate::extensions::gamer_yaml::yaml_start_request(
+        let mut req = crate::extensions::gamer_yaml::yaml_start_request(
             request.app.clone(),
             crate::extensions::gamer_yaml::run_target::RunTarget::Script {
                 script_id: payload.script_id.clone(),
@@ -213,6 +216,7 @@ impl TimerRunner for YamlTimerRunner {
             false,
         )
         .map_err(|error| TimerRunnerError::Invalid(error.to_string()))?;
+        req.request.execution_policy = request.execution_policy.clone();
         let hook = yaml_finish_hook(
             self.db.clone(),
             request.app.device_id.to_string(),
@@ -397,7 +401,7 @@ impl YamlTimerRunner {
                 ));
             }
         };
-        let start_request = crate::extensions::gamer_yaml::yaml_start_request(
+        let mut start_request = crate::extensions::gamer_yaml::yaml_start_request(
             app,
             target,
             RunSource::Manual,
@@ -407,6 +411,7 @@ impl YamlTimerRunner {
             true,
         )
         .map_err(|error| invalid_detail(error.to_string(), serde_json::json!([])))?;
+        start_request.request.execution_policy = request.execution_policy.clone();
         let db = self.db.clone();
         let hook: FinishHook = Arc::new(move |record, outcome| {
             write_manual_terminal_log(&db, record, outcome);
@@ -473,10 +478,6 @@ fn yaml_finish_hook(
 ) -> FinishHook {
     Arc::new(move |record, outcome| {
         let logs = outcome.logs().to_vec();
-        let log_error = logs
-            .iter()
-            .find(|(level, _)| level == "error")
-            .map(|(_, message)| message.clone());
         let db = db.clone();
         let device_id = device_id.clone();
         let script_id = script_id.clone();
@@ -488,10 +489,7 @@ fn yaml_finish_hook(
             }
         });
         let timer_outcome = match outcome {
-            RunOutcome::Success(_) if log_error.is_none() => TimerOutcome::Success,
-            RunOutcome::Success(_) => {
-                TimerOutcome::Failed(log_error.unwrap_or_else(|| "执行日志包含错误".to_string()))
-            }
+            RunOutcome::Success(_) => TimerOutcome::Success,
             RunOutcome::Failed(message, _) => TimerOutcome::Failed(message.clone()),
             RunOutcome::Cancelled(_) => TimerOutcome::Cancelled,
         };
@@ -502,6 +500,58 @@ fn yaml_finish_hook(
             outcome: timer_outcome,
         });
     })
+}
+
+#[cfg(test)]
+mod finish_hook_tests {
+    use super::*;
+    use crate::run_manager::{RunRecord, RunState};
+
+    #[tokio::test]
+    async fn error_level_log_does_not_change_a_successful_run_into_a_failed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            crate::store::Store::open(&crate::config::Config {
+                data_dir: dir.path().into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let completion = Arc::new(parking_lot::Mutex::new(None));
+        let result = completion.clone();
+        let hook = yaml_finish_hook(
+            db,
+            "target".into(),
+            "default/test.yaml".into(),
+            "task".into(),
+            Some(123),
+            Arc::new(move |value| *result.lock() = Some(value)),
+        );
+        let record = RunRecord {
+            run_id: "run".into(),
+            device_id: "target".into(),
+            runner_id: "gamer-yaml".into(),
+            entrypoint: "default/test.yaml".into(),
+            content_package: Some("default".into()),
+            script_id: "default/test.yaml".into(),
+            source: RunSource::Scheduled,
+            task_id: Some("task".into()),
+            scheduled_at: Some(123),
+            state: RunState::Success,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            error: None,
+        };
+        hook(
+            &record,
+            &RunOutcome::Success(vec![("error".into(), "诊断日志，步骤正常结束".into())]),
+        );
+        let actual = completion.lock().take().unwrap();
+        assert!(matches!(actual.outcome, TimerOutcome::Success));
+        assert_eq!(actual.run_id, "run");
+        assert_eq!(actual.task_id, "task");
+        assert_eq!(actual.scheduled_at, Some(123));
+    }
 }
 
 /// P11.2 / ADR-13：ExtensionService 生命周期回调的 YAML 侧绑定。扩展边界在

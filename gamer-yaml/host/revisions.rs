@@ -361,6 +361,12 @@ fn apply(
 pub(crate) fn history(store: &PackageStore, package: &str) -> Result<Value> {
     store.with_package_read(package, || {
         recover(store, package)?;
+        history_read_only(store, package)
+    })
+}
+/// External read tools never recover or remove transaction files as a side effect.
+pub(crate) fn history_read_only(store: &PackageStore, package: &str) -> Result<Value> {
+    store.with_package_read(package, || {
         let root = private_root(store, package)?;
         let mut revisions = vec![];
         if root.exists() {

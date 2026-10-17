@@ -7,6 +7,8 @@
  */
 import { api } from '../../../../../../web/src/api'
 import { scriptsData, templatesData } from '../../../../../../web/src/store'
+import { watch } from 'vue'
+import { yamlResourcesChanged } from '../console/resource-changes'
 import type { RunnerEditorContext, RunnerEntrypointOption } from '../../../../../../web/src/components/task/runner-editors'
 
 /** 去掉模板文件名上的区域/保色后缀，保持与步骤画布的短名输入口径一致（自 TaskBoard 迁入）。 */
@@ -19,6 +21,7 @@ export function templateShortName(name: string): string {
 const scriptsInflight = new Map<string, Promise<void>>()
 const templatesInflight = new Map<string, Promise<void>>()
 let activeResourcePackage = ''
+let resourceRevision = 0
 
 function resourcePackageOf(item: { package?: unknown; pkg?: unknown; id?: unknown }): string {
   const explicit = String(item?.package ?? item?.pkg ?? '').trim()
@@ -26,34 +29,36 @@ function resourcePackageOf(item: { package?: unknown; pkg?: unknown; id?: unknow
   return String(item?.id || '').split('/')[0] || ''
 }
 
-async function ensureScripts(packageId: string): Promise<void> {
-  if (scriptsData.value.length && scriptsData.value.every((item) => resourcePackageOf(item) === packageId)) return
+async function ensureScripts(packageId: string, force = false): Promise<void> {
+  if (!force && scriptsData.value.length && scriptsData.value.every((item) => resourcePackageOf(item) === packageId)) return
+  const revision = resourceRevision
   let request = scriptsInflight.get(packageId)
   if (!request) {
     request = api
       .listScripts(packageId)
       .then((list) => {
         // 旧 Package 的迟到结果不能污染当前候选 store。
-        if (activeResourcePackage === packageId) scriptsData.value = Array.isArray(list) ? list : []
+        if (activeResourcePackage === packageId && revision === resourceRevision) scriptsData.value = Array.isArray(list) ? list : []
       })
       .catch(() => { /* 拉取失败：ScriptPicker 显示「（无脚本）」 */ })
-      .finally(() => { scriptsInflight.delete(packageId) })
+      .finally(() => { if (scriptsInflight.get(packageId) === request) scriptsInflight.delete(packageId) })
     scriptsInflight.set(packageId, request)
   }
   await request
 }
 
-async function ensureTemplates(packageId: string): Promise<void> {
-  if (templatesData.value.length && templatesData.value.every((item) => resourcePackageOf(item) === packageId)) return
+async function ensureTemplates(packageId: string, force = false): Promise<void> {
+  if (!force && templatesData.value.length && templatesData.value.every((item) => resourcePackageOf(item) === packageId)) return
+  const revision = resourceRevision
   let request = templatesInflight.get(packageId)
   if (!request) {
     request = api
       .listTemplates(packageId)
       .then((list) => {
-        if (activeResourcePackage === packageId) templatesData.value = Array.isArray(list) ? list : []
+        if (activeResourcePackage === packageId && revision === resourceRevision) templatesData.value = Array.isArray(list) ? list : []
       })
       .catch(() => { /* 拉取失败：tmpl 参数无候选（可手输短名），不阻断保存 */ })
-      .finally(() => { templatesInflight.delete(packageId) })
+      .finally(() => { if (templatesInflight.get(packageId) === request) templatesInflight.delete(packageId) })
     templatesInflight.set(packageId, request)
   }
   await request
@@ -61,16 +66,23 @@ async function ensureTemplates(packageId: string): Promise<void> {
 
 /** 幂等保障脚本 + 模板候选进 store（payload 编辑器挂载与 entrypoints 枚举共用；
  * 数据上下文 = 调用方传入的当前 Package id，plan §39）。 */
-export function ensureGamerYamlResources(packageId: string | null | undefined): Promise<void> {
+export function ensureGamerYamlResources(packageId: string | null | undefined, force = false): Promise<void> {
   const pkg = String(packageId || '')
+  if (pkg !== activeResourcePackage || force) {
+    resourceRevision++
+    scriptsInflight.clear(); templatesInflight.clear()
+  }
   activeResourcePackage = pkg
   if (!pkg) {
     scriptsData.value = []
     templatesData.value = []
     return Promise.resolve()
   }
-  return Promise.all([ensureScripts(pkg), ensureTemplates(pkg)]).then(() => undefined)
+  return Promise.all([ensureScripts(pkg, force), ensureTemplates(pkg, force)]).then(() => undefined)
 }
+watch(() => yamlResourcesChanged.seq, () => {
+  if (activeResourcePackage && yamlResourcesChanged.packageId === activeResourcePackage) void ensureGamerYamlResources(activeResourcePackage, true)
+})
 
 /** 当前脚本分区（store 列表命中优先，回退 entrypoint 分区前缀约定）。 */
 export function scriptPackageOf(entrypoint: string): string {

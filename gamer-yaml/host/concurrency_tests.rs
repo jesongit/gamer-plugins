@@ -51,8 +51,11 @@ mod concurrency_tests {
                 program["trace"] = json!({"run_id": context.run_id.as_str()});
                 self.runtime
                     .run(YamlWasmRunRequest {
+                        execution_policy: request.execution_policy.clone(),
+                        private_templates: None,
                         notification: None,
                         ocr: None,
+                        live_switcher: None,
                         wasm: self.wasm.clone(),
                         program,
                         host: host_with_permissions(

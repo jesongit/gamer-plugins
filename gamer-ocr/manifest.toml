@@ -1,14 +1,17 @@
 manifest_version = 2
 id = "gamer-ocr"
-version = "0.1.0"
+version = "0.1.1"
 name = "文字识别"
 description = "按需本地 OCR，为自动化提供文字、置信度和位置"
-permissions = ["ui.host", "vision.ocr"]
+permissions = ["ui.host", "vision.ocr", "device.read", "resource.read", "media.read"]
 
 [host_api]
 ui = "^1.1"
 vision = "^1.0"
 runtime = "^1.0"
+device = "^1.0"
+resource = "^1.0"
+media = "^1.0"
 
 [targets.android]
 packages = ["*"]
@@ -55,3 +58,23 @@ action = "settings.read"
 type = "button"
 label = "检测可用性"
 action = "status"
+
+# External tools are explicit; UI/internal actions are never exported automatically.
+[[tools]]
+tool_id = "status"
+action = "external.status"
+description = "查询 OCR 可用性与语言，不返回本机路径或进程信息。"
+input_schema = "schemas/mcp/status.json"
+required_scopes = ["plugin.gamer-ocr.status.read"]
+required_permissions = ["vision.ocr"]
+effect = "read"
+
+[[tools]]
+tool_id = "recognize"
+action = "external.recognize"
+description = "识别已授权设备新截图、运行 Trace 图、配置包 PNG 或独立素材帧；不接收路径或任意图片字节。"
+input_schema = "schemas/mcp/recognize.json"
+required_scopes = ["plugin.gamer-ocr.recognize"]
+required_permissions = ["vision.ocr","device.read","resource.read","media.read"]
+effect = "read"
+

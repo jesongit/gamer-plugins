@@ -3,7 +3,7 @@
     <div class="zone-head">
       <span class="zone-title">素材库</span>
     </div>
-    <p class="zone-note">选视频可在左侧预览；创建项目可逐帧制作模板、保存标记。录制中的点击、滑动等操作可转成脚本。</p>
+    <p class="zone-note">选择视频在左侧预览；从录制历史制作素材包，可交给自己的 Agent 编写脚本。</p>
 
     <!-- 设备选择与录制/刷新/导入集中在标题下方同一行，窄面板允许换行。 -->
     <div class="record-context">
@@ -26,7 +26,7 @@
         ><UiIcon name="record" /> 开始录制</button>
         <template v-else>
           <button class="btn btn-sm btn-primary" type="button" :disabled="busy || session.state === 'finalizing'" data-testid="record-stop" @click="stop"><UiIcon name="stop" /> {{ session.state === 'finalizing' ? '正在保存…' : '停止并保存' }}</button>
-          <button class="btn btn-sm btn-danger" type="button" :disabled="busy || session.state === 'finalizing'" data-testid="record-cancel" @click="cancel">取消</button>
+          <button class="btn btn-sm btn-danger" type="button" :disabled="busy || session.state === 'finalizing'" data-testid="record-cancel" @click="cancel">取消录制</button>
         </template>
 
         <button class="btn btn-sm" type="button" :disabled="loading" data-testid="media-refresh" @click="$emit('refresh')"><UiIcon name="refresh" /> 刷新</button>
@@ -48,6 +48,8 @@
         </span>
     </div>
 
+    <p v-if="!session && !deviceId" class="zone-note" role="status">选择录制设备后可开始演示操作；也可以直接导入视频进行预览。</p>
+    <p v-else-if="!session && !canRecord" class="zone-note" role="status">当前目标不支持录制，可导入已有视频进行预览。</p>
     <p v-if="session?.state === 'finalizing'" class="zone-note" role="status" data-testid="record-saving">录制已停止，正在保存视频；完成后会自动加入素材库，可以继续使用其他功能。</p>
     <div v-if="importing" class="zone-note" role="status" data-testid="media-import-progress">
       正在上传并探测「{{ importingName }}」…（当前导入接口不提供取消操作）
@@ -94,7 +96,6 @@
     <div v-if="selectedMedia" class="zone-actions" data-testid="media-next-actions">
       <span class="media-name">已选：{{ selectedMedia.name }}</span>
       <button class="btn btn-sm" type="button" @click="$emit('select', selectedId)">预览视频</button>
-      <button class="btn btn-sm" type="button" data-testid="media-create-project" @click="$emit('create-project', selectedId)">创建制作项目</button>
     </div>
 
     <section class="history-box" data-testid="recording-history">
@@ -203,7 +204,7 @@ const props = defineProps({
   // 父层当前会吞掉 listMedia 错误；保留显式错误入口，避免把失败误报为空。
   loadError: { type: String, default: '' },
 })
-const emit = defineEmits(['select', 'refresh', 'changed', 'recording-finished', 'recording-selected', 'create-project', 'imported'])
+const emit = defineEmits(['select', 'refresh', 'changed', 'recording-finished', 'recording-selected', 'imported'])
 const selectedMedia = computed(() => props.mediaList.find(media => media.id === props.selectedId))
 
 const devices = devicesData
@@ -622,7 +623,7 @@ function stateTagClass(state) {
 </script>
 
 <style scoped>
-.media-library { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.media-library { display: flex; flex:1; flex-direction: column; gap: 8px; min-height: 0; min-width:0; padding:2px; overflow:auto; }
 .zone-head { display: flex; flex-wrap:wrap; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
 .zone-title { color: var(--text-0); font-size: 13px; font-weight: 700; }
 .zone-actions { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-left:auto; }

@@ -26,7 +26,7 @@ watch(() => props.images, images => { if (!images.some(image => image.image_id =
     <template v-if="selected">
       <div v-if="!broken.has(selected.image_id)" class="image-stage"><img :src="safeTraceImageUrl(runId,selected)" alt="所选运行截图原图" @error="unavailable(selected.image_id)" /><span v-if="region" class="overlay region" :style="region" aria-label="搜索区域" /><span v-if="match" class="overlay match" :style="match" aria-label="模板命中框" /></div>
       <p v-else class="warning">当前图像无法读取，可能已过期。保留原始事件说明，不以其他图像代替。</p>
-      <div class="frame-export"><a v-if="canSaveFrame" class="btn btn-sm" aria-label="保存原始画面" :href="safeTraceImageUrl(runId,selected)" :download="traceImageFilename(runId,selected)">保存画面</a><button v-else class="btn btn-sm" aria-label="保存原始画面" disabled>保存画面</button><span class="hint">保存原始 PNG 参考图，可供离线模板或回归检查；单张画面不包含操作与完成证据，不是完整回放素材</span></div>
+      <div class="frame-export"><a v-if="canSaveFrame" class="btn btn-sm" aria-label="保存原始画面" :href="safeTraceImageUrl(runId,selected)" :download="traceImageFilename(runId,selected)">保存画面</a><button v-else class="btn btn-sm" aria-label="保存原始画面" disabled>保存画面</button><span class="hint">保存原始 PNG 参考图，可供离线模板或回归检查；单张画面可用作模板参考；配合教学步骤和操作记录生成脚本</span></div>
       <p class="hint">{{ labels[selected.kind] || selected.kind }} · {{ selected.width }} × {{ selected.height }} · 采集 {{ selected.captured_at }}</p>
       <p class="hint">图像 ID {{ selected.image_id }}<span v-if="metadata.frame_id !== undefined"> · 调用栈帧 {{ metadata.frame_id }}</span></p>
       <p v-if="metadata.template">模板 {{ metadata.template }} · {{ metadata.found ? '命中' : '未命中' }}<span v-if="metadata.score !== undefined"> · 分数 {{ metadata.score }}</span><span v-if="metadata.threshold !== undefined"> · 阈值 {{ metadata.threshold }}</span></p>

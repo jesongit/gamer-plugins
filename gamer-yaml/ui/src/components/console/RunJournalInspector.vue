@@ -1,6 +1,6 @@
 <template>
   <aside class="journal-inspector" aria-label="所选记录详情">
-    <header class="inspector-header"><strong>{{ node.desc || eventText(node) }}</strong><span :class="runRowState(node)">{{ rowStateText(runRowState(node)) }} · {{ runDuration(node, now) }}</span><button v-if="node.trace?.source" class="btn btn-sm" @click="$emit('locate', node.failure || node)">定位步骤</button><button class="btn btn-ghost btn-sm" aria-label="关闭记录详情" @click="$emit('close')">关闭</button></header>
+    <header class="inspector-header"><strong>{{ node.desc || eventText(node) }}</strong><span :class="runRowState(node)">{{ rowStateText(runRowState(node)) }} · {{ runDuration(node, now) }}</span><button v-if="allowLocate && node.trace?.source" class="btn btn-sm" @click="$emit('locate', node.failure || node)">定位步骤</button><button class="btn btn-ghost btn-sm" aria-label="关闭记录详情" @click="$emit('close')">关闭</button></header>
     <div class="inspector-tabs" role="group" aria-label="记录详情分类">
       <button v-for="item in tabs" :key="item.key" class="inspector-tab" :class="{ active: tab === item.key }" :aria-pressed="tab === item.key" @click="tab = item.key">{{ item.label }}</button>
     </div>
@@ -33,7 +33,7 @@ import { computed, ref, watch } from 'vue'
 import RunTraceImages from './RunTraceImages.vue'
 import { traceImagesForNode } from './useRunTrace'
 import { detailText, eventText, formatRunValue, rowStateText, runDuration, runRowState, stepSummary, timeText } from './run-journal'
-const props = defineProps({ row: { type: Object, required: true }, now: Number, runId: String, images: { type: Array, default: () => [] }, traceStatus: String, traceEnabled: Boolean, traceGaps: { type: Array, default: () => [] } })
+const props = defineProps({ row: { type: Object, required: true }, now: Number, runId: String, images: { type: Array, default: () => [] }, traceStatus: String, traceEnabled: Boolean, traceGaps: { type: Array, default: () => [] }, allowLocate: { type: Boolean, default: true } })
 defineEmits(['close', 'locate'])
 const node = computed(() => props.row.node)
 const nodeImages = computed(() => traceImagesForNode(props.images, node.value))

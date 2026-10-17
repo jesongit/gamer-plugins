@@ -18,6 +18,8 @@ use crate::capabilities::{
     TouchHandle, TouchPoint,
 };
 pub(crate) mod dsl;
+pub(crate) mod external;
+pub(crate) use external::ExternalTools as KeymapExternalTools;
 
 pub(crate) use dsl::{
     parse_keymap_content, serialize_keymap, Keymap, KeymapAction, KeymapBinding, KeymapDiagnostic,

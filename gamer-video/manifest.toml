@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-video"
-version = "0.2.1"
+version = "0.2.6"
 name = "视频工作台"
 description = "视频工作台：媒体素材库、设备录制与可携带演示素材"
 permissions = ["ui.host", "media.read", "media.import", "media.record", "media.write", "media.events.read"]
@@ -12,14 +12,6 @@ ui = "^1.0"
 
 [targets.android]
 packages = ["*"]
-
-# 可选依赖：gamer-yaml 提供「创建模板 / 离线模板测试」能力。缺失时视频工作台基础功能（导入/录制/播放/逐帧/
-# 标记）不受影响，仅 YAML 相关入口降级隐藏（前端按能力发现接口判定）。
-# 依赖声明不授予权限、不触发自动安装/启用。
-[[dependencies]]
-id = "gamer-yaml"
-version = "*"
-required = false
 
 # builtin（宿主预置）执行类型：无 guest 字节、无常驻实例；执行体在宿主
 # extensions/builtin.rs 注册表内（builtin_id 必须已注册才能安装）。
@@ -41,3 +33,91 @@ entry = "ui/plugin.js"
 requires_device = false
 preferred_width = 440
 component = "VideoWorkbench"
+
+# Explicit external Agent tools. Installed older manifests remain unexposed.
+
+[[tools]]
+tool_id = "sample_list"
+action = "external.sample_list"
+description = "List only individually authorized standalone samples. A Package selector never grants sample access."
+input_schema = "schemas/external_sample_list.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read"]
+effect = "read"
+
+[[tools]]
+tool_id = "sample_read"
+action = "external.sample_read"
+description = "Read the verified self-contained manifest; does not require original video files."
+input_schema = "schemas/external_sample_read.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read"]
+effect = "read"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_frames"
+action = "external.sample_frames"
+description = "Read a bounded page of original screenshot index records."
+input_schema = "schemas/external_sample_frames.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read"]
+effect = "read"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_events"
+action = "external.sample_events"
+description = "Read accepted raw teaching events in bounded pages; these events are evidence, never replay instructions."
+input_schema = "schemas/external_sample_events.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read", "media.events.read"]
+effect = "read"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_frame"
+action = "external.sample_frame"
+description = "Return an actual saved PNG view plus original geometry and hashes. Display may be scaled to max_width; template crops always use original PNG pixels."
+input_schema = "schemas/external_sample_frame.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read"]
+effect = "read"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_export"
+action = "external.sample_export"
+description = "Read exact original .gamersample archive bytes as bounded base64 chunks."
+input_schema = "schemas/external_sample_export.json"
+required_scopes = ["plugin.gamer-video.read", "media.read"]
+required_permissions = ["media.read", "media.events.read"]
+effect = "read"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_import"
+action = "external.sample_import"
+description = "Import a self-contained archive up to 6 MiB inline; larger archives use the existing import UI. Exact sample ID and content hash must be authorized."
+input_schema = "schemas/external_sample_import.json"
+required_scopes = ["plugin.gamer-video.import", "media.read"]
+required_permissions = ["media.read", "media.write", "media.events.read"]
+effect = "media_write"
+[tools.context]
+media_field = "sample_id"
+
+[[tools]]
+tool_id = "sample_create"
+action = "external.sample_create"
+description = "Make a self-contained screenshot/event sample from an authorized completed recording. Every source media ID, device and new_sample_id must be authorized."
+input_schema = "schemas/external_sample_create.json"
+required_scopes = ["plugin.gamer-video.create", "media.read", "media.record"]
+required_permissions = ["media.read", "media.write", "media.events.read"]
+effect = "media_write"
+[tools.context]
+media_field = "new_sample_id"

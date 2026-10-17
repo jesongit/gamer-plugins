@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(json["step_path"], "args");
         assert_eq!(json["field"], "args");
         assert_eq!(json["resource"], "a/b.yaml");
-        let top = serde_json::to_value(ScriptError::new("yaml.version.removed", "v", "r")).unwrap();
+        let top = serde_json::to_value(ScriptError::new("yaml.top.unknown", "v", "r")).unwrap();
         assert_eq!(top["step_path"], "");
         assert_eq!(top["field"], "");
     }

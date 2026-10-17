@@ -8,6 +8,7 @@ import type { RunnerAppPackages, RunnerEditorContext } from '../../../../../../w
 import { registerRunnerEditor } from '../../../../../../web/src/components/task/runner-editors'
 import ScriptPicker from '../ScriptPicker.vue'
 import GamerYamlPayloadEditor from '../task/GamerYamlPayloadEditor.vue'
+import RunDetails from '../console/RunDetails.vue'
 import { ensureGamerYamlResources, gamerYamlEntrypointOptions } from '../task/gamer-yaml-resources'
 import { GAMER_YAML_RUNNER_ID } from '../../gamer-yaml-runner'
 
@@ -51,6 +52,7 @@ export function registerGamerYamlRunnerEditor(): () => void {
       autoPick: false,
     }),
     payloadEditor: GamerYamlPayloadEditor,
+    runDetails: RunDetails,
     resolveAppPackages: (entrypoint: string, _payload: Record<string, unknown>, context: RunnerEditorContext) =>
       resolveGamerYamlAppPackages(entrypoint, context),
   })

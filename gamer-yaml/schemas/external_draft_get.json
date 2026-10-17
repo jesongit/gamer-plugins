@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "package_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "script_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "offset": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 5
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40
+    }
+  },
+  "required": [
+    "package_id",
+    "script_id"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "version"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "offset"
+              ]
+            },
+            {
+              "required": [
+                "limit"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

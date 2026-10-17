@@ -106,17 +106,18 @@ async function unzipBounded(bytes, index) {
 
 /** Portable import works without a running video plugin; server validates again. */
 export async function inspectSampleArchive(input) {
-  if (typeof input?.size === 'number' && input.size > SAMPLE_ARCHIVE_LIMIT) throw new Error('素材包超过 128 MiB，请缩短录制或分段制作')
+  if (typeof input?.size === 'number' && input.size > SAMPLE_ARCHIVE_LIMIT) throw new Error('素材包超过 128 MiB，请选择较小的截图素材范围')
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(await input.arrayBuffer())
   const index = inspectZipDirectory(bytes)
   const files = await unzipBounded(bytes, index)
   const manifest = JSON.parse(strFromU8(files['manifest.json']))
-  if (manifest.schema_version !== 1 || !/^[a-z0-9-]{1,80}$/.test(manifest.id || '')) throw new Error('素材格式或 ID 无效')
+  if (manifest.schema_version !== 2 || !/^[a-z0-9-]{1,80}$/.test(manifest.id || '')) throw new Error('素材格式或 ID 无效')
   if (!Array.isArray(manifest.files) || !Array.isArray(manifest.frames) || manifest.frames.length > 240) throw new Error('素材证据目录无效')
   if (Object.keys(files).length !== index.size || manifest.files.length !== index.size - 1) throw new Error('素材文件集合不匹配')
   const seen = new Set()
   for (const file of manifest.files) {
     const body = files[file.path]
+    if (!file.path.startsWith('frames/') || !file.path.endsWith('.png')) throw new Error('素材包只允许截图 PNG，不接收视频片段')
     if (seen.has(file.path) || !body || body.length !== file.size || index.get(file.path) !== body.length || await sha256(body) !== file.sha256) throw new Error(`素材完整性校验失败：${file.path}`)
     seen.add(file.path)
   }

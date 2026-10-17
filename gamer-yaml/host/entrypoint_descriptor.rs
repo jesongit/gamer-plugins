@@ -4,7 +4,7 @@
 //! entrypoint = `<pkg>/<脚本>.yaml`（脚本）或 `<pkg>#<函数名>`（函数，
 //! 简化计划 Phase 1：统一命名空间按名寻址，函数从当前 Package 全部
 //! `_function*.yaml` 组合出的注册表解析——定义文件可拆分/移动）。
-//! 内层载荷 `{kind, format:"yaml-params-v1", schema}`——schema 即 V1
+//! 内层载荷 `{kind, format:"yaml-params", schema}`——schema 即 V1
 //! `params` 声明（名称/类型/必填/默认值/说明），前端据此渲染参数表单，
 //! 不解析 YAML。旧 v3 的 psig1 签名字段已删除。
 
@@ -188,7 +188,7 @@ fn describe_function(
 fn schema_payload(kind: &str, schema: &Value) -> Value {
     serde_json::json!({
         "kind": kind,
-        "format": "yaml-params-v1",
+        "format": "yaml-params",
         "schema": schema,
     })
 }
@@ -241,12 +241,12 @@ mod tests {
             &cfg,
             "automations",
             "daily.yaml",
-            "version: 2\nparams:\n  retry:\n    type: integer\n    default: 3\n    desc: 重试次数\nrun:\n  - log: hi\n",
+            "params:\n  retry:\n    type: integer\n    default: 3\n    desc: 重试次数\nrun:\n  - log: hi\n",
         );
         let store = PackageStore::open(&cfg).unwrap();
         let payload = describe_entrypoint(&store, "com.test.app/daily.yaml").unwrap();
         assert_eq!(payload["kind"], "script");
-        assert_eq!(payload["format"], "yaml-params-v1");
+        assert_eq!(payload["format"], "yaml-params");
         assert_eq!(payload["schema"][0]["name"], "retry");
         assert_eq!(payload["schema"][0]["type"], "integer");
         assert_eq!(payload["schema"][0]["default"], 3);
@@ -264,7 +264,7 @@ mod tests {
         match error {
             DescribeError::Invalid { diagnostics } => {
                 assert!(
-                    diagnostics.to_string().contains("yaml.version.unsupported"),
+                    diagnostics.to_string().contains("yaml.top.unknown"),
                     "{diagnostics}"
                 );
             }
@@ -277,12 +277,12 @@ mod tests {
         use crate::scheduler::EntrypointDescriber;
         use serde_json::{json, Map};
         let (cfg, _dir) = store_dir("bind");
-        write(&cfg, "automations", "_function.yaml", "version: 2\nfunctions:\n  claim:\n    params:\n      count:\n        type: integer\n        default: 3\n    run:\n      - log: hi\n");
+        write(&cfg, "automations", "_function.yaml", "functions:\n  claim:\n    params:\n      count:\n        type: integer\n        default: 3\n    run:\n      - log: hi\n");
         write(
             &cfg,
             "automations",
             "daily.yaml",
-            "version: 2\nparams:\n  who:\n    type: string\n    required: true\nrun:\n  - log: hi\n",
+            "params:\n  who:\n    type: string\n    required: true\nrun:\n  - log: hi\n",
         );
         let describer = StoreEntrypointDescriber::new(Arc::new(PackageStore::open(&cfg).unwrap()));
         assert_eq!(
@@ -324,7 +324,7 @@ mod tests {
             &cfg,
             "automations",
             "_function.yaml",
-            "version: 2\nfunctions:\n  claim:\n    params:\n      timeout:\n        type: duration\n        default: 5s\n    run:\n      - log: hi\n",
+            "functions:\n  claim:\n    params:\n      timeout:\n        type: duration\n        default: 5s\n    run:\n      - log: hi\n",
         );
         let store = PackageStore::open(&cfg).unwrap();
         let payload = describe_entrypoint(&store, "com.test.app#claim").unwrap();
@@ -336,7 +336,7 @@ mod tests {
             &cfg,
             "automations",
             "_function_battle.yaml",
-            "version: 2\nfunctions:\n  attack:\n    run:\n      - return: true\n",
+            "functions:\n  attack:\n    run:\n      - return: true\n",
         );
         let payload = describe_entrypoint(&store, "com.test.app#attack").unwrap();
         assert_eq!(payload["kind"], "function");

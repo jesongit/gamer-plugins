@@ -45,6 +45,7 @@ import { schemaToParamDecls } from '../../script-editor/entrypointParams'
 import { cloneArg } from '../../script-editor/params'
 import { api } from '../../../../../../web/src/api'
 import { GAMER_YAML_RUNNER_ID } from '../../gamer-yaml-runner'
+import { yamlResourcesChanged } from '../console/resource-changes'
 import { templatesData } from '../../../../../../web/src/store'
 import {
   ensureGamerYamlResources, scriptPackageOf, templateShortName,
@@ -126,7 +127,16 @@ watch([() => props.entrypoint, () => props.ctx?.packageId], ([ep, packageId]) =>
   adoptedPackageId.value = nextPackageId
   initialArgs.value = {}
   emit('update:payload', { args: {} })
+  void ensureGamerYamlResources(nextPackageId)
   loadScript(ep)
+})
+watch(() => yamlResourcesChanged.seq, () => {
+  if (yamlResourcesChanged.packageId !== String(props.ctx?.packageId || '').trim()
+    || props.entrypoint !== `${yamlResourcesChanged.packageId}/${yamlResourcesChanged.scriptId}`) return
+  // Preserve edits already emitted to the task form while updating its schema.
+  const currentArgs = props.payload?.args
+  initialArgs.value = currentArgs && typeof currentArgs === 'object' ? cloneArg(currentArgs) : {}
+  void loadScript(props.entrypoint)
 })
 
 function onArgsChange(change: { args: Record<string, unknown> }): void {

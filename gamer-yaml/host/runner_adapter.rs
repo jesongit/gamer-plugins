@@ -74,6 +74,35 @@ pub struct EngineExecutor {
     /// Filled after RunManager construction because the native capability
     /// registry itself contains a RunService backed by that manager.
     yaml_vnext: Arc<std::sync::RwLock<Option<Arc<YamlRunAdapter>>>>,
+    prepared: PreparedPrograms,
+}
+
+type PreparedPrograms =
+    Arc<parking_lot::Mutex<std::collections::BTreeMap<String, PreparedProgram>>>;
+struct PreparedProgram {
+    adapter: Arc<YamlRunAdapter>,
+    program: Value,
+}
+struct PreparedProgramGuard {
+    prepared: PreparedPrograms,
+    run_id: String,
+    armed: bool,
+}
+impl Drop for PreparedProgramGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.prepared.lock().remove(&self.run_id);
+        }
+    }
+}
+struct PreparedProgramLease {
+    inner: Box<dyn ActivityLease>,
+    _program: PreparedProgramGuard,
+}
+impl ActivityLease for PreparedProgramLease {
+    fn release(&mut self) -> BoxFuture<'_, ()> {
+        self.inner.release()
+    }
 }
 
 impl EngineExecutor {
@@ -82,6 +111,7 @@ impl EngineExecutor {
             devices,
             db,
             yaml_vnext: Arc::new(std::sync::RwLock::new(None)),
+            prepared: Arc::default(),
         }
     }
 
@@ -140,17 +170,42 @@ impl EngineExecutor {
             strict_args,
         })
     }
+
+    fn adapter(&self) -> anyhow::Result<Arc<YamlRunAdapter>> {
+        self.yaml_vnext
+            .read()
+            .expect("YAML vNext adapter lock poisoned")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("YAML 运行适配器未装配"))
+    }
 }
 
 impl RunExecutor for EngineExecutor {
     fn prepare<'a>(
         &'a self,
         context: &'a RunContext,
-        _request: &'a RunRequest,
+        request: &'a RunRequest,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
+            let mut cleanup = PreparedProgramGuard {
+                prepared: self.prepared.clone(),
+                run_id: context.run_id.as_str().into(),
+                armed: true,
+            };
+            if let Some(policy) = &request.execution_policy {
+                let adapter = self.adapter()?;
+                let spec = Self::decode(request, context)?;
+                // Freeze and authorize the exact executable program before
+                // target preparation can connect, wake or acquire a device.
+                let program = adapter.prepare_program(&spec, Some(policy)).await?;
+                self.prepared
+                    .lock()
+                    .insert(cleanup.run_id.clone(), PreparedProgram { adapter, program });
+            }
             let device_id = context.device_id().as_str();
             crate::targets::prepare(&self.devices, device_id).await?;
+            // acquire immediately takes responsibility for every later exit.
+            cleanup.armed = false;
             Ok(())
         })
     }
@@ -163,26 +218,41 @@ impl RunExecutor for EngineExecutor {
         stop: Arc<AtomicBool>,
     ) -> BoxFuture<'a, anyhow::Result<Vec<(String, String)>>> {
         Box::pin(async move {
-            let spec = Self::decode(request, context)?;
-            let adapter = self
-                .yaml_vnext
-                .read()
-                .expect("YAML vNext adapter lock poisoned")
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("YAML 运行适配器未装配"))?;
+            let PreparedProgram { adapter, program } = if request.execution_policy.is_some() {
+                let prepared = self.prepared.lock().remove(context.run_id.as_str());
+                prepared.ok_or_else(|| {
+                    anyhow::anyhow!("external_execution_denied: frozen YAML program is unavailable")
+                })?
+            } else {
+                let adapter = self.adapter()?;
+                let spec = Self::decode(request, context)?;
+                let program = adapter.prepare_program(&spec, None).await?;
+                PreparedProgram { adapter, program }
+            };
             // 录制输入来源标注（合同 §2.1 / Phase 9 矩阵）：gamer-yaml runner
             // 经能力适配器注入的输入标记为 "runner"。guest 实例线程经
             // block_on_yaml 派生线程，task-local 不跨线程，由
             // `NativeYamlHost::call_function_json` 在线程内再标注。
             crate::capabilities::adapters::with_caller_input_source("runner", async {
-                adapter.execute(&spec, stop).await
+                adapter
+                    .execute_prepared(context, program, stop, request.execution_policy.clone())
+                    .await
             })
             .await
         })
     }
 
     fn acquire(&self, context: &RunContext) -> anyhow::Result<Box<dyn ActivityLease>> {
-        crate::targets::acquire(&self.devices, context.device_id().as_str())
+        let cleanup = PreparedProgramGuard {
+            prepared: self.prepared.clone(),
+            run_id: context.run_id.as_str().into(),
+            armed: true,
+        };
+        let inner = crate::targets::acquire(&self.devices, context.device_id().as_str())?;
+        Ok(Box::new(PreparedProgramLease {
+            inner,
+            _program: cleanup,
+        }))
     }
 }
 
@@ -233,13 +303,13 @@ fn compose_function_snapshot(
         let Some(rel) = file.path.strip_prefix("automations/") else {
             continue;
         };
-        if !resources::is_function_library_path(rel) {
+        if !rel.ends_with(".yaml") {
             continue;
         }
         let Some(content) = file.content.as_deref() else {
             continue;
         };
-        let library = parse_function_library(content).map_err(|diagnostics| {
+        let library = super::syntax::callable_source(rel, content).map_err(|diagnostics| {
             anyhow::anyhow!(
                 "函数文件 {} 无效: {}",
                 file.path,
@@ -326,13 +396,13 @@ struct YamlRunAdapter {
 
 impl YamlRunAdapter {
     /// V1 唯一执行路径：解析入口 → 组合冻结函数表 → 校验调用面 → 绑定参数 →
-    /// 降线 → guest。旧 v3 源在解析层直接报 `yaml.version.removed`（无
+    /// 降线 → guest。旧 v3 源在解析层直接报 `yaml.top.unknown`（无
     /// fallback），其余坏源报结构化诊断。
-    async fn execute(
+    async fn prepare_program(
         &self,
         spec: &RunSpec,
-        stop: Arc<AtomicBool>,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+        execution_policy: Option<&crate::core::ExecutionPolicy>,
+    ) -> anyhow::Result<Value> {
         let defaults = super::settings::load(self.scripts.data_root())?;
         let scripts = self.scripts.clone();
         let target = spec.target.clone();
@@ -406,7 +476,18 @@ impl YamlRunAdapter {
             }
             Entry::Script { script, .. } => script.called_functions(),
         };
+        let mut roots = entry_calls.clone();
+        roots.extend(
+            library
+                .iter()
+                .filter(|(name, _)| !name.contains(".yaml"))
+                .flat_map(|(_, def)| def.called_functions()),
+        );
+        let reachable = super::syntax::call_closure(roots, &library);
         for (owner, def) in &library {
+            if owner.contains(".yaml") && !reachable.contains(owner) {
+                continue;
+            }
             if let Some(name) = def
                 .called_functions()
                 .iter()
@@ -427,11 +508,6 @@ impl YamlRunAdapter {
                 "{FUNCTION_NOT_FOUND}: 函数 {name:?} 不存在（可用：原生插件函数 + 当前 Package 函数）"
             ));
         }
-
-        let extensions = self
-            .extensions
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("YAML 扩展服务已关闭"))?;
 
         let mut program = match &entry {
             Entry::Script {
@@ -466,6 +542,31 @@ impl YamlRunAdapter {
             }
         };
         let mut sources = sources;
+        if let Entry::Script { script, source, .. } = &entry {
+            for (name, _) in &script.functions {
+                let mut location = source.clone();
+                location["function"] = json!(name);
+                sources.insert(name.clone(), location);
+            }
+            let request = super::offline_validation::ValidationRequest {
+                yaml: source["source_yaml"].as_str().unwrap_or("").to_string(),
+                templates: Default::default(),
+                samples: vec![],
+                settings: defaults.clone(),
+                args: Default::default(),
+                functions_sources: sources
+                    .values()
+                    .filter_map(|s| {
+                        Some((
+                            s["path"].as_str()?.to_string(),
+                            s["source_yaml"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect(),
+            };
+            program["_required_checkpoints"] =
+                json!(super::offline_validation::checkpoint_ids(&request)?);
+        }
         let mut source = match &entry {
             Entry::Script { source, .. } => source.clone(),
             Entry::Function { name, .. } => sources.get(name).cloned().unwrap_or(Value::Null),
@@ -490,12 +591,30 @@ impl YamlRunAdapter {
         }
         program["_source_files"] = Value::Object(source_files);
         program["trace"] = json!({ "run_id": spec.context.run_id.as_str(), "entry": source, "functions": sources });
+        if let Some(policy) = execution_policy {
+            super::private_trial::validate_external_policy(&program, policy)?;
+        }
+        Ok(program)
+    }
+
+    async fn execute_prepared(
+        &self,
+        context: &RunContext,
+        program: Value,
+        stop: Arc<AtomicBool>,
+        execution_policy: Option<crate::core::ExecutionPolicy>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let extensions = self
+            .extensions
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("YAML 扩展服务已关闭"))?;
         run_yaml_program(
             &extensions,
             program,
-            spec.context.app.clone(),
+            context.app.clone(),
             stop,
             self.sink.clone(),
+            execution_policy,
         )
         .await
         .map(|_| Vec::new())
@@ -506,6 +625,127 @@ impl YamlRunAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_program_is_frozen_and_checked_before_any_device_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            data_dir: root.path().into(),
+            ..Default::default()
+        };
+        let db = Arc::new(crate::store::Store::open(&cfg).unwrap());
+        // No configured target: reaching target preparation would fail with a
+        // device error. This fixture cannot connect to an actual device.
+        let devices = Arc::new(DeviceManager::new(db.clone(), cfg.clone()));
+        let packages = Arc::new(crate::resources::PackageStore::open(&cfg).unwrap());
+        packages.ensure_default_package().unwrap();
+        packages
+            .write_text(
+                "default",
+                YAML_EXTENSION_ID,
+                "automations/task.yaml",
+                "run:\n  - notify: {content: forbidden}\n",
+                None,
+                false,
+            )
+            .unwrap();
+        let executor = EngineExecutor::new(devices, db);
+        let adapter = Arc::new(YamlRunAdapter {
+            scripts: packages.clone(),
+            extensions: Weak::new(),
+            sink: None,
+        });
+        *executor.yaml_vnext.write().unwrap() = Some(adapter.clone());
+        let app = AppContext::for_test("absent-target", "default").unwrap();
+        let context = RunContext::new(crate::core::RunId::generate(), app.clone());
+        let mut start = yaml_start_request(
+            app,
+            RunTarget::Script {
+                script_id: "default/task.yaml".into(),
+                start_index: 0,
+            },
+            RunSource::Manual,
+            None,
+            None,
+            JsonMap::new(),
+            false,
+        )
+        .unwrap();
+        let policy = crate::core::ExecutionPolicy::external(
+            "fixture".into(),
+            ["gamer-yaml".into()].into(),
+            ["run.submit".into()].into(),
+        );
+        start.request.execution_policy = Some(policy.clone());
+        let error = executor
+            .prepare(&context, &start.request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("external_execution_denied") && error.contains("notify"),
+            "{error}"
+        );
+        assert!(executor.prepared.lock().is_empty());
+
+        let safe = "run:\n  - log: safe-frozen-source\n";
+        packages
+            .write_text(
+                "default",
+                YAML_EXTENSION_ID,
+                "automations/task.yaml",
+                safe,
+                None,
+                true,
+            )
+            .unwrap();
+        let spec = EngineExecutor::decode(&start.request, &context).unwrap();
+        let program = adapter.prepare_program(&spec, Some(&policy)).await.unwrap();
+        executor.prepared.lock().insert(
+            context.run_id.as_str().into(),
+            PreparedProgram { adapter, program },
+        );
+        packages
+            .write_text(
+                "default",
+                YAML_EXTENSION_ID,
+                "automations/task.yaml",
+                "run:\n  - notify: {}\n",
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            executor.prepared.lock()[context.run_id.as_str()].program["_source_files"]
+                ["automations/task.yaml"],
+            safe
+        );
+        // A cancellation that skips execute must still drop the frozen program.
+        let lease = PreparedProgramLease {
+            inner: Box::new(crate::core::NoopLease),
+            _program: PreparedProgramGuard {
+                prepared: executor.prepared.clone(),
+                run_id: context.run_id.as_str().into(),
+                armed: true,
+            },
+        };
+        drop(lease);
+        assert!(executor.prepared.lock().is_empty());
+        let error = executor
+            .execute(
+                &context,
+                &start.request,
+                false,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("frozen YAML program is unavailable"),
+            "execution must not re-read a different source: {error}"
+        );
+    }
 
     #[test]
     fn yaml_adapter_keeps_runner_and_target_outside_manager() {
@@ -558,7 +798,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "version: 2\nfunctions:\n  greet:\n    run:\n      - log: hi\n",
+                "functions:\n  greet:\n    run:\n      - log: hi\n",
                 None,
                 false,
             )
@@ -568,7 +808,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_battle.yaml",
-                "version: 2\nfunctions:\n  claim:\n    run:\n      - greet: {}\n",
+                "functions:\n  claim:\n    run:\n      - greet: {}\n",
                 None,
                 false,
             )
@@ -579,13 +819,13 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "version: 2\nrun:\n  - log: daily\n",
+                "run:\n  - log: daily\n",
                 None,
                 false,
             )
             .unwrap();
         let library = compose_function_library(&store, "com.test.app").unwrap();
-        assert_eq!(library.len(), 2, "两个 _function*.yaml 共 2 个函数");
+        assert_eq!(library.len(), 3, "两个库函数与可调用的 daily.yaml 脚本");
         let calls = library
             .iter()
             .find(|(name, _)| name == "claim")
@@ -599,7 +839,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "version: 2\nfunctions:\n  tap:\n    run: []\n",
+                "functions:\n  tap:\n    run: []\n",
                 None,
                 false,
             )
@@ -616,7 +856,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "version: 2\nfunctions:\n  greet:\n    run: []\n",
+                "functions:\n  greet:\n    run: []\n",
                 None,
                 true,
             )
@@ -630,7 +870,7 @@ mod tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function_bad.yaml",
-                "version: 2\nfunctions:\n  if:\n    run: []\n",
+                "functions:\n  if:\n    run: []\n",
                 None,
                 true,
             )
@@ -688,7 +928,7 @@ mod tests {
                 "com.a",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "version: 2\nfunctions:\n  a_fn:\n    run: []\n",
+                "functions:\n  a_fn:\n    run: []\n",
                 None,
                 false,
             )
@@ -721,7 +961,7 @@ mod tests {
                 "com.stable",
                 YAML_EXTENSION_ID,
                 "automations/_function_daily.yaml",
-                "version: 2\nfunctions:\n  claim:\n    run:\n      - return: true\n",
+                "functions:\n  claim:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -791,7 +1031,7 @@ mod tests {
                 "com.archive",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "version: 2\nfunctions:\n  claim:\n    run:\n      - return: true\n",
+                "functions:\n  claim:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -801,7 +1041,7 @@ mod tests {
                 "com.archive",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "version: 2\nrun:\n  - claim: {}\n",
+                "run:\n  - claim: {}\n",
                 None,
                 false,
             )
@@ -826,7 +1066,7 @@ mod tests {
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
-            ["claim"]
+            ["claim", "daily.yaml"]
         );
         assert!(restored
             .read_text("com.archive", YAML_EXTENSION_ID, "automations/daily.yaml")

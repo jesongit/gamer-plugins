@@ -1,4 +1,5 @@
 //! Optional, on-demand OCR. The host owns the process and all path configuration.
+pub(crate) mod external;
 mod parser;
 mod settings;
 #[cfg(test)]
@@ -278,6 +279,19 @@ impl OcrService {
     }
 
     async fn recognize(&self, values: Value) -> Result<Value> {
+        self.recognize_cancellable(values, None).await
+    }
+
+    /// Credential cancellation joins this invocation's owned worker without
+    /// cancelling or waiting behind other callers' queued requests.
+    async fn recognize_cancellable(
+        &self,
+        values: Value,
+        external: Option<watch::Receiver<bool>>,
+    ) -> Result<Value> {
+        let (_uncancelled, fallback) = watch::channel(false);
+        let mut external = external.unwrap_or(fallback);
+        ensure!(!*external.borrow(), "OCR 调用已取消");
         ensure!(
             self.state.closing.load(Ordering::Acquire) == 0,
             "OCR 正在停止"
@@ -297,6 +311,7 @@ impl OcrService {
         // targets keep their small encoded input while waiting, not enlarged frames.
         let permit = tokio::select! {
             biased;
+            _=external.changed()=>anyhow::bail!("OCR 调用已取消"),
             _=cancelled.changed()=>anyhow::bail!("OCR 已停止"),
             _=tokio::time::sleep_until(deadline)=>anyhow::bail!("OCR 排队超时"),
             permit=self.state.workers.clone().acquire_owned()=>permit.context("OCR 工作队列已关闭")?,
@@ -310,7 +325,7 @@ impl OcrService {
         let (abort, aborted) = oneshot::channel();
         // An owned task retains the permit through kill + wait, even when its caller
         // is cancelled. stop() therefore cannot outlive a detached OCR process.
-        let work = tokio::spawn(async move {
+        let mut work = tokio::spawn(async move {
             let _permit = permit;
             let (request, prepared) = tokio::task::spawn_blocking(move || {
                 let prepared = request.prepare()?;
@@ -358,7 +373,16 @@ impl OcrService {
                 prepared.scaled_height,
             )?)?)
         });
-        let result = work.await.context("OCR 工作任务异常")?;
+        let mut abort = Some(abort);
+        let result = tokio::select! {
+            biased;
+            _=external.changed()=>{
+                drop(abort.take());
+                let _ = work.await.context("OCR 工作任务异常")?;
+                Err(anyhow::anyhow!("OCR 调用已取消"))
+            }
+            result=&mut work=>result.context("OCR 工作任务异常")?,
+        };
         drop(abort);
         result
     }

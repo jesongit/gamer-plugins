@@ -1,6 +1,6 @@
 //! Portable evidence samples. This is a data contract, never a script generator.
-//! ZIP files contain a deterministic manifest, full-resolution PNGs and optional
-//! original segments. Every read validates all entries, including unused clips.
+//! ZIP files contain a deterministic manifest, full-resolution PNG screenshots
+//! and recorded events. The original video is used only during screenshot extraction.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -15,9 +15,18 @@ use crate::media::{FrameRequest, MediaService};
 use crate::recording::{
     InputEventRecord, RecordingId, RecordingService, RecordingState, SegmentMeta,
 };
-use crate::resources::PackageStore;
 
-pub(crate) const ACTIONS: &[&str] = &["sample.create", "sample.read", "sample.list"];
+#[path = "sample_external.rs"]
+pub(crate) mod external_tools;
+
+pub(crate) const ACTIONS: &[&str] = &[
+    "sample.create",
+    "sample.read",
+    "sample.list",
+    "sample.import",
+    "sample.export",
+    "sample.delete",
+];
 pub const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FILES: usize = 260;
 const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
@@ -34,28 +43,30 @@ pub struct SampleManifest {
     pub recording_id: String,
     pub start: Boundary,
     pub end: Boundary,
-    pub goal: Goal,
     pub coordinates: Coordinates,
     pub status: String,
-    pub max_frame_gap_us: u64,
     pub diagnostics: Vec<Diagnostic>,
     pub actions: Vec<InputEventRecord>,
     pub frames: Vec<SampleFrame>,
     pub windows: Vec<Window>,
     pub segments: Vec<SampleSegment>,
     pub files: Vec<SampleFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_actions: Vec<IgnoredAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recording_issues: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredAction {
+    pub event_id: String,
+    pub reason: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Boundary {
     pub timeline_us: u64,
     pub frame_id: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Goal {
-    pub description: String,
-    pub confirmed: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,10 +117,6 @@ pub struct SampleSegment {
     pub duration_us: u64,
     /// Original capture PTS, diagnostic only. File PTS starts at zero.
     pub base_pts_us: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clip_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clip_sha256: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,18 +128,12 @@ pub struct SampleFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRequest {
-    package_id: String,
     recording_id: String,
     name: String,
     start_us: u64,
     end_us: u64,
-    goal: Goal,
-    #[serde(default = "default_include_clips")]
-    include_clips: bool,
-}
-
-fn default_include_clips() -> bool {
-    true
+    #[serde(default)]
+    ignored_actions: Vec<IgnoredAction>,
 }
 
 pub(crate) fn accepts(id: &str, action: &str) -> bool {
@@ -142,15 +143,17 @@ pub(crate) fn permissions(id: &str, action: &str) -> Option<&'static [Permission
     if !accepts(id, action) {
         return None;
     }
-    Some(if action == "sample.create" {
-        &[
-            Permission::MediaRead,
-            Permission::MediaEventsRead,
-            Permission::MediaWrite,
-        ]
-    } else {
-        &[Permission::MediaRead]
-    })
+    Some(
+        if matches!(action, "sample.create" | "sample.import" | "sample.delete") {
+            &[
+                Permission::MediaRead,
+                Permission::MediaEventsRead,
+                Permission::MediaWrite,
+            ]
+        } else {
+            &[Permission::MediaRead]
+        },
+    )
 }
 pub(crate) fn catalog() -> Vec<Value> {
     ACTIONS.iter().map(|a|json!({"action":a,"version":1,"surface":"native","permissions":permissions(super::VIDEO_EXTENSION_ID,a).unwrap().iter().map(|p|p.as_str()).collect::<Vec<_>>()})).collect()
@@ -169,60 +172,118 @@ pub(crate) fn call(
             .map_err(|e| ExtensionError::CallRejected(format!("sample: {e:#}"))),
     )
 }
+// Serialize writes to the plugin's independent sample library.
+static SAMPLE_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn sample_disk(data_dir: &Path, id: &str) -> anyhow::Result<std::path::PathBuf> {
+    sample_path(id)?;
+    let root = data_dir
+        .join("plugin-data")
+        .join(super::VIDEO_EXTENSION_ID)
+        .join("samples");
+    for path in [
+        data_dir.join("plugin-data"),
+        data_dir.join("plugin-data").join(super::VIDEO_EXTENSION_ID),
+        root.clone(),
+        root.join(format!("{id}.gamersample")),
+    ] {
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "sample path cannot be a symlink"
+            );
+        }
+    }
+    Ok(root.join(format!("{id}.gamersample")))
+}
+pub(crate) fn read_stored_bundle(data_dir: &Path, id: &str) -> anyhow::Result<Value> {
+    let _io = SAMPLE_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("sample storage unavailable"))?;
+    read_bundle(&std::fs::read(sample_disk(data_dir, id)?)?)
+}
+fn save_standalone(data_dir: &Path, manifest: &SampleManifest, bytes: &[u8]) -> anyhow::Result<()> {
+    let disk = sample_disk(data_dir, &manifest.id)?;
+    if disk.exists() {
+        anyhow::ensure!(
+            std::fs::read(&disk)? == bytes,
+            "sample already exists with different content"
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(disk.parent().unwrap())?;
+    crate::core::fs::atomic_write(&disk, bytes)
+}
 fn dispatch(action: &str, values: &Value, data_dir: &Path) -> anyhow::Result<Value> {
+    let _io = SAMPLE_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("sample storage unavailable"))?;
     let cfg = crate::config::Config {
         data_dir: data_dir.to_path_buf(),
         ..Default::default()
     };
-    let store = PackageStore::open(&cfg)?;
-    let package = values["package_id"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("package_id required"))?;
-    store.manifest(package)?;
+    let media = crate::media::service(&cfg);
     match action {
         "sample.create" => {
             let req: CreateRequest = serde_json::from_value(values.clone())?;
-            let recording = crate::recording::service(&cfg);
-            let media = crate::media::service(&cfg);
-            let (manifest, bytes) = create(&req, &recording, &media)?;
-            let path = sample_path(&manifest.id)?;
-            let entry = store.write_binary(
-                &req.package_id,
-                super::VIDEO_EXTENSION_ID,
-                &path,
-                &bytes,
-                None,
-                false,
-            )?;
-            Ok(json!({"manifest":manifest,"path":path,"version":entry.version}))
+            let (manifest, bytes) = create(&req, &crate::recording::service(&cfg), &media)?;
+            save_standalone(data_dir, &manifest, &bytes)?;
+            Ok(json!({"manifest":manifest}))
         }
-        "sample.read" => {
+        "sample.import" => {
+            let encoded = values["base64"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("archive required"))?;
+            anyhow::ensure!(
+                encoded.len() <= MAX_ARCHIVE_BYTES * 4 / 3 + 4,
+                "sample archive too large"
+            );
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+            let (manifest, _) = validate_archive(&bytes)?;
+            save_standalone(data_dir, &manifest, &bytes)?;
+            Ok(json!({"manifest":manifest}))
+        }
+        "sample.read" | "sample.export" | "sample.delete" => {
             let id = values["sample_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("sample_id required"))?;
-            let bytes = store
-                .read_binary(package, super::VIDEO_EXTENSION_ID, &sample_path(id)?)?
-                .ok_or_else(|| anyhow::anyhow!("sample_not_found"))?;
+            let disk = sample_disk(data_dir, id)?;
+            let bytes = std::fs::read(&disk)?;
             let (manifest, files) = validate_archive(&bytes)?;
             anyhow::ensure!(manifest.id == id, "sample id mismatch");
-            let files:Vec<Value>=files.into_iter().filter(|(path,_)|path.starts_with("frames/")).map(|(path,bytes)|json!({"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)})).collect();
+            if action == "sample.export" {
+                return Ok(
+                    json!({"base64":base64::engine::general_purpose::STANDARD.encode(&bytes)}),
+                );
+            }
+            if action == "sample.delete" {
+                std::fs::remove_file(disk)?;
+                return Ok(json!({"deleted":true}));
+            }
+            let files:Vec<Value> = files.into_iter().filter(|(path,_)|path.starts_with("frames/")).map(|(path,bytes)|json!({"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)})).collect();
             Ok(json!({"manifest":manifest,"files":files}))
         }
         "sample.list" => {
-            let mut samples = Vec::new();
-            for entry in store.list(package, super::VIDEO_EXTENSION_ID, "samples/")? {
-                if !entry.path.ends_with(".gamersample") {
+            let root = sample_disk(data_dir, "probe")?
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let mut paths = if root.exists() {
+                std::fs::read_dir(root)?
+                    .map(|item| item.map(|e| e.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            paths.sort();
+            let mut samples = vec![];
+            for path in paths {
+                if path.extension().and_then(|s| s.to_str()) != Some("gamersample") {
                     continue;
                 }
-                let bytes = store
-                    .read_binary(package, super::VIDEO_EXTENSION_ID, &entry.path)?
-                    .unwrap_or_default();
-                match validate_archive(&bytes).and_then(|(manifest,files)| {
-                    anyhow::ensure!(entry.path == sample_path(&manifest.id)?, "sample ID/path mismatch");
-                    Ok((manifest,files))
-                }) {
-                    Ok((manifest,_))=>samples.push(json!({"id":manifest.id,"name":manifest.name,"status":manifest.status,"content_sha256":manifest.content_sha256,"path":entry.path,"diagnostics":manifest.diagnostics})),
-                    Err(e)=>samples.push(json!({"path":entry.path,"status":"corrupt","diagnostics":[{"code":"archive.invalid","message":e.to_string()}]})),
+                let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                match sample_disk(data_dir, id).and_then(|disk| Ok(validate_archive(&std::fs::read(disk)?)?.0)) {
+                    Ok(manifest) => samples.push(json!({"id":manifest.id,"name":manifest.name,"status":manifest.status,"recording_id":manifest.recording_id,"content_sha256":manifest.content_sha256,"diagnostics":manifest.diagnostics})),
+                    Err(e) => samples.push(json!({"id":id,"status":"corrupt","diagnostics":[{"code":"archive.invalid","message":e.to_string()}]})),
                 }
             }
             Ok(json!({"samples":samples}))
@@ -256,7 +317,7 @@ fn issue(
     message: impl Into<String>,
     event_id: Option<&str>,
 ) {
-    manifest.status = "unable_to_validate".into();
+    manifest.status = "incomplete".into();
     manifest.diagnostics.push(Diagnostic {
         code: code.into(),
         message: message.into(),
@@ -281,18 +342,9 @@ fn create(
 ) -> anyhow::Result<(SampleManifest, Vec<u8>)> {
     anyhow::ensure!(
         !req.name.trim().is_empty() && req.name.chars().count() <= 120,
-        "sample name required (max 120)"
+        "invalid sample name"
     );
-    anyhow::ensure!(
-        req.goal.confirmed
-            && !req.goal.description.trim().is_empty()
-            && req.goal.description.chars().count() <= 2000,
-        "END requires explicit user-confirmed goal"
-    );
-    anyhow::ensure!(
-        req.start_us < req.end_us && req.end_us - req.start_us <= 300_000_000,
-        "select START < END, at most 5 minutes"
-    );
+    anyhow::ensure!(req.start_us < req.end_us, "select START < END");
     let session = recording.status(&RecordingId(req.recording_id.clone()))?;
     anyhow::ensure!(
         !matches!(
@@ -301,21 +353,10 @@ fn create(
         ),
         "finish recording before making a sample"
     );
-    let mut load_issue = None;
-    let events = match recording.events(&session.id) {
-        Ok(e) => e,
-        Err(e) => {
-            load_issue = Some(e.to_string());
-            Vec::new()
-        }
-    };
-    let cuts_action = events.iter().any(|e| {
-        (e.timeline_us < req.start_us && action_end(e) > req.start_us)
-            || (e.timeline_us <= req.end_us && action_end(e) > req.end_us)
-    });
+    let events = recording.events(&session.id)?;
     let actions: Vec<_> = events
         .into_iter()
-        .filter(|e| e.timeline_us >= req.start_us && e.timeline_us <= req.end_us)
+        .filter(|event| event.timeline_us >= req.start_us && event.timeline_us <= req.end_us)
         .collect();
     anyhow::ensure!(
         actions.len() <= MAX_ACTIONS,
@@ -324,8 +365,17 @@ fn create(
     let first = segment_at(&session.segments, req.start_us)
         .ok_or_else(|| anyhow::anyhow!("START has no media segment"))?;
     let meta = media.get(&first.media_id)?;
+    let selected: Vec<_> = session
+        .segments
+        .iter()
+        .filter(|seg| {
+            seg.start_us <= req.end_us
+                && seg.start_us.saturating_add(seg.duration_us) >= req.start_us
+        })
+        .cloned()
+        .collect();
     let mut manifest = SampleManifest {
-        schema_version: 1,
+        schema_version: 2,
         id: uuid::Uuid::new_v4().simple().to_string(),
         name: req.name.trim().into(),
         content_sha256: String::new(),
@@ -338,7 +388,6 @@ fn create(
             timeline_us: req.end_us,
             frame_id: String::new(),
         },
-        goal: req.goal.clone(),
         coordinates: Coordinates {
             space: "device-display".into(),
             width: meta.width,
@@ -346,75 +395,44 @@ fn create(
             rotation: meta.rotation,
         },
         status: "complete".into(),
-        max_frame_gap_us: 500_000,
-        diagnostics: Vec::new(),
+        diagnostics: vec![],
         actions,
-        frames: Vec::new(),
-        windows: Vec::new(),
-        segments: Vec::new(),
-        files: Vec::new(),
+        frames: vec![],
+        windows: vec![],
+        files: vec![],
+        segments: selected
+            .iter()
+            .map(|seg| SampleSegment {
+                media_id: seg.media_id.0.clone(),
+                start_us: seg.start_us,
+                duration_us: seg.duration_us,
+                base_pts_us: seg.base_pts_us,
+            })
+            .collect(),
+        ignored_actions: req.ignored_actions.clone(),
+        recording_issues: session.evidence_issues.clone(),
     };
-    if cuts_action {
-        issue(
-            &mut manifest,
-            "boundary.cuts_action",
-            "START/END cuts through a captured action",
-            None,
+    let ignored: BTreeSet<_> = req
+        .ignored_actions
+        .iter()
+        .map(|a| a.event_id.as_str())
+        .collect();
+    anyhow::ensure!(
+        ignored.len() == req.ignored_actions.len(),
+        "duplicate ignored action"
+    );
+    for annotation in &req.ignored_actions {
+        anyhow::ensure!(
+            manifest
+                .actions
+                .iter()
+                .any(|a| a.event_id == annotation.event_id)
+                && !annotation.reason.trim().is_empty()
+                && annotation.reason.len() <= 1000,
+            "ignored action requires a recorded event and reason"
         );
-    }
-    if let Some(e) = load_issue {
-        issue(&mut manifest, "events.missing", e, None);
-    }
-    if session.state != RecordingState::Completed {
-        issue(
-            &mut manifest,
-            "recording.incomplete",
-            format!("recording state {:?}", session.state),
-            None,
-        );
-    }
-    for e in &session.evidence_issues {
-        issue(&mut manifest, "recording.evidence_loss", e, None);
     }
     let mut files = BTreeMap::new();
-    let selected: Vec<_> = session
-        .segments
-        .iter()
-        .filter(|s| {
-            s.start_us <= req.end_us && s.start_us.saturating_add(s.duration_us) >= req.start_us
-        })
-        .cloned()
-        .collect();
-    for seg in &selected {
-        let mut segment = SampleSegment {
-            media_id: seg.media_id.0.clone(),
-            start_us: seg.start_us,
-            duration_us: seg.duration_us,
-            base_pts_us: seg.base_pts_us,
-            clip_path: None,
-            clip_sha256: None,
-        };
-        if req.include_clips {
-            let remaining =
-                MAX_ARCHIVE_BYTES.saturating_sub(files.values().map(Vec::len).sum::<usize>());
-            match media.file_path(&seg.media_id).and_then(|path| {
-                anyhow::ensure!(
-                    std::fs::metadata(&path)?.len() <= remaining as u64,
-                    "clip exceeds sample size limit"
-                );
-                Ok(std::fs::read(path)?)
-            }) {
-                Ok(bytes) => {
-                    let path = format!("clips/{}.mp4", seg.media_id.0);
-                    segment.clip_sha256 = Some(hash(&bytes));
-                    segment.clip_path = Some(path.clone());
-                    files.insert(path, bytes);
-                }
-                Err(e) => issue(&mut manifest, "clip.missing", e.to_string(), None),
-            }
-        }
-        manifest.segments.push(segment);
-    }
     manifest.start.frame_id = add_frame(
         media,
         &selected,
@@ -424,11 +442,7 @@ fn create(
         false,
         "start",
         None,
-    )
-    .unwrap_or_else(|e| {
-        issue(&mut manifest, "start.missing", e.to_string(), None);
-        String::new()
-    });
+    )?;
     manifest.end.frame_id = add_frame(
         media,
         &selected,
@@ -438,156 +452,67 @@ fn create(
         true,
         "end",
         None,
-    )
-    .unwrap_or_else(|e| {
-        issue(&mut manifest, "end.missing", e.to_string(), None);
-        String::new()
-    });
-    for (label, boundary) in [
-        ("start", manifest.start.clone()),
-        ("end", manifest.end.clone()),
-    ] {
-        if manifest
-            .frames
-            .iter()
-            .find(|f| f.id == boundary.frame_id)
-            .is_none_or(|f| f.timeline_us != boundary.timeline_us)
-        {
-            issue(
-                &mut manifest,
-                "boundary.not_exact",
-                format!("{label} must be pinned to an exact confirmed video frame"),
-                None,
-            );
-        }
-    }
-    let actions = manifest.actions.clone();
-    for (i, event) in actions.iter().enumerate() {
-        if let Some(reason) = unsupported_action(event, &manifest.coordinates) {
-            issue(
-                &mut manifest,
-                "action.unsupported",
-                reason,
-                Some(&event.event_id),
-            );
-        }
-        let mut window = Window {
-            event_id: event.event_id.clone(),
-            before_frame_ids: Vec::new(),
-            after_frame_ids: Vec::new(),
-        };
-        let before_floor = i
-            .checked_sub(1)
-            .map(|p| action_end(&actions[p]))
-            .unwrap_or(req.start_us);
-        let after_limit = actions
-            .get(i + 1)
-            .map(|e| e.timeline_us)
-            .unwrap_or(req.end_us);
-        let before_offsets: &[u64] = if req.include_clips {
-            &[1]
-        } else {
-            &[250_000, 1]
-        };
-        for &delta in before_offsets {
-            let t = event.timeline_us.saturating_sub(delta).max(before_floor);
-            if t >= event.timeline_us {
-                continue;
-            }
-            if let Ok(id) = add_frame(
-                media,
-                &selected,
-                &mut manifest,
-                &mut files,
-                t,
-                true,
-                "before",
-                Some(&event.event_id),
-            ) {
-                let frame = manifest.frames.iter().find(|f| f.id == id).unwrap();
-                if frame.timeline_us < event.timeline_us
-                    && frame.timeline_us >= before_floor
-                    && !window.before_frame_ids.contains(&id)
-                {
-                    window.before_frame_ids.push(id);
-                }
-            }
-        }
-        let after_offsets: &[u64] = if req.include_clips {
-            &[0, 250_000]
-        } else {
-            &[0, 250_000, 750_000]
-        };
-        for &delta in after_offsets {
-            let t = action_end(event).saturating_add(delta);
-            if t > after_limit {
-                continue;
-            }
-            if let Ok(id) = add_frame(
-                media,
-                &selected,
-                &mut manifest,
-                &mut files,
-                t,
-                false,
-                "after",
-                Some(&event.event_id),
-            ) {
-                let frame = manifest.frames.iter().find(|f| f.id == id).unwrap();
-                if frame.timeline_us >= action_end(event)
-                    && frame.timeline_us <= after_limit
-                    && !window.after_frame_ids.contains(&id)
-                {
-                    window.after_frame_ids.push(id);
-                }
-            }
-        }
-        if window.before_frame_ids.is_empty() || window.after_frame_ids.len() < 2 {
-            issue(
-                &mut manifest,
-                "window.insufficient",
-                "Need a genuine before frame and two distinct after frames",
-                Some(&event.event_id),
-            );
-        }
-        manifest.windows.push(window);
-    }
-    // Preserve additional observations throughout longer waits, without inventing
-    // timestamps for static duplicate images. Sampling uses actual display PTS.
-    let stride = 250_000;
-    let mut t = req.start_us.saturating_add(stride);
-    while !req.include_clips && t < req.end_us && manifest.frames.len() < MAX_FRAMES {
-        let _ = add_frame(
+    )?;
+    // START/END select actual frames. They describe the selected lesson, not a
+    // user assertion that every task has already succeeded.
+    manifest.start.timeline_us = manifest
+        .frames
+        .iter()
+        .find(|frame| frame.id == manifest.start.frame_id)
+        .unwrap()
+        .timeline_us;
+    manifest.end.timeline_us = manifest
+        .frames
+        .iter()
+        .find(|frame| frame.id == manifest.end.frame_id)
+        .unwrap()
+        .timeline_us;
+    let events = manifest.actions.clone();
+    let mut before_frames = vec![];
+    for event in events
+        .iter()
+        .filter(|event| !ignored.contains(event.event_id.as_str()))
+    {
+        let before_time = event
+            .timeline_us
+            .saturating_sub(1)
+            .max(manifest.start.timeline_us);
+        let before = add_frame(
             media,
             &selected,
             &mut manifest,
             &mut files,
-            t,
-            false,
-            "observation",
-            None,
-        );
-        t = t.saturating_add(stride);
+            before_time,
+            true,
+            "before",
+            Some(&event.event_id),
+        )?;
+        before_frames.push((event, before));
     }
-    manifest.frames.sort_by(|a, b| {
-        a.timeline_us
-            .cmp(&b.timeline_us)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let observed_gap = manifest
-        .frames
-        .windows(2)
-        .map(|f| f[1].timeline_us - f[0].timeline_us)
-        .max()
-        .unwrap_or(req.end_us - req.start_us);
-    if !req.include_clips && observed_gap > manifest.max_frame_gap_us {
-        issue(
-            &mut manifest,
-            "frames.sparse",
-            "Observation gap exceeds 500 ms; shorten or supplement the recording",
-            None,
-        );
+    // The next observed operation state is also the previous action's result.
+    // Reuse that PNG rather than storing arbitrary fixed-delay duplicates.
+    for (index, (event, before)) in before_frames.iter().enumerate() {
+        let after = before_frames
+            .get(index + 1)
+            .map(|(_, frame)| frame.clone())
+            .unwrap_or_else(|| manifest.end.frame_id.clone());
+        let after_time = manifest
+            .frames
+            .iter()
+            .find(|frame| frame.id == after)
+            .unwrap()
+            .timeline_us;
+        manifest.windows.push(Window {
+            event_id: event.event_id.clone(),
+            before_frame_ids: vec![before.clone()],
+            after_frame_ids: if after_time >= action_end(event) {
+                vec![after]
+            } else {
+                vec![]
+            },
+        });
     }
+    manifest.frames.sort_by_key(|frame| frame.timeline_us);
     manifest.files = files
         .iter()
         .map(|(path, bytes)| SampleFile {
@@ -602,110 +527,6 @@ fn create(
     Ok((manifest, bytes))
 }
 
-fn unsupported_action(e: &InputEventRecord, c: &Coordinates) -> Option<String> {
-    if e.schema_version != 1
-        || e.operation_id.is_empty()
-        || e.status != "accepted"
-        || e.time_domain != "recording"
-        || e.coordinate_space != "device-display"
-    {
-        return Some("untrusted action metadata".into());
-    }
-    if e.display_size.width != c.width || e.display_size.height != c.height || c.rotation != 0 {
-        return Some("coordinate dimensions or rotation differ".into());
-    }
-    if !matches!(e.kind.as_str(), "tap" | "swipe" | "key" | "wait") {
-        return Some(format!("{} cannot be reproduced", e.kind));
-    }
-    if matches!(e.kind.as_str(), "tap" | "swipe" | "key")
-        && e.payload["duration_us"].as_u64().is_none()
-    {
-        return Some("captured duration missing".into());
-    }
-    if e.kind == "key"
-        && !(e.payload["code"].is_u64()
-            || e.payload["code"]
-                .as_str()
-                .is_some_and(|s| !s.trim().is_empty() && s.len() <= 128))
-    {
-        return Some("key identity missing".into());
-    }
-    if e.kind == "wait" && e.payload["duration_us"].as_u64().is_none() {
-        return Some("wait duration missing".into());
-    }
-    if matches!(e.kind.as_str(), "tap" | "swipe") {
-        for (key, limit) in [("x", c.width), ("y", c.height)] {
-            if e.payload[key].as_u64().is_none_or(|n| n >= limit as u64) {
-                return Some("action coordinate out of range".into());
-            }
-        }
-    }
-    if e.kind == "swipe" {
-        let (Some(x), Some(y), Some(x2), Some(y2)) = (
-            e.payload["x"].as_f64(),
-            e.payload["y"].as_f64(),
-            e.payload["x2"].as_f64(),
-            e.payload["y2"].as_f64(),
-        ) else {
-            return Some("swipe endpoint missing".into());
-        };
-        if x2 < 0. || y2 < 0. || x2 >= c.width as f64 || y2 >= c.height as f64 {
-            return Some("swipe endpoint out of range".into());
-        }
-        let Some(points) = e.payload["points"].as_array() else {
-            return Some("captured swipe trajectory missing".into());
-        };
-        if points.len() < 2 || points.len() > 257 {
-            return Some("swipe trajectory incomplete".into());
-        }
-        let duration = e.payload["duration_us"].as_u64().unwrap();
-        let length = (x2 - x).hypot(y2 - y);
-        if length < 1. {
-            return Some("closed swipe needs unsupported gesture replay".into());
-        }
-        let mut maximum_projection = 0f64;
-        let mut previous_time = 0u64;
-        for p in points {
-            let (Some(time), Some(px), Some(py)) = (
-                p.get(0).and_then(Value::as_u64),
-                p.get(1).and_then(Value::as_u64),
-                p.get(2).and_then(Value::as_u64),
-            ) else {
-                return Some("invalid swipe trajectory point".into());
-            };
-            let (px, py) = (px as f64, py as f64);
-            let projection = ((px - x) * (x2 - x) + (py - y) * (y2 - y)) / length;
-            let perpendicular = ((x2 - x) * (y - py) - (x - px) * (y2 - y)).abs() / length;
-            if time < previous_time
-                || time > duration
-                || px >= c.width as f64
-                || py >= c.height as f64
-                || perpendicular > 8.
-                || projection < -8.
-                || projection > length + 8.
-                || projection + 8. < maximum_projection
-            {
-                return Some("non-linear, overshooting or reversing swipe cannot be replayed as a straight swipe".into());
-            }
-            previous_time = time;
-            maximum_projection = maximum_projection.max(projection);
-        }
-        let first = &points[0];
-        let last = points.last().unwrap();
-        if first[0].as_u64() != Some(0)
-            || first[1].as_f64() != Some(x)
-            || first[2].as_f64() != Some(y)
-            || last[0].as_u64() != Some(duration)
-            || last[1].as_f64() != Some(x2)
-            || last[2].as_f64() != Some(y2)
-        {
-            return Some("swipe trajectory endpoints or duration mismatch".into());
-        }
-    }
-    None
-}
-
-#[allow(clippy::too_many_arguments)]
 fn add_frame(
     media: &MediaService,
     segments: &[SegmentMeta],
@@ -756,11 +577,20 @@ fn add_frame(
             && (source.width as u64) * (source.height as u64) <= 16_777_216,
         "source image dimensions exceed sample budget"
     );
+    let neighbors = media.frame_neighbors(&seg.media_id, pos.index)?;
+    let unique_pts = neighbors
+        .prev
+        .as_ref()
+        .is_none_or(|p| p.pts_us != pos.pts_us)
+        && neighbors
+            .next
+            .as_ref()
+            .is_none_or(|p| p.pts_us != pos.pts_us);
     let extracted = media.extract_frame(
         &seg.media_id,
         &FrameRequest {
-            index: Some(pos.index),
-            pts_us: None,
+            index: (!unique_pts).then_some(pos.index),
+            pts_us: unique_pts.then_some(pos.pts_us),
             max_width: None,
         },
     )?;
@@ -790,7 +620,7 @@ fn add_frame(
     files.insert(path.clone(), extracted.png);
     anyhow::ensure!(
         files.values().map(Vec::len).sum::<usize>() <= MAX_ARCHIVE_BYTES,
-        "sample exceeds 128 MiB; shorten range or omit original clips"
+        "sample screenshots exceed 128 MiB; select a smaller lesson"
     );
     m.frames.push(SampleFrame {
         id: id.clone(),
@@ -1021,11 +851,10 @@ pub fn validate_archive(
         .remove("manifest.json")
         .ok_or_else(|| anyhow::anyhow!("manifest missing"))?;
     let manifest: SampleManifest = serde_json::from_slice(&manifest_bytes)?;
-    validate_manifest(&manifest, &files, true)?;
+    validate_manifest(&manifest, &files)?;
     Ok((manifest, files))
 }
-/// Server-side portable-format contract, including optional clips. Keep this
-/// internal bundle server-side; public sample.read returns only PNG previews.
+/// Portable screenshot/event contract. Reading it needs no original video.
 pub fn read_bundle(bytes: &[u8]) -> anyhow::Result<Value> {
     let (manifest, files) = validate_archive(bytes)?;
     let files: Vec<Value> = files.into_iter().map(|(path,bytes)|json!({"path":path,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)})).collect();
@@ -1034,18 +863,17 @@ pub fn read_bundle(bytes: &[u8]) -> anyhow::Result<Value> {
 
 pub fn validate_bundle(manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> anyhow::Result<()> {
     let manifest: SampleManifest = serde_json::from_value(manifest.clone())?;
-    validate_manifest(&manifest, files, false)
+    validate_manifest(&manifest, files)
 }
 
-fn validate_manifest(
-    m: &SampleManifest,
-    files: &BTreeMap<String, Vec<u8>>,
-    require_clips: bool,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(m.schema_version == 1, "sample schema unsupported");
+fn validate_manifest(m: &SampleManifest, files: &BTreeMap<String, Vec<u8>>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        m.schema_version == 2,
+        "only screenshot/event sample schema 2 is supported; remake old video-dependent samples"
+    );
     sample_path(&m.id)?;
     anyhow::ensure!(
-        m.name.chars().count() <= 120 && !m.name.trim().is_empty(),
+        !m.name.trim().is_empty() && m.name.chars().count() <= 120,
         "invalid sample name"
     );
     anyhow::ensure!(
@@ -1053,330 +881,165 @@ fn validate_manifest(
         "sample fingerprint mismatch"
     );
     anyhow::ensure!(
-        m.start.timeline_us < m.end.timeline_us
-            && m.end.timeline_us - m.start.timeline_us <= 300_000_000,
+        m.start.timeline_us < m.end.timeline_us,
         "invalid START/END range"
     );
     anyhow::ensure!(
-        m.goal.confirmed
-            && !m.goal.description.trim().is_empty()
-            && m.goal.description.chars().count() <= 2000,
-        "goal not explicitly confirmed"
-    );
-    anyhow::ensure!(
-        matches!(m.status.as_str(), "complete" | "unable_to_validate"),
-        "invalid status"
-    );
-    anyhow::ensure!(
-        m.max_frame_gap_us == 500_000,
-        "unsupported evidence gap bound"
+        matches!(m.status.as_str(), "complete" | "incomplete"),
+        "invalid sample status"
     );
     anyhow::ensure!(
         m.status != "complete" || m.diagnostics.is_empty(),
         "complete sample has diagnostics"
     );
     anyhow::ensure!(
-        m.frames.len() <= MAX_FRAMES
+        m.frames.len() >= 2
+            && m.frames.len() <= MAX_FRAMES
             && m.actions.len() <= MAX_ACTIONS
-            && m.files.len() >= files.len()
-            && (!require_clips || m.files.len() == files.len()),
-        "manifest limits or file set mismatch"
+            && m.files.len() == files.len(),
+        "sample limits or file set mismatch"
     );
     anyhow::ensure!(
         m.coordinates.space == "device-display"
             && m.coordinates.width > 0
             && m.coordinates.height > 0
-            && m.coordinates.width <= 16384
-            && m.coordinates.height <= 16384
+            && m.coordinates.width <= 8192
+            && m.coordinates.height <= 8192
             && [0, 90, 180, 270].contains(&m.coordinates.rotation),
         "invalid coordinates"
     );
-    anyhow::ensure!(
-        m.files
-            .iter()
-            .try_fold(0u64, |sum, f| sum.checked_add(f.size))
-            .is_some_and(|n| n <= MAX_ARCHIVE_BYTES as u64),
-        "expanded bundle exceeds size limit"
-    );
-    let mut indexed = BTreeSet::new();
-    for f in &m.files {
+    let mut paths = BTreeSet::new();
+    let mut total = 0u64;
+    for file in &m.files {
         anyhow::ensure!(
-            safe_path(&f.path) && crate::media::is_sha256_hex(&f.sha256),
-            "invalid file metadata"
+            safe_path(&file.path)
+                && file.path.starts_with("frames/")
+                && file.path.ends_with(".png")
+                && paths.insert(file.path.clone()),
+            "sample payload must contain unique PNG screenshots only"
         );
-        anyhow::ensure!(indexed.insert(&f.path), "duplicate file index");
-        if !require_clips
-            && !files.contains_key(&f.path)
-            && m.segments.iter().any(|seg| {
-                seg.clip_path.as_deref() == Some(f.path.as_str())
-                    && seg.clip_sha256.as_deref() == Some(f.sha256.as_str())
-            })
-        {
-            continue;
-        }
         let bytes = files
-            .get(&f.path)
-            .ok_or_else(|| anyhow::anyhow!("file missing: {}", f.path))?;
+            .get(&file.path)
+            .ok_or_else(|| anyhow::anyhow!("missing screenshot"))?;
         anyhow::ensure!(
-            bytes.len() as u64 == f.size && hash(bytes) == f.sha256,
-            "file hash/size mismatch: {}",
-            f.path
+            bytes.len() as u64 == file.size && hash(bytes) == file.sha256,
+            "screenshot hash/size mismatch"
         );
+        total = total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow::anyhow!("sample size overflow"))?;
     }
     anyhow::ensure!(
-        files.keys().all(|path| indexed.contains(path)),
-        "payload is missing from canonical file index"
+        total <= MAX_ARCHIVE_BYTES as u64,
+        "sample screenshots exceed128MiB"
     );
-    anyhow::ensure!(
-        files
-            .values()
-            .try_fold(0usize, |sum, b| sum.checked_add(b.len()))
-            .is_some_and(|n| n <= MAX_ARCHIVE_BYTES),
-        "actual bundle bytes exceed size limit"
-    );
-    let clip_backed = !m.segments.is_empty()
-        && m.segments.iter().all(|seg| {
-            seg.clip_path
-                .as_ref()
-                .is_some_and(|path| files.contains_key(path))
-        });
-    let mut frame_ids = BTreeSet::new();
-    let mut source_frames = BTreeSet::new();
-    let mut media_hashes = BTreeMap::new();
+    let mut ids = BTreeSet::new();
     let mut frame_paths = BTreeSet::new();
-    let mut prev = 0;
-    for f in &m.frames {
+    for frame in &m.frames {
         anyhow::ensure!(
-            frame_ids.insert(&f.id)
-                && frame_paths.insert(&f.path)
-                && source_frames.insert((&f.media_id, f.frame_index)),
-            "duplicate frame"
+            !frame.id.is_empty()
+                && ids.insert(frame.id.clone())
+                && frame_paths.insert(frame.path.clone()),
+            "duplicate frame identity"
         );
-        if let Some(previous) = media_hashes.insert(&f.media_id, &f.media_sha256) {
-            anyhow::ensure!(previous == &f.media_sha256, "source media identity changed");
-        }
         anyhow::ensure!(
-            f.timeline_us >= m.start.timeline_us
-                && f.timeline_us <= m.end.timeline_us
-                && f.timeline_us >= prev,
-            "frame outside range or order"
-        );
-        prev = f.timeline_us;
-        anyhow::ensure!(
-            f.path.starts_with("frames/") && f.path.ends_with(".png"),
-            "invalid frame path"
+            frame.timeline_us >= m.start.timeline_us && frame.timeline_us <= m.end.timeline_us,
+            "frame outside selected lesson"
         );
         let bytes = files
-            .get(&f.path)
-            .ok_or_else(|| anyhow::anyhow!("frame missing"))?;
-        anyhow::ensure!(hash(bytes) == f.sha256, "frame hash mismatch");
-        let mut reader =
-            image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(8192);
-        limits.max_image_height = Some(8192);
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        reader.limits(limits);
-        let decoded = reader.decode()?;
-        let image = (decoded.width(), decoded.height());
+            .get(&frame.path)
+            .ok_or_else(|| anyhow::anyhow!("missing frame PNG"))?;
+        anyhow::ensure!(hash(bytes) == frame.sha256, "frame SHA256 mismatch");
+        let image = decode_png(bytes)?;
         anyhow::ensure!(
-            image == (f.width, f.height)
-                && f.width > 0
-                && f.height > 0
-                && f.width <= 8192
-                && f.height <= 8192
-                && (f.width as u64) * (f.height as u64) <= 16_777_216,
+            image.width() == frame.width
+                && image.height() == frame.height
+                && frame.width == m.coordinates.width
+                && frame.height == m.coordinates.height
+                && frame.rotation == m.coordinates.rotation,
             "frame geometry mismatch"
         );
-        let seg = m
-            .segments
-            .iter()
-            .find(|s| s.media_id == f.media_id)
-            .ok_or_else(|| anyhow::anyhow!("frame segment missing"))?;
+    }
+    anyhow::ensure!(frame_paths == paths, "unreferenced screenshot payload");
+    for boundary in [&m.start, &m.end] {
         anyhow::ensure!(
-            f.timeline_us
-                == seg
-                    .start_us
-                    .checked_add(f.pts_us)
-                    .ok_or_else(|| anyhow::anyhow!("frame time overflow"))?,
-            "frame timing mismatch"
+            m.frames
+                .iter()
+                .any(|frame| frame.id == boundary.frame_id
+                    && frame.timeline_us == boundary.timeline_us),
+            "START/END frame missing"
         );
-        anyhow::ensure!(f.pts_us <= seg.duration_us, "frame extends beyond segment");
+    }
+    let mut events = BTreeSet::new();
+    let mut previous = m.start.timeline_us;
+    for event in &m.actions {
         anyhow::ensure!(
-            crate::media::is_sha256_hex(&f.media_sha256),
-            "invalid source SHA"
+            event.schema_version == 1
+                && !event.operation_id.is_empty()
+                && event.status == "accepted"
+                && event.time_domain == "recording"
+                && event.coordinate_space == "device-display",
+            "invalid event provenance"
         );
-        if m.status == "complete" {
+        anyhow::ensure!(
+            events.insert(event.event_id.clone())
+                && event.timeline_us >= previous
+                && event.timeline_us <= m.end.timeline_us,
+            "event timeline invalid"
+        );
+        previous = event.timeline_us;
+        if matches!(event.kind.as_str(), "tap" | "long_press" | "swipe") {
             anyhow::ensure!(
-                f.width == m.coordinates.width
-                    && f.height == m.coordinates.height
-                    && f.rotation == m.coordinates.rotation,
-                "coordinate mapping unavailable"
+                event.payload["x"]
+                    .as_u64()
+                    .is_some_and(|x| x < m.coordinates.width as u64)
+                    && event.payload["y"]
+                        .as_u64()
+                        .is_some_and(|y| y < m.coordinates.height as u64),
+                "event coordinates invalid"
             );
         }
     }
-    let mut segment_ids = BTreeSet::new();
-    for seg in &m.segments {
-        anyhow::ensure!(
-            segment_ids.insert(&seg.media_id)
-                && crate::media::is_valid_media_id(&seg.media_id)
-                && seg.duration_us > 0,
-            "invalid/duplicate sample segment"
-        );
-        match (&seg.clip_path, &seg.clip_sha256) {
-            (Some(path), Some(sha)) => {
-                anyhow::ensure!(
-                    path.starts_with("clips/") && path.ends_with(".mp4"),
-                    "invalid clip path"
-                );
-                anyhow::ensure!(
-                    m.files.iter().any(|f| &f.path == path && &f.sha256 == sha),
-                    "clip file metadata missing"
-                );
-                anyhow::ensure!(
-                    files
-                        .get(path)
-                        .map(|b| hash(b) == *sha)
-                        .unwrap_or(!require_clips),
-                    "clip hash mismatch"
-                );
-            }
-            (None, None) => {}
-            _ => anyhow::bail!("partial clip reference"),
-        }
-    }
-    let referenced: BTreeSet<&str> = m
-        .frames
+    let ignored: BTreeSet<_> = m
+        .ignored_actions
         .iter()
-        .map(|f| f.path.as_str())
-        .chain(m.segments.iter().filter_map(|s| s.clip_path.as_deref()))
+        .map(|a| a.event_id.as_str())
         .collect();
     anyhow::ensure!(
-        files.keys().all(|p| referenced.contains(p.as_str())),
-        "unreferenced archive payload"
+        ignored.len() == m.ignored_actions.len(),
+        "duplicate ignored event"
     );
-    let mut event_ids = BTreeSet::new();
-    let mut previous = 0;
-    for e in &m.actions {
+    for ignored in &m.ignored_actions {
         anyhow::ensure!(
-            event_ids.insert(&e.event_id) && !e.event_id.is_empty(),
-            "duplicate action id"
+            events.contains(&ignored.event_id) && !ignored.reason.trim().is_empty(),
+            "ignored event requires source and reason"
         );
+    }
+    let mut windows = BTreeSet::new();
+    for window in &m.windows {
         anyhow::ensure!(
-            e.timeline_us >= m.start.timeline_us
-                && e.timeline_us <= m.end.timeline_us
-                && e.timeline_us >= previous,
-            "action ordering/range invalid"
+            events.contains(&window.event_id)
+                && windows.insert(window.event_id.as_str())
+                && !window.before_frame_ids.is_empty(),
+            "event screenshot reference invalid"
         );
-        previous = e.timeline_us;
-        anyhow::ensure!(
-            e.session_id == m.recording_id,
-            "action recording identity mismatch"
-        );
-        if m.status == "complete" {
-            anyhow::ensure!(
-                action_end(e) <= m.end.timeline_us,
-                "action extends beyond END"
-            );
-            anyhow::ensure!(
-                unsupported_action(e, &m.coordinates).is_none(),
-                "unsupported action cannot be complete"
-            );
+        for id in window
+            .before_frame_ids
+            .iter()
+            .chain(&window.after_frame_ids)
+        {
+            anyhow::ensure!(ids.contains(id), "event screenshot missing");
         }
     }
-    let mut window_ids = BTreeSet::new();
-    for w in &m.windows {
-        anyhow::ensure!(window_ids.insert(&w.event_id), "duplicate window");
-        let e = m
-            .actions
-            .iter()
-            .find(|e| e.event_id == w.event_id)
-            .ok_or_else(|| anyhow::anyhow!("window action missing"))?;
-        let event_index = m
-            .actions
-            .iter()
-            .position(|a| a.event_id == w.event_id)
-            .unwrap();
-        let before_floor = event_index
-            .checked_sub(1)
-            .map(|i| action_end(&m.actions[i]))
-            .unwrap_or(m.start.timeline_us);
-        let after_limit = m
-            .actions
-            .get(event_index + 1)
-            .map(|a| a.timeline_us)
-            .unwrap_or(m.end.timeline_us);
-        let mut unique = BTreeSet::new();
-        for (before, ids) in [(true, &w.before_frame_ids), (false, &w.after_frame_ids)] {
-            let mut timestamps = BTreeSet::new();
-            for id in ids {
-                anyhow::ensure!(unique.insert(id), "duplicate window frame");
-                let f = m
-                    .frames
-                    .iter()
-                    .find(|f| &f.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("window frame missing"))?;
-                anyhow::ensure!(
-                    timestamps.insert(f.timeline_us),
-                    "window frames must have distinct source timestamps"
-                );
-                anyhow::ensure!(
-                    if before {
-                        f.timeline_us < e.timeline_us && f.timeline_us >= before_floor
-                    } else {
-                        f.timeline_us >= action_end(e) && f.timeline_us <= after_limit
-                    },
-                    "window is not genuine before/after evidence"
-                );
-            }
-        }
-        if m.status == "complete" {
-            anyhow::ensure!(
-                !w.before_frame_ids.is_empty() && w.after_frame_ids.len() >= 2,
-                "window evidence insufficient"
-            );
-        }
-    }
-    if m.status == "complete" {
+    for event in &m.actions {
         anyhow::ensure!(
-            clip_backed
-                || m.frames
-                    .windows(2)
-                    .all(|pair| pair[1].timeline_us - pair[0].timeline_us <= m.max_frame_gap_us),
-            "sparse frames need original clip evidence; import the complete archive"
-        );
-        anyhow::ensure!(
-            m.windows.len() == m.actions.len()
-                && frame_ids.contains(&m.start.frame_id)
-                && frame_ids.contains(&m.end.frame_id),
-            "missing complete sample evidence"
-        );
-        let start = m.frames.iter().find(|f| f.id == m.start.frame_id).unwrap();
-        let end = m.frames.iter().find(|f| f.id == m.end.frame_id).unwrap();
-        anyhow::ensure!(
-            start.timeline_us == m.start.timeline_us
-                && end.timeline_us == m.end.timeline_us
-                && start.timeline_us < end.timeline_us,
-            "START/END must identify exact confirmed boundary frames"
-        );
-        anyhow::ensure!(
-            m.actions
-                .first()
-                .is_none_or(|e| start.timeline_us <= e.timeline_us),
-            "START follows first action"
-        );
-        anyhow::ensure!(
-            m.actions
-                .last()
-                .is_none_or(|e| end.timeline_us >= action_end(e)),
-            "END predates final action completion"
+            ignored.contains(event.event_id.as_str()) || windows.contains(event.event_id.as_str()),
+            "event before screenshot missing"
         );
     }
     Ok(())
 }
 
-/// Raw PackageStore uploads use the same validator as public reads. The ID is
-/// immutable and independent of destination package, so import is portable.
 pub fn validate_resource(path: &str, bytes: &[u8]) -> Result<(), Value> {
     if !path.starts_with("samples/") {
         return Ok(());
@@ -1389,395 +1052,115 @@ pub fn validate_resource(path: &str, bytes: &[u8]) -> Result<(), Value> {
     result.map_err(|e| json!([{"code":"sample.invalid","message":e.to_string(),"path":path}]))
 }
 
+fn decode_png(bytes: &[u8]) -> anyhow::Result<image::DynamicImage> {
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    anyhow::ensure!(
+        (image.width() as u64) * (image.height() as u64) <= 16_777_216,
+        "PNG pixel budget exceeded"
+    );
+    Ok(image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn png() -> Vec<u8> {
-        let mut bytes = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(8, 8)
-            .write_to(&mut bytes, image::ImageFormat::Png)
+    pub(super) fn fixture() -> (SampleManifest, BTreeMap<String, Vec<u8>>) {
+        let mut png = Cursor::new(vec![]);
+        image::RgbImage::new(16, 16)
+            .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        bytes.into_inner()
-    }
-    fn fixture() -> (SampleManifest, BTreeMap<String, Vec<u8>>) {
-        let bytes = png();
-        let sha = hash(&bytes);
-        let media = "a".repeat(32);
-        let frame = |id: &str, t| SampleFrame {
-            id: id.into(),
-            path: format!("frames/{id}.png"),
-            sha256: sha.clone(),
-            media_id: media.clone(),
-            media_sha256: "b".repeat(64),
-            frame_index: t as u32,
-            pts_us: t,
-            timeline_us: t,
-            width: 8,
-            height: 8,
-            rotation: 0,
-            role: "observation".into(),
-            event_id: None,
-        };
-        let frames = vec![frame("start", 0), frame("end", 1000)];
-        let files = frames
-            .iter()
-            .map(|f| (f.path.clone(), bytes.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut m = SampleManifest {
-            schema_version: 1,
-            id: "sample-1".into(),
-            name: "example".into(),
-            content_sha256: String::new(),
-            recording_id: "r1".into(),
-            start: Boundary {
-                timeline_us: 0,
-                frame_id: "start".into(),
-            },
-            end: Boundary {
-                timeline_us: 1000,
-                frame_id: "end".into(),
-            },
-            goal: Goal {
-                description: "goal visible".into(),
-                confirmed: true,
-            },
-            coordinates: Coordinates {
-                space: "device-display".into(),
-                width: 8,
-                height: 8,
-                rotation: 0,
-            },
-            status: "complete".into(),
-            max_frame_gap_us: 500_000,
-            diagnostics: vec![],
-            actions: vec![],
-            frames,
-            windows: vec![],
-            segments: vec![SampleSegment {
-                media_id: media,
-                start_us: 0,
-                duration_us: 1000,
-                base_pts_us: 5_000_000,
-                clip_path: None,
-                clip_sha256: None,
-            }],
-            files: files
-                .iter()
-                .map(|(p, b)| SampleFile {
-                    path: p.clone(),
-                    sha256: hash(b),
-                    size: b.len() as u64,
-                })
-                .collect(),
-        };
-        m.content_sha256 = fingerprint(&m).unwrap();
-        (m, files)
+        let png = png.into_inner();
+        let files = BTreeMap::from([
+            ("frames/start.png".into(), png.clone()),
+            ("frames/end.png".into(), png.clone()),
+        ]);
+        let frames=vec![("start",0),("end",7_200_000_000u64)].into_iter().map(|(id,at)|json!({"id":id,"path":format!("frames/{id}.png"),"sha256":hash(&png),"media_id":"unavailable-video","media_sha256":"original-source-hash","frame_index":0,"pts_us":at,"timeline_us":at,"width":16,"height":16,"rotation":0,"role":id})).collect::<Vec<_>>();
+        let mut manifest:SampleManifest=serde_json::from_value(json!({"schema_version":2,"id":"test-screenshot-only","name":"two-hour sparse lesson","recording_id":"recording","content_sha256":"","start":{"timeline_us":0,"frame_id":"start"},"end":{"timeline_us":7_200_000_000u64,"frame_id":"end"},"coordinates":{"space":"device-display","width":16,"height":16,"rotation":0},"status":"complete","diagnostics":[],"actions":[],"windows":[],"segments":[],"frames":frames,"files":files.iter().map(|(path,bytes)|json!({"path":path,"sha256":hash(bytes),"size":bytes.len()})).collect::<Vec<_>>()})).unwrap();
+        manifest.content_sha256 = fingerprint(&manifest).unwrap();
+        (manifest, files)
     }
     #[test]
-    fn portable_archive_is_deterministic_and_self_contained() {
-        let (m, f) = fixture();
-        let a = encode_archive(&m, &f).unwrap();
-        assert_eq!(a, encode_archive(&m, &f).unwrap());
-        let (r, files) = validate_archive(&a).unwrap();
-        assert_eq!(r.content_sha256, m.content_sha256);
-        assert_eq!(files, f);
-        assert!(validate_resource("samples/sample-1.gamersample", &a).is_ok());
-        assert!(validate_resource("samples/other.gamersample", &a).is_err());
-    }
-    #[test]
-    fn tamper_and_false_completeness_are_rejected() {
-        let (mut m, mut f) = fixture();
-        f.get_mut("frames/end.png").unwrap().push(1);
-        assert!(validate_archive(&encode_archive(&m, &f).unwrap()).is_err());
-        let (_, f) = fixture();
-        m.goal.confirmed = false;
-        m.content_sha256 = fingerprint(&m).unwrap();
-        assert!(validate_archive(&encode_archive(&m, &f).unwrap()).is_err());
-    }
-    #[test]
-    fn unsafe_and_duplicate_zip_entries_are_rejected() {
-        for names in [
-            vec!["../outside"],
-            vec!["/outside"],
-            vec!["a\\b"],
-            vec!["manifest.json", "manifest.json"],
-        ] {
-            let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-            for n in names {
-                if z.start_file(n, zip::write::SimpleFileOptions::default())
-                    .is_ok()
-                {
-                    z.write_all(b"{}").unwrap();
-                }
-            }
-            let b = z.finish().unwrap().into_inner();
-            assert!(validate_archive(&b).is_err());
-        }
-    }
-    #[test]
-    fn exact_boundary_and_neighbor_windows_cannot_be_reassigned() {
-        let (mut m, mut files) = fixture();
-        m.start.frame_id = "end".into();
-        m.content_sha256 = fingerprint(&m).unwrap();
-        assert!(validate_manifest(&m, &files, true).is_err());
-        let (mut m, _) = fixture();
-        let template = m.frames[0].clone();
-        for t in [400, 600, 800] {
-            let mut f = template.clone();
-            f.id = format!("f{t}");
-            f.path = format!("frames/f{t}.png");
-            f.pts_us = t;
-            f.timeline_us = t;
-            f.frame_index = t as u32;
-            files.insert(f.path.clone(), png());
-            m.frames.push(f);
-        }
-        m.frames.sort_by_key(|f| f.timeline_us);
-        m.files = files
-            .iter()
-            .map(|(p, b)| SampleFile {
-                path: p.clone(),
-                sha256: hash(b),
-                size: b.len() as u64,
-            })
-            .collect();
-        let event = |id: &str, t| InputEventRecord {
-            schema_version: 1,
-            event_id: id.into(),
-            operation_id: format!("op-{id}"),
-            session_id: "r1".into(),
-            source: "manual".into(),
-            kind: "tap".into(),
-            timeline_us: t,
-            time_domain: "recording".into(),
-            coordinate_space: "device-display".into(),
-            display_size: crate::recording::DisplaySize {
-                width: 8,
-                height: 8,
-            },
-            payload: json!({"x":1,"y":1,"duration_us":10}),
-            status: "accepted".into(),
-        };
-        m.actions = vec![event("a1", 300), event("a2", 700)];
-        m.windows = vec![
-            Window {
-                event_id: "a1".into(),
-                before_frame_ids: vec!["start".into()],
-                after_frame_ids: vec!["f400".into(), "f600".into()],
-            },
-            Window {
-                event_id: "a2".into(),
-                before_frame_ids: vec!["f600".into()],
-                after_frame_ids: vec!["f800".into(), "end".into()],
-            },
-        ];
-        m.content_sha256 = fingerprint(&m).unwrap();
-        validate_manifest(&m, &files, true).unwrap();
-        m.windows[0].after_frame_ids = vec!["f800".into(), "end".into()];
-        m.content_sha256 = fingerprint(&m).unwrap();
-        assert!(validate_manifest(&m, &files, true).is_err());
-    }
-    #[test]
-    fn inline_bundle_allows_only_omitted_optional_clips() {
-        let (mut m, files) = fixture();
-        let path = "clips/original.mp4".to_string();
-        let sha = hash(b"clip");
-        m.segments[0].clip_path = Some(path.clone());
-        m.segments[0].clip_sha256 = Some(sha.clone());
-        m.files.push(SampleFile {
-            path,
-            sha256: sha,
-            size: 4,
-        });
-        m.content_sha256 = fingerprint(&m).unwrap();
-        validate_bundle(&serde_json::to_value(&m).unwrap(), &files).unwrap();
-        assert!(validate_manifest(&m, &files, true).is_err());
-        let mut missing = files;
-        missing.remove("frames/end.png");
-        assert!(validate_bundle(&serde_json::to_value(&m).unwrap(), &missing).is_err());
-    }
-
-    #[test]
-    fn collinear_overshoot_and_reverse_gestures_remain_unsupported() {
-        let coordinates = Coordinates {
-            space: "device-display".into(),
-            width: 200,
-            height: 200,
-            rotation: 0,
-        };
-        let mut event = InputEventRecord {
-            schema_version: 1,
-            event_id: "e".into(),
-            operation_id: "op".into(),
-            session_id: "r".into(),
-            source: "manual".into(),
-            kind: "swipe".into(),
-            timeline_us: 0,
-            time_domain: "recording".into(),
-            coordinate_space: "device-display".into(),
-            display_size: crate::recording::DisplaySize {
-                width: 200,
-                height: 200,
-            },
-            payload: json!({"x":10,"y":10,"x2":100,"y2":10,"duration_us":1000,"points":[[0,10,10],[500,50,10],[1000,100,10]]}),
-            status: "accepted".into(),
-        };
-        assert!(unsupported_action(&event, &coordinates).is_none());
-        event.payload["x2"] = json!(20);
-        event.payload["points"] = json!([[0, 10, 10], [500, 100, 10], [1000, 20, 10]]);
-        assert!(unsupported_action(&event, &coordinates).is_some());
-        event.payload["x2"] = json!(100);
-        event.payload["points"] =
-            json!([[0, 10, 10], [300, 80, 10], [600, 30, 10], [1000, 100, 10]]);
-        assert!(unsupported_action(&event, &coordinates).is_some());
-    }
-    #[test]
-    fn inline_frame_bytes_must_be_in_the_canonical_file_index() {
-        let (mut m, files) = fixture();
-        for (i, file) in m.files.iter_mut().enumerate() {
-            file.path = format!("clips/{i}.mp4");
-            let mut seg = m.segments[0].clone();
-            seg.media_id = if i == 0 {
-                "a".repeat(32)
-            } else {
-                "b".repeat(32)
-            };
-            seg.clip_path = Some(file.path.clone());
-            seg.clip_sha256 = Some(file.sha256.clone());
-            if i == 0 {
-                m.segments[0] = seg;
-            } else {
-                m.segments.push(seg);
-            }
-        }
-        m.content_sha256 = fingerprint(&m).unwrap();
-        assert!(validate_bundle(&serde_json::to_value(&m).unwrap(), &files)
-            .unwrap_err()
-            .to_string()
-            .contains("file index"));
-    }
-
-    #[test]
-    fn resource_handler_rejects_text_uploads_and_identity_renames() {
-        use crate::resources::ResourceHandler;
+    fn sparse_long_material_import_read_export_needs_no_video_or_package() {
+        let (manifest, files) = fixture();
+        let archive = encode_archive(&manifest, &files).unwrap();
         let root = tempfile::tempdir().unwrap();
-        let store = PackageStore::open(&crate::config::Config {
-            data_dir: root.path().into(),
-            ..Default::default()
-        })
-        .unwrap();
-        let handler = super::super::project::VideoProjectResourceHandler;
-        assert_eq!(
-            handler.max_upload_bytes("samples/ok.gamersample"),
-            MAX_ARCHIVE_BYTES
-        );
-        assert_eq!(
-            handler.max_upload_bytes("projects/ok.json"),
-            16 * 1024 * 1024
-        );
-        assert!(handler
-            .validate_save(crate::resources::SaveValidation {
-                package: "p",
-                plugin: super::super::VIDEO_EXTENSION_ID,
-                path: "samples/ok.gamersample",
-                content: "{}",
-                store: &store
-            })
-            .is_err());
-        assert!(handler
-            .before_rename(
-                &store,
-                "p",
-                super::super::VIDEO_EXTENSION_ID,
-                "samples/ok.gamersample",
-                "samples/changed.gamersample"
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn sparse_pngs_require_supplied_original_clip_evidence() {
-        let (mut m, mut files) = fixture();
-        m.end.timeline_us = 1_000_000;
-        m.frames[1].timeline_us = 1_000_000;
-        m.frames[1].pts_us = 1_000_000;
-        m.segments[0].duration_us = 1_000_000;
-        let path = "clips/original.mp4".to_string();
-        let bytes = b"opaque clip bytes; decoded coverage is validated by replay".to_vec();
-        let sha = hash(&bytes);
-        m.segments[0].clip_path = Some(path.clone());
-        m.segments[0].clip_sha256 = Some(sha.clone());
-        m.files.push(SampleFile {
-            path: path.clone(),
-            sha256: sha,
-            size: bytes.len() as u64,
-        });
-        m.content_sha256 = fingerprint(&m).unwrap();
-        assert!(validate_bundle(&serde_json::to_value(&m).unwrap(), &files).is_err());
-        files.insert(path.clone(), bytes);
-        validate_bundle(&serde_json::to_value(&m).unwrap(), &files).unwrap();
-        let archive = encode_archive(&m, &files).unwrap();
-        let bundle = read_bundle(&archive).unwrap();
-        assert!(bundle["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|file| file["path"] == path));
-    }
-
-    #[test]
-    fn raw_zip_duplicates_and_symlinks_are_rejected_before_indexing() {
-        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        for name in ["manifest.json", "same-a", "same-b"] {
-            z.start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            z.write_all(b"{}").unwrap();
-        }
-        let mut bytes = z.finish().unwrap().into_inner();
-        for i in 0..bytes.len() - 6 {
-            if &bytes[i..i + 6] == b"same-b" {
-                bytes[i + 5] = b'a';
-            }
-        }
-        assert!(validate_archive(&bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate"));
-        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        z.start_file("manifest.json", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        z.write_all(b"{}").unwrap();
-        z.add_symlink(
-            "frames/link",
-            "../../outside",
-            zip::write::SimpleFileOptions::default(),
+        let imported = dispatch(
+            "sample.import",
+            &json!({"base64":base64::engine::general_purpose::STANDARD.encode(&archive)}),
+            root.path(),
         )
         .unwrap();
-        assert!(validate_archive(&z.finish().unwrap().into_inner())
-            .unwrap_err()
-            .to_string()
-            .contains("symlink"));
+        assert_eq!(imported["manifest"]["status"], "complete");
+        let read = dispatch(
+            "sample.read",
+            &json!({"sample_id":manifest.id}),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(read["files"].as_array().unwrap().len(), 2);
+        assert!(!root.path().join("media").exists());
+        assert!(!root.path().join("packages").exists());
+        let exported = dispatch(
+            "sample.export",
+            &json!({"sample_id":manifest.id}),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(exported["base64"].as_str().unwrap())
+                .unwrap(),
+            archive
+        );
     }
     #[test]
-    fn mismatched_disk_entry_counts_are_rejected() {
-        let (m, f) = fixture();
-        let mut bytes = encode_archive(&m, &f).unwrap();
-        let end = bytes.len() - 22;
-        bytes[end + 10..end + 12].copy_from_slice(&1u16.to_le_bytes());
-        assert!(validate_archive(&bytes)
+    fn modified_png_and_video_payload_are_rejected() {
+        let (mut manifest, mut files) = fixture();
+        files.values_mut().next().unwrap().push(0);
+        assert!(validate_manifest(&manifest, &files)
             .unwrap_err()
             .to_string()
-            .contains("count"));
+            .contains("hash/size"));
+        let (original, original_files) = fixture();
+        manifest = original;
+        files = original_files;
+        files.insert("clips/video.mp4".into(), vec![1]);
+        manifest.files.push(SampleFile {
+            path: "clips/video.mp4".into(),
+            size: 1,
+            sha256: hash(&[1]),
+        });
+        manifest.content_sha256 = fingerprint(&manifest).unwrap();
+        assert!(validate_manifest(&manifest, &files)
+            .unwrap_err()
+            .to_string()
+            .contains("PNG"));
     }
-
     #[test]
-    fn fingerprint_covers_action_goal_and_file_evidence() {
-        let (m, _) = fixture();
-        let mut changed = m.clone();
-        changed.goal.description = "different".into();
-        assert_ne!(fingerprint(&m).unwrap(), fingerprint(&changed).unwrap());
-        changed = m.clone();
-        changed.frames[1].timeline_us = 999;
-        assert_ne!(fingerprint(&m).unwrap(), fingerprint(&changed).unwrap());
+    fn zip_traversal_and_duplicate_entries_rejected_before_read() {
+        for names in [
+            ["../outside", "manifest.json"],
+            ["manifest.json", "manifest.jsom"],
+        ] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(vec![]));
+            for name in names {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"{}").unwrap();
+            }
+            let mut archive = zip.finish().unwrap().into_inner();
+            for offset in 0..archive.len().saturating_sub(12) {
+                if &archive[offset..offset + 13] == b"manifest.jsom" {
+                    archive[offset + 12] = b'n';
+                }
+            }
+            assert!(validate_archive(&archive).is_err());
+        }
     }
 }

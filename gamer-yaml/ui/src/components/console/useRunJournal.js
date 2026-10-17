@@ -6,29 +6,40 @@ import { api } from '../../../../../../web/src/api'
 const selections = reactive(new Map())
 const observedLiveRuns = new Map()
 const HISTORY_PAGE_SIZE = 30
-export function useRunJournal(device, liveRun, visible = ref(true)) {
+export function useRunJournal(device, liveRun, visible = ref(true), taskId = ref('')) {
   const records = ref([]), events = ref([]), error = ref(''), loading = ref(false), hasMore = ref(false)
   const hasOlder = ref(false), olderLoading = ref(false)
-  const selected = computed({ get: () => selections.get(device.value) || '', set: id => { if (device.value) selections.set(device.value, id) } })
+  // Task history owns its selection. Opening it starts at the latest task run
+  // without changing the script/function panels' device-wide selection.
+  const taskSelection = ref('')
+  const selected = computed({
+    get: () => taskId.value ? taskSelection.value : selections.get(device.value) || '',
+    set: id => { if (taskId.value) taskSelection.value = id; else if (device.value) selections.set(device.value, id) },
+  })
   const record = computed(() => records.value.find(r => r.run_id === selected.value))
   let scope = 0, generation = 0, cursor = 0, inFlight = null, ticks = 0, historyInFlight = null, olderCursor = null
   function mergeRecords(list) {
+    if (taskId.value) list = list.filter(record => record.task_id === taskId.value)
     records.value = [...new Map([...records.value, ...list].map(r => [r.run_id, r])).values()]
       .sort((a, b) => b.started_at.localeCompare(a.started_at) || b.run_id.localeCompare(a.run_id))
   }
+  function fetchHistory(before) {
+    if (taskId.value) return api.listRunHistory(undefined, undefined, before, taskId.value)
+    return before ? api.listRunHistory(device.value, undefined, before) : api.listRunHistory(device.value)
+  }
   async function history() {
     const token = scope
-    if (!device.value || historyInFlight === token) return
+    if ((!device.value && !taskId.value) || historyInFlight === token) return
     historyInFlight = token
     try {
-      const list = await api.listRunHistory(device.value)
+      const list = await fetchHistory()
       if (token !== scope) return
       mergeRecords(list)
       if (olderCursor === null) {
         olderCursor = list.at(-1)?.run_id || null
         hasOlder.value = list.length === HISTORY_PAGE_SIZE
       }
-      if (!selected.value) selected.value = list[0]?.run_id || ''
+      if (!selected.value) selected.value = records.value[0]?.run_id || ''
     } catch (e) { if (token === scope) error.value = `读取运行历史失败：${e.message}` }
     finally { if (token === scope) historyInFlight = null }
   }
@@ -37,7 +48,7 @@ export function useRunJournal(device, liveRun, visible = ref(true)) {
     const token = scope
     olderLoading.value = true
     try {
-      const list = await api.listRunHistory(device.value, undefined, olderCursor)
+      const list = await fetchHistory(olderCursor)
       if (token !== scope) return
       mergeRecords(list)
       olderCursor = list.at(-1)?.run_id || olderCursor
@@ -52,6 +63,7 @@ export function useRunJournal(device, liveRun, visible = ref(true)) {
     try {
       const current = await api.getRun(id)
       if (token !== generation) return
+      if (taskId.value && current.task_id !== taskId.value) throw new Error('该运行不属于当前任务，请重新选择记录')
       mergeRecords([current])
       for (let page = 0; page < 4; page++) {
         const result = await api.getRunEvents(id, cursor)
@@ -64,18 +76,19 @@ export function useRunJournal(device, liveRun, visible = ref(true)) {
     } catch (e) { if (token === generation) error.value = `读取运行详情失败：${e.message}` }
     finally { if (token === generation) { loading.value = false; inFlight = null } }
   }
-  watch(device, () => {
+  watch([device, taskId], () => {
     scope++; generation++; records.value = []; events.value = []; error.value = ''; loading.value = false
+    taskSelection.value = ''
     cursor = 0; hasMore.value = false; hasOlder.value = false; olderLoading.value = false; olderCursor = null
     history()
   }, { immediate: true, flush: 'sync' })
-  watch([device, selected], () => {
+  watch([device, taskId, selected], () => {
     generation++; cursor = 0; events.value = []; hasMore.value = false; error.value = ''; loading.value = false
     refresh()
   }, { immediate: true, flush: 'sync' })
   watch([device, liveRun], ([deviceId, id]) => {
     // Reopening a panel must not take selection away from an older run being inspected.
-    if (deviceId && id && observedLiveRuns.get(deviceId) !== id) {
+    if (!taskId.value && deviceId && id && observedLiveRuns.get(deviceId) !== id) {
       observedLiveRuns.set(deviceId, id); selected.value = id; history()
     }
   }, { immediate: true })

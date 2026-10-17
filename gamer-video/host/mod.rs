@@ -18,11 +18,8 @@
 //! 脚本生成与验证由自动化插件承担，本插件只提供自包含证据素材公开契约。媒体/录制能力由 Core 进程级服务
 //! （`crate::media` / `crate::recording`）承载，插件不直接持有句柄。
 //!
-//! 制作业务（Phase 6）：Video Project（项目/标记/校准）归本扩展所有——
-//! schema 与保存期校验在 [`project`]，数据存 Package 资源
-//! `plugins/gamer-video/projects/<id>.json`（Core 只寻址不解释）。
+//! 视频和演示素材独立于 Package，数据由本插件保存于 plugin-data/gamer-video/samples。
 
-pub(crate) mod project;
 pub(crate) mod sample;
 
 /// builtin 扩展 id（唯一归属本模块；无 guest、无 Runner、无 start 参数）。
@@ -62,7 +59,7 @@ mod tests {
     fn video_manifest_parses_with_builtin_execution_and_core_panel() {
         let manifest = parse_manifest(VIDEO_EXTENSION_MANIFEST_TOML.as_bytes()).unwrap();
         assert_eq!(manifest.id().as_str(), super::VIDEO_EXTENSION_ID);
-        assert_eq!(manifest.version().as_str(), "0.2.0");
+        assert_eq!(manifest.version().as_str(), "0.2.6");
         // manifest v2 + builtin 执行类型：无 entry、builtin_id 已注册。
         assert_eq!(manifest.execution().kind(), ExecutionKind::Builtin);
         assert_eq!(
@@ -123,6 +120,7 @@ mod tests {
             // 真实 builtin 包：只有 manifest，没有 plugin.wasm。
             writer.start_file("ui/plugin.js", options).unwrap();
             writer.write_all(b"export const sdkVersion = 1;").unwrap();
+            super::external_schemas::append_schemas(&mut writer);
             writer.finish().unwrap();
         }
         let installed = service.install(&archive).await.unwrap();
@@ -151,3 +149,6 @@ mod tests {
         assert!(service.ui_contributions().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod external_schemas;

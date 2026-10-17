@@ -85,7 +85,7 @@ pub(crate) fn script_entry(
 // ---------------------------------------------------------------------------
 
 /// V1 脚本校验：结构解析（顶层字段、步骤形态、表达式形态）。旧 v3 源因
-/// `version` 字段/未知顶层字段直接被拒（`yaml.version.removed`）。
+/// `version` 字段/未知顶层字段直接被拒（`yaml.top.unknown`）。
 fn type_library(
     store: &PackageStore,
     package: &str,
@@ -98,8 +98,8 @@ fn type_library(
         )?;
     Ok(files
         .iter()
-        .filter(|file| file.path != exclude && is_function_library_path(&file.path))
-        .filter_map(|file| syntax::parse_function_library(file.content.as_deref()?).ok())
+        .filter(|file| file.path != exclude && file.path.ends_with(".yaml"))
+        .filter_map(|file| syntax::callable_source(&file.path, file.content.as_deref()?).ok())
         .flatten()
         .collect())
 }
@@ -318,7 +318,7 @@ struct YamlResourceHandler {
 impl ResourceHandler for YamlResourceHandler {
     fn after_package_delete(&self, package: &str) -> anyhow::Result<()> {
         crate::resources::validate_scope_id("package id", package)?;
-        for area in ["candidates", "revisions"] {
+        for area in ["candidates", "revisions", "authoring"] {
             let path = self
                 .data_root
                 .join("extension-data/gamer-yaml")
@@ -599,7 +599,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/main.yaml",
-                "version: 2\nrun:\n  - find:\n      template: old.png\n      region: [0, 0, 1, 1]\n    as: hit\n  - log: old.png 文本不应改\n",
+                "run:\n  - find:\n      template: old.png\n      region: [0, 0, 1, 1]\n    as: hit\n  - log: old.png 文本不应改\n",
                 None,
                 false,
             )
@@ -609,7 +609,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "version: 2\nfunctions:\n  login:\n    run:\n      - wait_find: old.png\n",
+                "functions:\n  login:\n    run:\n      - wait_find: old.png\n",
                 None,
                 false,
             )
@@ -665,14 +665,44 @@ mod rename_tests {
         assert!(legacy.contains("old.png"), "不可解析的存量源保持原样");
     }
 
-    /// 保存边界：V1 直存；旧 v3 源报 yaml.version.unsupported；automations/ 内
+    /// 保存边界：V1 直存；旧 v3 源报 yaml.top.unknown；automations/ 内
     /// `_function*.yaml` 按函数库（functions: 包装）校验；旧 functions/ 目录
     /// 显式拒绝。
+    #[test]
+    fn saves_allow_hover_on_observed_template_and_reject_invalid_point_reference() {
+        let (store, _dir) = temp_store("hover-reference-types");
+        let path = "automations/live.yaml";
+        let good =
+            "targets:\n  more: {template: more.png}\nrun:\n  - wait: more\n  - hover: $more\n";
+        store
+            .validate_save(SaveValidation {
+                package: "com.test.app",
+                plugin: YAML_EXTENSION_ID,
+                path,
+                content: good,
+                store: &store,
+            })
+            .unwrap();
+        let bad = good.replace("hover: $more", "hover: {position: false}");
+        assert!(
+            store
+                .validate_save(SaveValidation {
+                    package: "com.test.app",
+                    plugin: YAML_EXTENSION_ID,
+                    path,
+                    content: &bad,
+                    store: &store,
+                })
+                .is_err(),
+            "hover still requires a coordinate or observed match"
+        );
+    }
+
     #[test]
     fn saves_check_reference_types_and_preserve_existing_content_on_error() {
         let (store, _dir) = temp_store("reference-types");
         let path = "automations/_function.yaml";
-        let good = "version: 2\nfunctions:\n  daily:\n    run:\n      - match_templates:\n          cases:\n            - template: reward.png\n              as: hit\n              do:\n                - tap: $hit\n";
+        let good = "functions:\n  daily:\n    run:\n      - match_templates:\n          cases:\n            - template: reward.png\n              as: hit\n              do:\n                - tap: $hit\n";
         let original = store
             .write_text("com.test.app", YAML_EXTENSION_ID, path, good, None, false)
             .unwrap();
@@ -707,7 +737,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "automations/daily.yaml",
-                content: "version: 2\nrun:\n  - log: ok\n",
+                content: "run:\n  - log: ok\n",
                 store: &store,
             })
             .expect("V1 脚本必须通过");
@@ -720,7 +750,7 @@ mod rename_tests {
                 store: &store,
             })
             .unwrap_err();
-        assert_eq!(err[0]["code"], "yaml.version.unsupported");
+        assert_eq!(err[0]["code"], "yaml.top.unknown");
 
         // _function 前缀 → 函数库校验（必须有 functions: 包装）
         let err = store
@@ -728,7 +758,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "automations/_function.yaml",
-                content: "version: 2\ngreet:\n  run: []\n",
+                content: "greet:\n  run: []\n",
                 store: &store,
             })
             .unwrap_err();
@@ -740,7 +770,7 @@ mod rename_tests {
                 package: "com.test.app",
                 plugin: YAML_EXTENSION_ID,
                 path: "functions/lib.yaml",
-                content: "version: 2\nfunctions:\n  greet:\n    run: []\n",
+                content: "functions:\n  greet:\n    run: []\n",
                 store: &store,
             })
             .unwrap_err();
@@ -752,7 +782,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/_function.yaml",
-                "version: 2\nfunctions:\n  greet:\n    run:\n      - return: true\n",
+                "functions:\n  greet:\n    run:\n      - return: true\n",
                 None,
                 false,
             )
@@ -772,7 +802,7 @@ mod rename_tests {
                 "com.test.app",
                 YAML_EXTENSION_ID,
                 "automations/daily.yaml",
-                "version: 2\nrun:\n  - log: ok\n",
+                "run:\n  - log: ok\n",
                 None,
                 false,
             )

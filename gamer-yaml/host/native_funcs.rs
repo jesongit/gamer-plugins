@@ -125,9 +125,22 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 name: "fail",
                 display_name: "明确失败",
                 description: "立即失败并记录原因",
-                params: vec![p("message", ParamType::String, true, None, "失败原因")],
+                params: vec![p("message", ParamType::String, true, None, "失败原因"),
+                    p("code", ParamType::String, false, None, "稳定错误码"),
+                    p("stage", ParamType::String, false, None, "失败阶段"),
+                    p("expected", ParamType::Any, false, None, "预期状态"),
+                    p("actual", ParamType::Any, false, None, "实际状态"),
+                    p("retryable", ParamType::Boolean, false, Some(json!(false)), "是否可通过环境恢复重试")],
                 returns: RETURN_NULL,
                 permissions: &[],
+            },
+            NativeFunction {
+                name: "hover",
+                display_name: "鼠标悬浮",
+                description: "浏览器移到指定位置而不点击，复用输入屏障与截图校验；Android 不支持",
+                params: vec![p("position", ParamType::Point, true, None, "坐标或匹配结果")],
+                returns: RETURN_NULL,
+                permissions: &[Permission::InputTap],
             },
             NativeFunction {
                 name: "tap",
@@ -156,6 +169,29 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                         false,
                         Some(json!("300ms")),
                         "滑动时长",
+                    ),
+                ],
+                returns: RETURN_NULL,
+                permissions: &[Permission::InputSwipe],
+            },
+            NativeFunction {
+                name: "press",
+                display_name: "长按",
+                description: "在新鲜匹配位置按住后释放；位置不移动，用于录制中的长按控件",
+                params: vec![
+                    p(
+                        "position",
+                        ParamType::Point,
+                        true,
+                        None,
+                        "匹配结果或相对坐标",
+                    ),
+                    p(
+                        "duration",
+                        ParamType::Duration,
+                        false,
+                        Some(json!("800ms")),
+                        "按住时长 200ms..3s",
                     ),
                 ],
                 returns: RETURN_NULL,
@@ -217,6 +253,14 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                     None,
                     "Android 包名，缺省用设备配置",
                 )],
+                returns: RETURN_NULL,
+                permissions: &[Permission::DeviceApp],
+            },
+            NativeFunction {
+                name: "reset_input",
+                display_name: "重置输入入口",
+                description: "浏览器刷新当前绑定网页，Android 冷启动当前配置 App；清理按住状态并使旧截图失效，随后仍须等待并识别入口画面",
+                params: vec![],
                 returns: RETURN_NULL,
                 permissions: &[Permission::DeviceApp],
             },
@@ -298,6 +342,13 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                         Some(json!(0.8)),
                         "匹配阈值 0..1",
                     ),
+                    p(
+                        "region",
+                        ParamType::List,
+                        false,
+                        None,
+                        "所有模板共用的搜索区域 [x, y, w, h]（相对坐标）；缺省沿用各模板文件名区域",
+                    ),
                 ],
                 returns: RETURN_MATCH,
                 permissions: &[Permission::VisionMatch, Permission::ResourceRead],
@@ -308,6 +359,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 description: "等待模板出现，默认仅观察（click: true 才点击）；超时返回 null",
                 params: vec![
                     p("template", ParamType::Template, true, None, "模板短名"),
+                    p("forever", ParamType::Boolean, false, Some(json!(false)), "持续等待直到命中或取消；忽略 timeout，设备和模板错误仍立即失败"),
                     ParamSchema {
                         item_type: Some(ParamType::Template),
                         ..p(
@@ -507,7 +559,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
         functions.push(NativeFunction {
             name: "notify",
             display_name: "发送通知",
-            description: "提交通知后继续运行；通知插件不可用时跳过并返回原因",
+            description: "即时发送或登记当前脚本/函数结束时的通知；通知插件不可用时跳过并返回原因",
             params: vec![
                 p("content", ParamType::String, true, None, "通知正文"),
                 p(
@@ -524,9 +576,48 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                     Some(json!("")),
                     "全局通道 ID；留空使用默认通道",
                 ),
+                p(
+                    "when",
+                    ParamType::String,
+                    false,
+                    Some(json!("immediate")),
+                    "immediate 立即发送；success/failure 在当前脚本或函数结束时发送",
+                ),
+                p(
+                    "enabled",
+                    ParamType::Boolean,
+                    false,
+                    Some(json!(true)),
+                    "是否发送此通知；关闭的结果通知仍覆盖全局默认规则",
+                ),
             ],
             returns: "object",
             permissions: &[],
+        });
+        functions.push(NativeFunction {
+            name: "switch_live_device",
+            display_name: "切换直播输出设备",
+            description: "切换已启动直播助手的画面来源，保持输出地址和参数；省略设备时使用当前脚本目标，支持 Android 和浏览器",
+            params: vec![
+                p("device_id", ParamType::String, false, Some(json!("")), "目标设备 ID；留空使用当前脚本运行目标"),
+                p("timeout", ParamType::Duration, false, Some(json!("10s")), "等待新设备画面并切换的上限"),
+            ],
+            returns: "object",
+            permissions: &[Permission::MediaStream],
+        });
+        functions.push(NativeFunction {
+            name: "wait_live_confirmation",
+            display_name: "等待直播观众确认",
+            description: "登录就绪后等待当前队列任务触发者确认或取消；返回 status 为 confirmed、cancelled 或 timeout，停止时中断",
+            params: vec![p(
+                "timeout",
+                ParamType::Duration,
+                false,
+                Some(json!("5m")),
+                "确认等待上限，1ms..5m，向上取整到秒；不能延长队列规则冻结的期限",
+            )],
+            returns: "object",
+            permissions: &[Permission::RuntimeSleep],
         });
         functions.push(NativeFunction {
             name: "ocr",
@@ -536,6 +627,35 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             params: ocr_params(),
             returns: "object",
             permissions: &[Permission::DeviceRead, Permission::VisionOcr],
+        });
+        functions.push(NativeFunction {
+            name: "number",
+            display_name: "提取整数",
+            description: "从 OCR 文字按顺序提取非负整数；没有数字明确失败，不把识别失败当成零",
+            params: vec![
+                p("text", ParamType::String, true, None, "小区域 OCR 的 text"),
+                p(
+                    "index",
+                    ParamType::Integer,
+                    false,
+                    Some(json!(0)),
+                    "从零开始的数字序号，例如 60/300 的体力为 0",
+                ),
+                p(
+                    "format",
+                    ParamType::String,
+                    false,
+                    Some(json!("tokens")),
+                    "tokens 按顺序提取；fraction 严格要求完整整数/整数，index 0 为分子、1 为分母，缺项或零分母明确失败",
+                ),
+            ],
+            returns: "integer",
+            permissions: &[],
+        });
+        functions.push(NativeFunction {
+            name: "calculate", display_name: "数值计算", description: "纯数值运算：add/sub/mul/div/floor_div/min/max；可计算剩余体力可刷次数，不引入表达式语法",
+            params: vec![p("op", ParamType::String, true, None, "运算名"), p("a", ParamType::Number, true, None, "左值"), p("b", ParamType::Number, true, None, "右值")],
+            returns: "number", permissions: &[],
         });
         let mut text_params = vec![
             p("text", ParamType::String, true, None, "要查找的文字"),
@@ -564,7 +684,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             returns: "match?",
             permissions: &[Permission::DeviceRead, Permission::VisionOcr],
         });
-        for name in ["observe", "finish"] {
+        for name in ["observe", "finish", "checkpoint"] {
             functions.push(NativeFunction {
                 name,
                 display_name: if name == "finish" {
@@ -613,6 +733,16 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 ],
             });
         }
+        let checkpoint = functions
+            .iter_mut()
+            .find(|f| f.name == "checkpoint")
+            .unwrap();
+        checkpoint.display_name = "验证任务完成项";
+        checkpoint.description =
+            "实际观察到模板后记录完成项；只读，未观察到模板明确失败，不要求统一结束标记";
+        checkpoint
+            .params
+            .push(p("id", ParamType::String, true, None, "稳定完成项 ID"));
         for func in &mut functions {
             func.params.push(p(
                 "name",
@@ -647,7 +777,7 @@ pub fn native_schema_json(func: &NativeFunction) -> Value {
         "name": func.name,
         "description": func.description,
         "source": "plugin",
-        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "ocr" | "find_text" => Some("gamer-ocr"), _ => None },
+        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "ocr" | "find_text" => Some("gamer-ocr"), "switch_live_device" | "wait_live_confirmation" => Some("gamer-live"), _ => None },
         "params": func.params.iter().map(|param| {
             let mut schema = json!({
             "name": param.name,
@@ -670,7 +800,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_functions_have_display_names_and_ten_second_timeouts() {
+    fn all_functions_have_display_names_and_declared_timeouts() {
         let mut timeouts = 0;
         for function in native_functions() {
             let names: Vec<_> = function
@@ -682,12 +812,19 @@ mod tests {
             assert_eq!(names[0].default, Some(json!(function.display_name)));
             assert_eq!(names[0].ty, ParamType::String);
             assert!(!names[0].required);
-            assert_ne!(function.params[0].name, "name", "位置简写不能变");
+            if function.params.len() > 1 {
+                assert_ne!(function.params[0].name, "name", "位置简写不能变");
+            }
             for param in function.params.iter().filter(|p| p.name == "timeout") {
-                assert_eq!(param.default, Some(json!("10s")), "{}", function.name);
+                let expected = if function.name == "wait_live_confirmation" {
+                    "5m"
+                } else {
+                    "10s"
+                };
+                assert_eq!(param.default, Some(json!(expected)), "{}", function.name);
                 timeouts += 1;
             }
         }
-        assert_eq!(timeouts, 7);
+        assert_eq!(timeouts, 10);
     }
 }

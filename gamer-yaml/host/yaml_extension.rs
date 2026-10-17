@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Map as JsonMap, Value};
 
@@ -32,7 +32,12 @@ use crate::extensions::gamer_yaml::native_funcs::{native_function, ParamSchema};
 use crate::extensions::gamer_yaml::syntax::{parse_duration_ms, point_components, ParamType};
 use crate::extensions::{HostApi, Permission};
 
+mod numeric;
 mod ocr;
+
+#[cfg(test)]
+#[path = "browser_cleanup_tests.rs"]
+mod browser_cleanup_tests;
 
 pub(crate) const YAML_EXTENSION_ID: &str = "gamer-yaml";
 /// 运行结构事件私有通道（guest → sink，先于权限校验拦截）。
@@ -65,6 +70,7 @@ mod manifest_sync_tests {
 const MIN_POLL_INTERVAL_MS: u64 = 50;
 /// 单次 sleep 上限（与 v3 一致）。
 const MAX_SLEEP_MS: u64 = 3_600_000;
+const MAX_VISUAL_WAIT_MS: u64 = 7_200_000;
 
 // ---------------------------------------------------------------------------
 // WASM runtime 契约
@@ -73,8 +79,12 @@ const MAX_SLEEP_MS: u64 = 3_600_000;
 /// 一次 YAML 运行的请求：`program` 是宿主 lowering 产出的解释器 wire JSON
 /// （含冻结的 Package 函数表、绑定参数与可选 start_index）。
 pub(crate) struct YamlWasmRunRequest {
+    /// Host-only authority; never deserialize it from the wire program.
+    pub(crate) execution_policy: Option<crate::core::ExecutionPolicy>,
+    pub(crate) private_templates: Option<std::collections::BTreeMap<String, Vec<u8>>>,
     pub(crate) notification: Option<super::notification::Sender>,
     pub(crate) ocr: Option<super::ocr_bridge::Recognizer>,
+    pub(crate) live_switcher: Option<super::live_bridge::Switcher>,
     pub(crate) wasm: Vec<u8>,
     pub(crate) program: Value,
     pub(crate) host: HostApi,
@@ -122,6 +132,10 @@ impl YamlWasmRuntime for NoYamlWasmRuntime {
 /// 不能绕过插件权限（计划 Phase 3.2）。
 #[derive(Default)]
 pub(crate) struct YamlRunState {
+    pub(crate) result_notifications: super::notification::ResultNotifications,
+    pub(crate) required_checks: RwLock<std::collections::BTreeSet<String>>,
+    pub(crate) completed_checks: RwLock<std::collections::BTreeSet<String>>,
+    pub(crate) private_templates: RwLock<Option<std::collections::BTreeMap<String, Vec<u8>>>>,
     pub(crate) trace_enabled: AtomicBool,
     pub(crate) goal_verified: AtomicBool,
     pub(crate) enforce_template_versions: AtomicBool,
@@ -160,9 +174,11 @@ impl YamlRunState {
 }
 
 pub(crate) struct NativeYamlHost {
+    execution_policy: Option<crate::core::ExecutionPolicy>,
     pub(crate) run_state: Arc<YamlRunState>,
     notification: Option<super::notification::Sender>,
     ocr: Option<super::ocr_bridge::Recognizer>,
+    live_switcher: Option<super::live_bridge::Switcher>,
     settings: super::settings::Settings,
     host: HostApi,
     registry: CapabilityRegistry,
@@ -295,9 +311,14 @@ impl NativeYamlHost {
         settings: super::settings::Settings,
         notification: Option<super::notification::Sender>,
         ocr: Option<super::ocr_bridge::Recognizer>,
+        live_switcher: Option<super::live_bridge::Switcher>,
         run_state: Arc<YamlRunState>,
+        execution_policy: Option<crate::core::ExecutionPolicy>,
     ) -> Result<Value> {
         let (name, args_json) = function;
+        if let Some(policy) = &execution_policy {
+            super::private_trial::authorize_external_native(policy, name)?;
+        }
         let args: Value = serde_json::from_str(args_json)
             .map_err(|error| anyhow!("函数 {name} 参数不是合法 JSON: {error}"))?;
         let mut host = Self::new(host, context, stop, sink).await?;
@@ -305,6 +326,8 @@ impl NativeYamlHost {
         host.settings = settings;
         host.notification = notification;
         host.ocr = ocr;
+        host.live_switcher = live_switcher;
+        host.execution_policy = execution_policy;
         // 录制输入来源标注：guest 实例线程内执行点（task-local 不跨线程），
         // 在此线程内把 YAML runner 注入的输入标为 "runner"。
         crate::capabilities::adapters::with_caller_input_source("runner", async {
@@ -330,9 +353,11 @@ impl NativeYamlHost {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(Self {
+            execution_policy: None,
             run_state: Arc::new(YamlRunState::new()),
             notification: None,
             ocr: None,
+            live_switcher: None,
             settings: super::settings::Settings::default(),
             host,
             registry,
@@ -359,9 +384,19 @@ impl NativeYamlHost {
         self.ocr = ocr;
         self
     }
+    pub(crate) fn with_live_switcher(
+        mut self,
+        live_switcher: Option<super::live_bridge::Switcher>,
+    ) -> Self {
+        self.live_switcher = live_switcher;
+        self
+    }
 
     /// 函数派发：查注册表 → 权限 → Schema 绑定 → handler。
     pub(crate) async fn call_function(&self, name: &str, args: Value) -> Result<Value> {
+        if let Some(policy) = &self.execution_policy {
+            super::private_trial::authorize_external_native(policy, name)?;
+        }
         let args = super::settings::bind_timeout(name, args, self.settings.default_timeout_secs);
         let Some(func) = native_function(name) else {
             bail!("未知函数: {name}");
@@ -371,10 +406,10 @@ impl NativeYamlHost {
                 .authorize(*permission)
                 .map_err(anyhow::Error::new)?;
         }
-        // tap consumes a resolved match directly; its normalized center takes
+        // Point inputs consume a resolved match directly; its normalized center takes
         // precedence over the match's pixel-space bounding-box x/y.
         let mut args = args;
-        if name == "tap" {
+        if matches!(name, "tap" | "press" | "hover") {
             if let Some(position) = args.get_mut("position") {
                 if position.get("center").is_some() {
                     let center = position.get("center").unwrap();
@@ -400,12 +435,37 @@ impl NativeYamlHost {
         .await;
         if matches!(
             name,
-            "tap" | "swipe" | "key" | "input_text" | "launch" | "stop_app" | "tap_template"
+            "tap"
+                | "press"
+                | "swipe"
+                | "key"
+                | "input_text"
+                | "launch"
+                | "stop_app"
+                | "reset_input"
+                | "tap_template"
         ) {
             self.run_state.goal_verified.store(false, Ordering::Relaxed);
         }
         match name {
             "observe" | "finish" => self.observe(&bound, name == "finish").await,
+            "checkpoint" => {
+                let result = self.observe(&bound, false).await?;
+                if !result.is_null() {
+                    let id = bound.string("id")?;
+                    self.run_state
+                        .completed_checks
+                        .write()
+                        .unwrap()
+                        .insert(id.clone());
+                    self.emit_event(RuntimeEventKind::Detail {
+                        name: "checkpoint".into(),
+                        data: json!({"id":id,"verified":true,"template":bound.string("template")?}),
+                    })
+                    .await;
+                }
+                Ok(result)
+            }
             "trace" => {
                 let enabled = bound.values["enabled"].as_bool().expect("validated bool");
                 self.run_state
@@ -423,19 +483,66 @@ impl NativeYamlHost {
                 }
                 Ok(Value::Null)
             }
-            "fail" => bail!("GOAL_FAILED: {}", bound.string("message")?),
+            "fail" => {
+                let detail = json!({"code":bound.opt_string("code")?.unwrap_or_else(||"GOAL_FAILED".into()),
+                    "stage":bound.opt_string("stage")?,"expected":bound.values.get("expected"),
+                    "actual":bound.values.get("actual"),"retryable":bound.values["retryable"],"message":bound.string("message")?});
+                self.emit_event(RuntimeEventKind::Detail {
+                    name: "failure".into(),
+                    data: detail.clone(),
+                })
+                .await;
+                bail!("GOAL_FAILED: {detail}")
+            }
             "notify" => self.notify(&bound).await,
+            "switch_live_device" => self.switch_live_device(&bound).await,
+            "wait_live_confirmation" => self.wait_live_confirmation(&bound).await,
             "tap" => self.tap(&bound).await,
+            "hover" => self.hover(&bound).await,
             "swipe" => self.swipe(&bound).await,
+            "press" => {
+                let duration = bound.duration_ms("duration")?;
+                if !(200..=3000).contains(&duration) {
+                    bail!("press 时长必须为 200ms..3s");
+                }
+                let position = bound.values["position"].clone();
+                if position["_observed_at_ms"]
+                    .as_u64()
+                    .is_some_and(|at| self.runtime.now_ms().saturating_sub(at) > 5000)
+                {
+                    bail!("STALE_OBSERVATION: 长按目标超过 5 秒，须重新观察");
+                }
+                self.swipe(&BoundArgs {
+                    values: JsonMap::from_iter([
+                        ("from".into(), position.clone()),
+                        ("to".into(), position),
+                        ("duration".into(), json!(duration)),
+                    ]),
+                })
+                .await
+            }
             "key" => self.key(&bound).await,
             "input_text" => self.input_text(&bound).await,
             "launch" => self.launch(&bound).await,
             "stop_app" => self.stop_app(&bound).await,
+            "reset_input" => self.reset_input().await,
             "sleep" => self.sleep(&bound).await,
             "log" => self.log(&bound).await,
             "find" => self.find(&bound).await,
             "ocr" => self.ocr(&bound, false).await,
             "find_text" => self.ocr(&bound, true).await,
+            "number" => numeric::number(
+                &bound.string("text")?,
+                bound.values["index"]
+                    .as_u64()
+                    .context("number index 必须非负")?,
+                &bound.string("format")?,
+            ),
+            "calculate" => numeric::calculate(
+                &bound.string("op")?,
+                bound.number("a")?.context("缺少 a")?,
+                bound.number("b")?.context("缺少 b")?,
+            ),
             "find_any" => self.find_any(&bound).await,
             "wait_find" => self.wait_find(&bound).await,
             "tap_template" => self.tap_template(&bound).await,
@@ -507,6 +614,34 @@ impl NativeYamlHost {
     }
 
     // -- handlers ----------------------------------------------------------
+
+    async fn hover(&self, args: &BoundArgs) -> Result<Value> {
+        self.refresh_input_screen().await?;
+        let position = &args.values["position"];
+        ensure!(
+            !position["_observed_at_ms"].as_u64().is_some_and(|at| self
+                .runtime
+                .now_ms()
+                .saturating_sub(at)
+                > 5000),
+            "STALE_OBSERVATION: 悬浮目标超过 5 秒，须重新观察"
+        );
+        let stamp = match position.get("_frame") {
+            Some(stamp) => Some(serde_json::from_value(stamp.clone())?),
+            None => self.frame_stamp.read().unwrap().clone(),
+        };
+        self.registry
+            .input()
+            .ok_or_else(|| anyhow!("input capability 未注册"))?
+            .hover_from_frame(
+                &self.device,
+                self.touch_point(args.point("position")?)?,
+                stamp.as_ref(),
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(Value::Null)
+    }
 
     async fn tap(&self, args: &BoundArgs) -> Result<Value> {
         self.refresh_input_screen().await?;
@@ -689,6 +824,23 @@ impl NativeYamlHost {
         Ok(Value::Null)
     }
 
+    async fn reset_input(&self) -> Result<Value> {
+        let app = self
+            .context
+            .android_package
+            .as_ref()
+            .map(|name| AppId::new(name.as_str()));
+        self.registry
+            .device()
+            .ok_or_else(|| anyhow!("device capability 未注册"))?
+            .reset_input(&self.device, app.as_ref())
+            .await
+            .map_err(anyhow::Error::new)?;
+        *self.frame_stamp.write().unwrap() = None;
+        *self.observed_at_ms.write().unwrap() = None;
+        Ok(Value::Null)
+    }
+
     async fn sleep(&self, args: &BoundArgs) -> Result<Value> {
         let duration = args.duration_ms("duration")?.min(MAX_SLEEP_MS);
         // Keep one sleep request (including offline virtual-clock semantics),
@@ -716,7 +868,39 @@ impl NativeYamlHost {
                 crate::capabilities::CapabilityError::Cancelled,
             ));
         }
-        let values = json!({"content":args.string("content")?, "title":args.opt_string("title")?.unwrap_or_default(), "channel":args.opt_string("channel")?.filter(|s| !s.is_empty())});
+        let mut values = json!({"content":args.string("content")?, "title":args.opt_string("title")?.unwrap_or_default(), "channel":args.opt_string("channel")?.filter(|s| !s.is_empty()), "target_id": self.context.device_id.as_str()});
+        let when = args.string("when")?;
+        ensure!(
+            matches!(when.as_str(), "immediate" | "success" | "failure"),
+            "notify when 必须是 immediate/success/failure"
+        );
+        let enabled = args.values["enabled"].as_bool().expect("validated bool");
+        if when != "immediate" {
+            let trace = self.run_state.trace_context.read().unwrap().clone();
+            let frame = trace["frame_id"].as_u64().unwrap_or(0);
+            if let (Some(package), Some(path)) = (
+                trace["source"]["package_id"].as_str(),
+                trace["source"]["path"]
+                    .as_str()
+                    .and_then(|path| path.strip_prefix("automations/")),
+            ) {
+                values["result_scope"] =
+                    json!({"package_id":package,"entrypoint":format!("{package}/{path}")});
+            }
+            let result = self
+                .run_state
+                .result_notifications
+                .register(frame, &when, enabled, values);
+            self.emit_event(RuntimeEventKind::Detail {
+                name: "notification_policy".into(),
+                data: result.clone(),
+            })
+            .await;
+            return Ok(result);
+        }
+        if !enabled {
+            return Ok(super::notification::skipped("此通知已关闭"));
+        }
         let result = match &self.notification {
             Some(sender) => sender(values).await,
             None => super::notification::skipped("通知发送能力不可用"),
@@ -730,6 +914,102 @@ impl NativeYamlHost {
             let _ = self.log(&BoundArgs { values: serde_json::from_value(json!({"message":format!("通知未发送：{}", result["reason"].as_str().unwrap_or("能力不可用")), "level":"warn"}))? }).await;
         }
         Ok(result)
+    }
+    async fn switch_live_device(&self, args: &BoundArgs) -> Result<Value> {
+        ensure!(!self.runtime.cancelled(), "CANCELLED");
+        let switcher = self
+            .live_switcher
+            .as_ref()
+            .ok_or_else(|| anyhow!("LIVE_UNAVAILABLE: 请安装并启用直播助手"))?;
+        let timeout = args.duration_ms("timeout")?;
+        ensure!(
+            (1..=60_000).contains(&timeout),
+            "直播切换 timeout 必须在 1ms..60s"
+        );
+        let device = args
+            .opt_string("device_id")?
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| self.device.id().as_str().to_owned());
+        let operation = switcher("stream.switch", json!({"device_id":device}));
+        tokio::pin!(operation);
+        let deadline = tokio::time::sleep(Duration::from_millis(timeout));
+        tokio::pin!(deadline);
+        loop {
+            ensure!(!self.runtime.cancelled(), "CANCELLED");
+            tokio::select! {
+                result = &mut operation => return result,
+                _ = &mut deadline => bail!("LIVE_SWITCH_TIMEOUT: 等待直播输出切换超时"),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+
+    async fn live_confirmation_action(&self, action: &'static str, values: Value) -> Result<Value> {
+        ensure!(!self.runtime.cancelled(), "CANCELLED");
+        let bridge = self
+            .live_switcher
+            .as_ref()
+            .ok_or_else(|| anyhow!("LIVE_UNAVAILABLE: 请安装并启用直播助手"))?;
+        let operation = bridge(action, values);
+        tokio::pin!(operation);
+        // Only short requests hold an extension lifecycle read lease. Waiting
+        // for the viewer happens here, outside any live-plugin call/queue lock.
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            ensure!(!self.runtime.cancelled(), "CANCELLED");
+            tokio::select! {
+                result = &mut operation => {
+                    ensure!(!self.runtime.cancelled(), "CANCELLED");
+                    return result.map_err(|error| anyhow!("LIVE_CONFIRMATION_UNAVAILABLE: {error}"));
+                }
+                _ = &mut deadline => bail!("LIVE_CONFIRMATION_UNAVAILABLE: 直播确认状态读取超时"),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+
+    async fn wait_live_confirmation(&self, args: &BoundArgs) -> Result<Value> {
+        ensure!(!self.runtime.cancelled(), "CANCELLED");
+        let timeout_ms = args.duration_ms("timeout")?;
+        ensure!(
+            (1..=300_000).contains(&timeout_ms),
+            "直播确认 timeout 必须在 1ms..5m"
+        );
+        let timeout_secs = timeout_ms.div_ceil(1000);
+        let mut result = self
+            .live_confirmation_action("confirmation.begin", json!({"timeout_secs": timeout_secs}))
+            .await?;
+        // The queue owns and persists the actual deadline (possibly shorter
+        // than this request). Never manufacture a timeout decision locally.
+        let unavailable_at = tokio::time::Instant::now() + Duration::from_secs(timeout_secs + 2);
+        loop {
+            ensure!(!self.runtime.cancelled(), "CANCELLED");
+            match result["status"].as_str() {
+                Some(status @ ("confirmed" | "cancelled" | "timeout")) => {
+                    return Ok(json!({"status": status}));
+                }
+                Some("waiting" | "awaiting_confirmation") => {}
+                Some("disconnected") => bail!("LIVE_CONFIRMATION_DISCONNECTED: 直播互动连接已中断"),
+                _ => bail!("LIVE_CONFIRMATION_INVALID_STATE: 直播确认状态无效"),
+            }
+            ensure!(
+                tokio::time::Instant::now() < unavailable_at,
+                "LIVE_CONFIRMATION_UNAVAILABLE: 直播队列未按期限结束确认等待"
+            );
+            let next_poll = tokio::time::sleep(Duration::from_millis(250));
+            tokio::pin!(next_poll);
+            loop {
+                ensure!(!self.runtime.cancelled(), "CANCELLED");
+                tokio::select! {
+                    _ = &mut next_poll => break,
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            }
+            result = self
+                .live_confirmation_action("confirmation.poll", json!({}))
+                .await?;
+        }
     }
 
     async fn log(&self, args: &BoundArgs) -> Result<Value> {
@@ -773,8 +1053,8 @@ impl NativeYamlHost {
 
     async fn observe(&self, args: &BoundArgs, finish: bool) -> Result<Value> {
         let timeout = args.duration_ms("timeout")?;
-        if timeout > MAX_SLEEP_MS {
-            bail!("等待超出有限预算 3600000ms");
+        if timeout > MAX_VISUAL_WAIT_MS {
+            bail!("等待超出有限预算 7200000ms");
         }
         let threshold = args.number("threshold")?.unwrap_or(0.8);
         if !(0.0..=1.0).contains(&threshold) {
@@ -812,8 +1092,14 @@ impl NativeYamlHost {
                 .map_err(anyhow::Error::new)?;
         }
         let timeout = args.duration_ms("timeout")?;
-        if timeout > MAX_SLEEP_MS {
-            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        if !args
+            .values
+            .get("forever")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && timeout > MAX_VISUAL_WAIT_MS
+        {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 7200000ms");
         }
         let Some(matched) = self.poll_match(args, timeout, "wait_find").await? else {
             return Ok(Value::Null);
@@ -826,8 +1112,8 @@ impl NativeYamlHost {
 
     async fn tap_template(&self, args: &BoundArgs) -> Result<Value> {
         let timeout = args.duration_ms("timeout")?;
-        if timeout > MAX_SLEEP_MS {
-            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        if timeout > MAX_VISUAL_WAIT_MS {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 7200000ms");
         }
         let Some(matched) = self.poll_match(args, timeout, "tap_template").await? else {
             return Ok(Value::Null);
@@ -845,8 +1131,8 @@ impl NativeYamlHost {
 
     async fn wait_disappear(&self, args: &BoundArgs) -> Result<Value> {
         let timeout = args.duration_ms("timeout")?;
-        if timeout > MAX_SLEEP_MS {
-            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 3600000ms");
+        if timeout > MAX_VISUAL_WAIT_MS {
+            bail!("WAIT_BUDGET_EXCEEDED: timeout 超出 7200000ms");
         }
         let interval = args.duration_ms("interval")?.max(MIN_POLL_INTERVAL_MS);
         let started = self.runtime.now_ms();
@@ -1010,6 +1296,11 @@ impl NativeYamlHost {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let forever = args
+            .values
+            .get("forever")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         loop {
             if self.runtime.cancelled() {
                 bail!("CANCELLED");
@@ -1039,7 +1330,10 @@ impl NativeYamlHost {
                     cleared = true;
                     break;
                 }
-                if timeout_ms > 0 && self.runtime.now_ms().saturating_sub(started) >= timeout_ms {
+                if !forever
+                    && timeout_ms > 0
+                    && self.runtime.now_ms().saturating_sub(started) >= timeout_ms
+                {
                     return Ok(None);
                 }
                 if self.runtime.cancelled() {
@@ -1060,13 +1354,17 @@ impl NativeYamlHost {
             if let MatchOutcome::Found(_) = outcome {
                 return Ok(Some(self.match_value(outcome, region, self.screen())));
             }
-            if self.runtime.now_ms().saturating_sub(started) >= timeout_ms {
+            if !forever && self.runtime.now_ms().saturating_sub(started) >= timeout_ms {
                 return Ok(None);
             }
             self.runtime
-                .sleep(Duration::from_millis(interval.min(MAX_SLEEP_MS).min(
-                    timeout_ms.saturating_sub(self.runtime.now_ms().saturating_sub(started)),
-                )))
+                .sleep(Duration::from_millis(if forever {
+                    interval.min(MAX_SLEEP_MS)
+                } else {
+                    interval.min(MAX_SLEEP_MS).min(
+                        timeout_ms.saturating_sub(self.runtime.now_ms().saturating_sub(started)),
+                    )
+                }))
                 .await
                 .map_err(anyhow::Error::new)?;
             // Observe at the deadline as well; only a failed observation at
@@ -1127,6 +1425,29 @@ impl NativeYamlHost {
         let mut cache = self.run_state.templates.lock().await;
         if let Some(handle) = cache.get(name) {
             return Ok(*handle);
+        }
+        let private = self.run_state.private_templates.read().unwrap().clone();
+        if let Some(templates) = private {
+            let filename = crate::resources::resolve_short_relative_path(
+                name,
+                templates.keys().map(String::as_str),
+            )?
+            .to_string();
+            let resources = self
+                .registry
+                .resource()
+                .ok_or_else(|| anyhow!("resource capability 未注册"))?;
+            let id = ResourceId::new(
+                package.as_str().to_string(),
+                YAML_EXTENSION_ID,
+                format!("templates/{filename}"),
+            )?;
+            let handle = resources
+                .freeze_bytes(&id, templates[&filename].clone())
+                .await?;
+            *self.run_state.cleanup_registry.lock().unwrap() = Some(self.registry.clone());
+            cache.insert(name.to_string(), handle);
+            return Ok(handle);
         }
         let resource = self
             .registry
@@ -1440,6 +1761,14 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .push(("stop_app".into(), app.as_str().into()));
+            Ok(())
+        }
+
+        async fn reset_input(&self, _: &DeviceHandle, app: Option<&AppId>) -> CapabilityResult<()> {
+            self.apps.lock().unwrap().push((
+                "reset_input".into(),
+                app.map(|app| app.as_str()).unwrap_or_default().into(),
+            ));
             Ok(())
         }
     }
@@ -1813,6 +2142,514 @@ log = "^1.0"
         assert_eq!(result["status"], "skipped");
         assert_eq!(call("eq", json!({"a":1,"b":1}), &host).unwrap(), true);
         assert!(call("notify", json!({"content":42}), &host).is_err());
+        assert_eq!(
+            call("notify", json!({"content":"完成","enabled":false}), &host).unwrap()["status"],
+            "skipped"
+        );
+        assert!(call("notify", json!({"content":"完成","when":"unknown"}), &host).is_err());
+    }
+
+    #[tokio::test]
+    async fn external_native_dispatch_rejects_guest_calls_absent_from_the_frozen_program() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(trace, &stub, LogTrace::new(), &[]);
+        let policy = crate::core::ExecutionPolicy::external(
+            "fixture".into(),
+            ["gamer-yaml".into()].into(),
+            ["run.submit".into()].into(),
+        );
+        // A guest can ignore an empty program and send __fn itself. Exercise
+        // that native entry directly, with no parser or static closure scan.
+        for name in [
+            "notify",
+            "switch_live_device",
+            "wait_live_confirmation",
+            "ocr",
+            "find_text",
+        ] {
+            let error = NativeYamlHost::call_function_json(
+                host.clone(),
+                test_context(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                (name, r#"{"content":"forged","execution_policy":null}"#),
+                super::super::settings::Settings::default(),
+                None,
+                None,
+                None,
+                Arc::new(YamlRunState::new()),
+                Some(policy.clone()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("external_execution_denied"),
+                "{name}: {error}"
+            );
+        }
+        let value = NativeYamlHost::call_function_json(
+            host.clone(),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            ("eq", r#"{"a":1,"b":1}"#),
+            super::super::settings::Settings::default(),
+            None,
+            None,
+            None,
+            Arc::new(YamlRunState::new()),
+            Some(policy.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, true);
+        // The actual native dispatcher also enforces the typed policy when
+        // called independently of the JSON guest bridge.
+        let mut native = NativeYamlHost::new(
+            host.clone(),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        native.execution_policy = Some(policy);
+        assert!(native
+            .call_function("notify", json!({"content":"forged"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external_execution_denied"));
+        native.execution_policy = None;
+        assert_eq!(
+            native
+                .call_function("notify", json!({"content":"management"}))
+                .await
+                .unwrap()["status"],
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn notification_result_policy_follows_called_script_arguments_and_keeps_parent_steps() {
+        struct Bridge<'a> {
+            native: &'a NativeYamlHost,
+            runtime: &'a tokio::runtime::Runtime,
+        }
+        impl yaml_interp::HostFunctions for Bridge<'_> {
+            fn invoke(&self, name: &str, args: Value) -> Result<Value, yaml_interp::HostError> {
+                self.runtime
+                    .block_on(self.native.call_function(name, args))
+                    .map_err(|e| {
+                        yaml_interp::HostError::new(
+                            yaml_interp::HostErrorKind::Failed,
+                            e.to_string(),
+                        )
+                    })
+            }
+        }
+        impl yaml_interp::EventSink for Bridge<'_> {
+            fn emit(&self, event: Value) {
+                *self.native.run_state.trace_context.write().unwrap() = event["trace"].clone();
+                if event["ev"] == "call_end" {
+                    self.runtime
+                        .block_on(self.native.run_state.result_notifications.settle(
+                            event["trace"]["frame_id"].as_u64(),
+                            event["ok"] == true,
+                            event["error"].as_str(),
+                            self.native.notification.as_ref(),
+                        ));
+                }
+            }
+        }
+        let short = "params:\n  notify_success: {type: boolean, default: true}\n  notify_failure: {type: boolean, default: true}\n  simulate_failure: {type: boolean, default: false}\nrun:\n  - notify: {when: success, enabled: $notify_success, content: success}\n  - notify: {when: failure, enabled: $notify_failure, content: failure}\n  - reset_input: {}\n  - if: $simulate_failure\n    then: [{fail: {message: deliberate test failure, code: LIVE_DAILY_TEST_FAILURE}}]\n";
+        let library = super::super::syntax::callable_source("short.yaml", short).unwrap();
+        for (success, failure, simulate, expected) in [
+            (true, true, false, vec!["success"]),
+            (false, true, false, vec![]),
+            (true, true, true, vec!["failure"]),
+            (true, false, true, vec![]),
+        ] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let logs = LogTrace::new();
+            let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = sent.clone();
+            let sender: super::super::notification::Sender = Arc::new(move |values| {
+                captured.lock().unwrap().push(values);
+                Box::pin(async { json!({"accepted":true,"status":"queued"}) })
+            });
+            let mut native = runtime
+                .block_on(NativeYamlHost::new(
+                    vision_host(
+                        trace.clone(),
+                        &stub,
+                        logs.clone(),
+                        &["device.read", "device.app", "input.tap", "log.write"],
+                    ),
+                    test_context(),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                ))
+                .unwrap();
+            native.notification = Some(sender);
+            let caller = super::super::syntax::parse_script(&format!("run:\n  - notify: {{when: failure, content: parent failure}}\n  - short.yaml: {{notify_success: {success}, notify_failure: {failure}, simulate_failure: {simulate}}}\n  - log: {{message: parent continued, level: info}}\n")).unwrap();
+            let mut wire =
+                super::super::syntax::build_program(&caller, &library, Default::default(), 0);
+            wire["trace"] = json!({"run_id":"notification-test"});
+            let program: yaml_interp::Program = serde_json::from_value(wire).unwrap();
+            let bridge = Bridge {
+                native: &native,
+                runtime: &runtime,
+            };
+            let outcome = yaml_interp::run(&program, &bridge, Some(&bridge));
+            assert_eq!(outcome.is_err(), simulate, "{outcome:?}");
+            let error = outcome.as_ref().err().map(String::as_str);
+            runtime.block_on(native.run_state.result_notifications.settle(
+                None,
+                outcome.is_ok(),
+                error,
+                native.notification.as_ref(),
+            ));
+            let sent = sent.lock().unwrap();
+            // An explicitly disabled child failure allows the enclosing script's
+            // independently enabled policy to report its own failed task.
+            let expected = if simulate && !failure {
+                vec!["parent failure"]
+            } else {
+                expected
+            };
+            assert_eq!(sent.len(), expected.len());
+            for (sent, expected) in sent.iter().zip(expected) {
+                assert!(sent["content"].as_str().unwrap().starts_with(expected));
+            }
+            assert_eq!(
+                trace
+                    .apps
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(action, _)| action == "reset_input")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                logs.logs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, message)| message == "parent continued"),
+                !simulate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_switch_uses_run_target_and_checks_permission_provider_and_timeout() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = requests.clone();
+        let switcher: super::super::live_bridge::Switcher = Arc::new(move |action, values| {
+            assert_eq!(action, "stream.switch");
+            captured.lock().unwrap().push(values.clone());
+            Box::pin(
+                async move { Ok(json!({"device_id":values["device_id"],"state":"streaming"})) },
+            )
+        });
+        let make =
+            |permissions: &[&str]| vision_host(trace.clone(), &stub, LogTrace::new(), permissions);
+        let native = NativeYamlHost::new(
+            make(&["media.stream"]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(switcher.clone()));
+        let current = native
+            .call_function("switch_live_device", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(current["device_id"], test_context().device_id.as_str());
+        let explicit = native
+            .call_function("switch_live_device", json!({"device_id":"browser-other"}))
+            .await
+            .unwrap();
+        assert_eq!(explicit["device_id"], "browser-other");
+        let denied = NativeYamlHost::new(
+            make(&[]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(switcher));
+        assert!(denied
+            .call_function("switch_live_device", json!({}))
+            .await
+            .is_err());
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let missing = NativeYamlHost::new(
+            make(&["media.stream"]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(missing
+            .call_function("switch_live_device", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("LIVE_UNAVAILABLE"));
+        let waiting: super::super::live_bridge::Switcher =
+            Arc::new(|_, _| Box::pin(std::future::pending()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let slow = NativeYamlHost::new(
+            make(&["media.stream"]),
+            test_context(),
+            stopped.clone(),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(waiting));
+        assert!(slow
+            .call_function("switch_live_device", json!({"timeout":"5ms"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("LIVE_SWITCH_TIMEOUT"));
+        stopped.store(true, Ordering::SeqCst);
+        assert!(slow
+            .call_function("switch_live_device", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("CANCELLED"));
+    }
+
+    #[tokio::test]
+    async fn live_confirmation_returns_only_persisted_terminal_status_without_input() {
+        for status in ["confirmed", "cancelled", "timeout"] {
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let captured = calls.clone();
+            let bridge: super::super::live_bridge::Switcher = Arc::new(move |action, values| {
+                captured.lock().unwrap().push((action, values.clone()));
+                Box::pin(async move {
+                    match action {
+                        "confirmation.begin" => {
+                            assert_eq!(values, json!({"timeout_secs":300}));
+                            Ok(
+                                json!({"status":"awaiting_confirmation", "open_id":"private-viewer"}),
+                            )
+                        }
+                        "confirmation.poll" => Ok(
+                            json!({"status":status, "item_id":"private-item", "open_id":"private-viewer"}),
+                        ),
+                        _ => panic!("confirmation must not switch output"),
+                    }
+                })
+            });
+            let native = NativeYamlHost::new(
+                vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]),
+                test_context(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await
+            .unwrap()
+            .with_live_switcher(Some(bridge));
+            let result = native
+                .call_function("wait_live_confirmation", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(result, json!({"status":status}));
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[
+                    ("confirmation.begin", json!({"timeout_secs":300})),
+                    ("confirmation.poll", json!({})),
+                ]
+            );
+            assert!(trace.apps.lock().unwrap().is_empty());
+            assert!(trace.taps.lock().unwrap().is_empty());
+            assert!(trace.swipes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_confirmation_validates_timeout_permission_and_provider() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = calls.clone();
+        let bridge: super::super::live_bridge::Switcher = Arc::new(move |action, values| {
+            assert_eq!(action, "confirmation.begin");
+            assert_eq!(values, json!({"timeout_secs":2}));
+            captured.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({"status":"confirmed"})) })
+        });
+        let native = NativeYamlHost::new(
+            vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(bridge.clone()));
+        for args in [
+            json!({"timeout":"0ms"}),
+            json!({"timeout":"301s"}),
+            json!({"run_id":"forged"}),
+            json!({"device_id":"forged"}),
+            json!({"open_id":"forged"}),
+        ] {
+            assert!(native
+                .call_function("wait_live_confirmation", args)
+                .await
+                .is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            native
+                .call_function("wait_live_confirmation", json!({"timeout":"1501ms"}))
+                .await
+                .unwrap(),
+            json!({"status":"confirmed"})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let denied = NativeYamlHost::new(
+            vision_host(trace.clone(), &stub, LogTrace::new(), &[]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(bridge));
+        assert!(denied
+            .call_function("wait_live_confirmation", json!({}))
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let missing = NativeYamlHost::new(
+            vision_host(trace, &stub, LogTrace::new(), &["runtime.sleep"]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(missing
+            .call_function("wait_live_confirmation", json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("LIVE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn live_confirmation_cancels_inflight_rpc_and_between_polls() {
+        struct Dropped(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for pending_rpc in [true, false] {
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured_drops = drops.clone();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured_calls = calls.clone();
+            let bridge: super::super::live_bridge::Switcher = Arc::new(move |action, _| {
+                assert_eq!(action, "confirmation.begin");
+                captured_calls.fetch_add(1, Ordering::SeqCst);
+                let guard = Dropped(captured_drops.clone());
+                Box::pin(async move {
+                    let _guard = guard;
+                    if pending_rpc {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(json!({"status":"waiting"}))
+                })
+            });
+            let native = NativeYamlHost::new(
+                vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]),
+                test_context(),
+                stopped.clone(),
+                None,
+            )
+            .await
+            .unwrap()
+            .with_live_switcher(Some(bridge));
+            let cancel = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                stopped.store(true, Ordering::SeqCst);
+            });
+            let error = tokio::time::timeout(
+                Duration::from_millis(500),
+                native.call_function("wait_live_confirmation", json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            cancel.await.unwrap();
+            assert!(error.to_string().contains("CANCELLED"), "{error}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(trace.apps.lock().unwrap().is_empty());
+            assert!(trace.taps.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_confirmation_unavailable_disconnected_and_invalid_state_fail_closed() {
+        for response in [None, Some("disconnected"), Some("success"), Some("")] {
+            let trace = Arc::new(Trace::default());
+            let stub = VisionStub::new(FrameSize::new(1000, 1000));
+            let bridge: super::super::live_bridge::Switcher = Arc::new(move |_, _| {
+                Box::pin(async move {
+                    match response {
+                        None => Err(anyhow!("not a queue main run")),
+                        Some(status) => Ok(json!({"status":status})),
+                    }
+                })
+            });
+            let native = NativeYamlHost::new(
+                vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]),
+                test_context(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await
+            .unwrap()
+            .with_live_switcher(Some(bridge));
+            assert!(native
+                .call_function("wait_live_confirmation", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("LIVE_CONFIRMATION_"));
+            assert!(trace.apps.lock().unwrap().is_empty());
+            assert!(trace.taps.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -2028,7 +2865,8 @@ log = "^1.0"
             started.notified().await;
             cancel_clock.stop.store(true, Ordering::SeqCst);
         });
-        assert!(result.unwrap_err().to_string().contains("CANCELLED"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_ascii_lowercase().contains("cancelled"), "{error}");
         assert!(dropped.load(Ordering::SeqCst));
         assert!(clock.sleeps.lock().unwrap().is_empty());
         assert_eq!(stub.released.lock().unwrap().len(), 1);
@@ -2138,6 +2976,34 @@ log = "^1.0"
         );
     }
 
+    #[test]
+    fn press_accepts_resolved_match_center_without_rematching() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1920, 1080));
+        let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["input.swipe"]);
+        let matched = json!({"center":{"x":1844.0/1920.0,"y":892.0/1080.0},"x":1833,"y":872,"width":36,"height":30,"score":0.98,"template":"plus.png"});
+        call(
+            "press",
+            json!({"position":matched,"duration":"800ms"}),
+            &host,
+        )
+        .unwrap();
+        let swipes = trace.swipes.lock().unwrap();
+        assert_eq!(swipes.len(), 1);
+        assert_eq!(swipes[0].start(), swipes[0].end());
+        assert_eq!(swipes[0].start().x(), 1844);
+        assert_eq!(swipes[0].start().y(), 892);
+        assert_eq!(swipes[0].duration(), Duration::from_millis(800));
+        assert_eq!(stub.match_calls.load(Ordering::SeqCst), 0);
+        drop(swipes);
+        assert!(call(
+            "press",
+            json!({"position":{"center":{"x":1.5,"y":0.5}},"duration":"800ms"}),
+            &host
+        )
+        .is_err());
+        assert_eq!(trace.swipes.lock().unwrap().len(), 1);
+    }
     #[test]
     fn tap_accepts_match_center_without_rematching_and_rejects_invalid_targets() {
         let trace = Arc::new(Trace::default());
@@ -2318,6 +3184,129 @@ log = "^1.0"
         assert!(trace.taps.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn visual_assertions_are_independent_and_fail_keeps_structured_reason() {
+        let trace = Arc::new(Trace::default());
+        let vision = VisionStub::new(FrameSize::new(1000, 1000));
+        let api = vision_host(
+            trace,
+            &vision,
+            LogTrace::new(),
+            &["vision.match", "resource.read", "runtime.sleep"],
+        );
+        let host = NativeYamlHost::new(
+            api,
+            AppContext::for_test("d", "com.test").unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        host.run_state
+            .required_checks
+            .write()
+            .unwrap()
+            .insert("daily".into());
+        let found = || {
+            MatchOutcome::Found(crate::capabilities::MatchBox {
+                x: 10,
+                y: 10,
+                width: 9,
+                height: 9,
+                score: 0.99,
+            })
+        };
+        vision.push_outcome(found());
+        assert!(host
+            .call_function("finish", json!({"template":"world","timeout":"0ms"}))
+            .await
+            .is_ok());
+        vision.push_outcome(found());
+        host.call_function(
+            "checkpoint",
+            json!({"id":"daily","template":"claimed","timeout":"0ms"}),
+        )
+        .await
+        .unwrap();
+        assert!(host
+            .run_state
+            .completed_checks
+            .read()
+            .unwrap()
+            .contains("daily"));
+        vision.push_outcome(found());
+        host.call_function("finish", json!({"template":"world","timeout":"0ms"}))
+            .await
+            .unwrap();
+        assert!(host.run_state.goal_verified.load(Ordering::Relaxed));
+        let error=host.call_function("fail",json!({"code":"OCR_INVALID","stage":"stamina","expected":300,"actual":999,"retryable":false,"message":"bad reading"})).await.unwrap_err().to_string();
+        assert!(
+            error.contains("OCR_INVALID") && error.contains("stamina") && error.contains("999")
+        );
+    }
+
+    #[test]
+    fn wait_find_forever_keeps_polling_past_timeout_and_refreshes_obstacles() {
+        let trace = Arc::new(Trace::default());
+        let vision = VisionStub::new(FrameSize::new(1000, 1000));
+        for outcome in [
+            stub_outcome(),
+            MatchOutcome::NotFound,
+            MatchOutcome::NotFound,
+            MatchOutcome::NotFound,
+            stub_outcome(),
+        ] {
+            vision.push_outcome(outcome);
+        }
+        let host = vision_host(
+            trace.clone(),
+            &vision,
+            LogTrace::new(),
+            &[
+                "vision.match",
+                "resource.read",
+                "runtime.sleep",
+                "input.tap",
+            ],
+        );
+        let result = call("wait_find", json!({"template":"home", "obstacles":["expired"], "forever":true, "timeout":"0ms", "interval":"50ms"}), &host).unwrap();
+        assert!(!result.is_null());
+        assert_eq!(trace.taps.lock().unwrap().len(), 1);
+        assert_eq!(vision.match_calls.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn wait_find_forever_is_cancelled_without_hitting_timeout() {
+        let trace = Arc::new(Trace::default());
+        let vision = VisionStub::new(FrameSize::new(1000, 1000));
+        let api = vision_host(
+            trace,
+            &vision,
+            LogTrace::new(),
+            &["vision.match", "resource.read"],
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let host = NativeYamlHost::new(api, test_context(), stop.clone(), None)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            stop.store(true, Ordering::SeqCst);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.call_function(
+                "wait_find",
+                json!({"template":"missing", "forever":true, "timeout":"0ms", "interval":"50ms"}),
+            ),
+        )
+        .await
+        .unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.to_ascii_lowercase().contains("cancelled"), "{error}");
+        assert!(vision.match_calls.load(Ordering::Relaxed) >= 2);
+    }
+
     #[test]
     fn wait_find_defaults_to_observation_and_click_is_explicit() {
         for click in [None, Some(true), Some(false)] {
@@ -2391,7 +3380,7 @@ log = "^1.0"
         );
         let matched = call(
             "find_any",
-            json!({"templates":["notice", "login", "home"]}),
+            json!({"templates":["notice", "login", "home"],"region":[0.2,0.1,0.4,0.3]}),
             &host,
         )
         .unwrap();
@@ -2402,6 +3391,18 @@ log = "^1.0"
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0], frames[1]);
         drop(frames);
+        assert_eq!(
+            *stub.regions.lock().unwrap(),
+            vec![
+                Some(SearchRegion {
+                    x: 200,
+                    y: 100,
+                    width: 400,
+                    height: 300
+                });
+                2
+            ]
+        );
         for invalid in [json!([]), json!([""]), json!([1]), json!("home")] {
             assert!(call("find_any", json!({"templates":invalid}), &host).is_err());
         }
@@ -2413,6 +3414,46 @@ log = "^1.0"
         );
     }
 
+    #[test]
+    fn wait_find_keeps_checking_late_obstacles_until_the_goal_appears() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        // First poll: no popup or goal. Then the popup appears, remains after
+        // the first click, and finally clears so the goal can be observed.
+        for outcome in [
+            MatchOutcome::NotFound,
+            MatchOutcome::NotFound,
+            stub_outcome(),
+            stub_outcome(),
+            MatchOutcome::NotFound,
+            stub_outcome(),
+        ] {
+            stub.push_outcome(outcome);
+        }
+        let host = vision_host(
+            trace.clone(),
+            &stub,
+            LogTrace::new(),
+            &["vision.match", "resource.read", "input.tap"],
+        );
+        let matched=call("wait_find",json!({"template":"world","obstacles":["supply"],"click":false,"timeout":"5min","interval":"2s","region":[0.75,0.18,0.25,0.08]}),&host).unwrap();
+        assert!(matched.is_object());
+        assert_eq!(trace.taps.lock().unwrap().len(), 2);
+        let frames = stub.frames.lock().unwrap();
+        assert_eq!(frames[0], frames[1]);
+        assert_ne!(frames[1], frames[2]);
+        assert_ne!(frames[2], frames[3]);
+        assert_ne!(frames[3], frames[4]);
+        assert_eq!(frames[4], frames[5]);
+        let regions = stub.regions.lock().unwrap();
+        assert!(
+            regions[0].is_none()
+                && regions[2].is_none()
+                && regions[3].is_none()
+                && regions[4].is_none()
+        );
+        assert!(regions[1].is_some() && regions[5].is_some());
+    }
     #[test]
     fn wait_find_obstacles_click_first_then_refresh_and_share_next_frame() {
         let trace = Arc::new(Trace::default());
@@ -2822,28 +3863,77 @@ log = "^1.0"
         assert_eq!(trace.text.lock().unwrap().as_slice(), ["你好"]);
         call("launch", json!({}), &host).unwrap();
     }
+
+    #[tokio::test]
+    async fn reset_input_uses_run_target_app_and_requires_app_permission() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(trace.clone(), &stub, LogTrace::new(), &["device.app"]);
+        let native = NativeYamlHost::new(
+            host.clone(),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            native
+                .call_function("reset_input", json!({}))
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        let mut browser_context = test_context();
+        browser_context.android_package = None;
+        let browser = NativeYamlHost::new(
+            host,
+            browser_context,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        browser
+            .call_function("reset_input", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *trace.apps.lock().unwrap(),
+            [
+                ("reset_input".into(), "com.example.game".into()),
+                ("reset_input".into(), "".into()),
+            ]
+        );
+        let denied = NativeYamlHost::new(
+            vision_host(trace.clone(), &stub, LogTrace::new(), &[]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(denied
+            .call_function("reset_input", json!({}))
+            .await
+            .is_err());
+        assert_eq!(trace.apps.lock().unwrap().len(), 2);
+    }
 }
 
 #[cfg(all(test, feature = "wasm-runtime"))]
-mod wasm_tests {
+pub(crate) mod wasm_tests {
     use super::super::wasm_host::LazyYamlWasmtimeRuntime;
     use super::tests;
     use super::*;
     use crate::extensions::gamer_yaml::syntax;
-    fn v2_fixture(source: &str) -> String {
-        if source.lines().any(|line| line.starts_with("version:")) {
-            source.into()
-        } else {
-            format!("version: 2\n{source}")
-        }
-    }
     fn parse_script(source: &str) -> Result<syntax::Script, Vec<syntax::Diagnostic>> {
-        syntax::parse_script(&v2_fixture(source))
+        syntax::parse_script(source)
     }
     fn parse_function_library(
         source: &str,
     ) -> Result<syntax::FunctionLibrary, Vec<syntax::Diagnostic>> {
-        syntax::parse_function_library(&v2_fixture(source))
+        syntax::parse_function_library(source)
     }
     fn build_program(
         script: &syntax::Script,
@@ -2851,10 +3941,9 @@ mod wasm_tests {
         vars: JsonMap<String, Value>,
         start: usize,
     ) -> Value {
-        let mut program = syntax::build_program(script, library, vars, start);
+        let program = syntax::build_program(script, library, vars, start);
         // These fixtures test isolated native/control-flow instructions. Full
         // visual completion stays mandatory at production build_program.
-        program["require_goal"] = json!(false);
         program
     }
     use async_trait::async_trait;
@@ -2988,7 +4077,7 @@ mod wasm_tests {
         })
     }
 
-    fn guest_component() -> Vec<u8> {
+    pub(crate) fn guest_component() -> Vec<u8> {
         static COMPONENT: OnceLock<Vec<u8>> = OnceLock::new();
         COMPONENT
             .get_or_init(|| {
@@ -3075,8 +4164,11 @@ runtime = "^1.0"
         sink: Option<Arc<dyn EventSink>>,
     ) -> YamlWasmRunRequest {
         YamlWasmRunRequest {
+            execution_policy: None,
+            private_templates: None,
             notification: None,
             ocr: None,
+            live_switcher: None,
             wasm: guest_component(),
             program,
             host,
@@ -3084,6 +4176,70 @@ runtime = "^1.0"
             stop,
             sink,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_switches_live_source_through_native_function() {
+        let trace = Arc::new(tests::Trace::default());
+        let host = tests::vision_host(
+            trace,
+            &tests::VisionStub::new(FrameSize::new(1920, 1080)),
+            tests::LogTrace::new(),
+            &["media.stream"],
+        );
+        let script = parse_script("run:\n  - switch_live_device: {device_id: browser-next}\n    as: switched\n  - return: $switched\n").unwrap();
+        let mut request = run_request(
+            build_program(&script, &vec![], Default::default(), 0),
+            host,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        request.live_switcher = Some(Arc::new(|action, values| {
+            Box::pin(async move {
+                assert_eq!(action, "stream.switch");
+                assert_eq!(values, json!({"device_id":"browser-next"}));
+                Ok(
+                    json!({"device_id":"browser-next","state":"streaming","output_id":"existing-output"}),
+                )
+            })
+        }));
+        let result = LazyYamlWasmtimeRuntime::new().run(request).await.unwrap();
+        assert_eq!(
+            result.value,
+            json!({"device_id":"browser-next","state":"streaming","output_id":"existing-output"})
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_waits_for_live_confirmation_through_native_function() {
+        let trace = Arc::new(tests::Trace::default());
+        let host = tests::vision_host(
+            trace.clone(),
+            &tests::VisionStub::new(FrameSize::new(1920, 1080)),
+            tests::LogTrace::new(),
+            &["runtime.sleep"],
+        );
+        let script = parse_script(
+            "run:\n  - wait_live_confirmation: {}\n    as: decision\n  - return: $decision\n",
+        )
+        .unwrap();
+        let mut request = run_request(
+            build_program(&script, &vec![], Default::default(), 0),
+            host,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        request.live_switcher = Some(Arc::new(|action, values| {
+            Box::pin(async move {
+                assert_eq!(action, "confirmation.begin");
+                assert_eq!(values, json!({"timeout_secs":300}));
+                Ok(json!({"status":"cancelled", "open_id":"must-not-leak"}))
+            })
+        }));
+        let result = LazyYamlWasmtimeRuntime::new().run(request).await.unwrap();
+        assert_eq!(result.value, json!({"status":"cancelled"}));
+        assert!(trace.apps.lock().unwrap().is_empty());
+        assert!(trace.taps.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3240,7 +4396,7 @@ runtime = "^1.0"
                 "runtime.sleep",
             ],
         );
-        let script = syntax::parse_script("version: 2\ntargets: {button: {template: button.png}, done: {template: done.png}}\nrun: [{trace: false}, {wait: button, then: [{tap: button}]}, {trace: true}, {finish: done}]\n").unwrap();
+        let script = syntax::parse_script("targets: {button: {template: button.png}, done: {template: done.png}}\nrun: [{trace: false}, {wait: button, then: [{tap: button}]}, {trace: true}, {finish: done}]\n").unwrap();
         let program = syntax::build_program(&script, &vec![], Default::default(), 0);
         let result = LazyYamlWasmtimeRuntime::new()
             .run(run_request(
@@ -3465,6 +4621,7 @@ runtime = "^1.0"
             writer.write_all(&guest_component()).unwrap();
             writer.start_file("ui/plugin.js", options).unwrap();
             writer.write_all(b"export const sdkVersion = 1;").unwrap();
+            super::super::external_schemas::append_schemas(&mut writer);
             writer.finish().unwrap();
         }
         let installed = service.install(&archive).await.unwrap();
@@ -3477,6 +4634,7 @@ runtime = "^1.0"
             wire("run:\n  - notify: {content: 通知测试}\n    as: delivery\n  - log: from-v1-e2e\n  - return: $delivery.status\n"),
             AppContext::for_test("device-1", "com.example.game").unwrap(),
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         )
         .await
@@ -3510,6 +4668,7 @@ runtime = "^1.0"
             AppContext::for_test("device-1", "com.example.game").unwrap(),
             Arc::new(AtomicBool::new(false)),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3532,6 +4691,7 @@ runtime = "^1.0"
             wire("run: []\n"),
             AppContext::for_test("device-1", "com.example.game").unwrap(),
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         )
         .await

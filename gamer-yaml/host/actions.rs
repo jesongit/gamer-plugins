@@ -6,11 +6,10 @@
 //! 清单是唯一契约面：动作名 / 版本 / 参数 / 调用方上下文要求集中在此声明，
 //! 实现与清单由下方测试双向锁死（清单里有的必有实现或显式映射，实现必在清单）。
 //!
-//! 三种 surface：
+//! 两种 surface：
 //! - [`ActionSurface::Native`]：本缝内原生实现（按调用执行，无常驻实例）；
 //! - [`ActionSurface::Rest`]：复用既有 Core REST 端点（不重复实现，`mapping`
 //!   写明端点映射关系；调用方直接打 REST，不走本缝）；
-//! - [`ActionSurface::Frontend`]：纯前端导航/装配契约（无服务端往返）。
 //!
 //! `caller` / `context` 是动作契约：REST 通路由用户会话鉴权；插件互调走
 //! `ExtensionService::call_extension_from_plugin`，由宿主从运行实例取得 caller
@@ -22,23 +21,16 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::video_draft::{self, AUTOMATION_CREATE_DRAFT};
 use super::yaml_extension::YAML_EXTENSION_ID;
 use crate::extensions::{ExtensionError, ExtensionResult, Permission};
-use crate::resources::{PackageStore, SaveBinaryValidation, SaveValidation};
+use crate::resources::{PackageStore, SaveBinaryValidation};
 
 /// 模板创建动作（§10.2）：从视频确定帧裁出的 PNG + 相对搜索区域 → 存为
 /// 当前 Package 的 gamer-yaml 模板（灰度归一化经资源字节钩子自动生效）。
 pub(crate) const TEMPLATE_CREATE_FROM_FRAME: &str = "template.create_from_frame";
-/// 草稿保存动作（§10.3）：v2 未验证草稿文本 → 存为当前 Package 的 automations 脚本
-///（保存经 v2 校验钩子，非法源结构化拒绝）。
-pub(crate) const AUTOMATION_SAVE_DRAFT: &str = "automation.save_draft";
 /// 模板离线测试：与 `POST /api/capabilities/vision/test`（media_id+pts_us/frame_index
 /// 离线寻址）同能力 —— **复用 REST 不重复实现**；清单内只登记映射关系。
 pub(crate) const VISION_TEST_TEMPLATE: &str = "vision.test_template";
-/// 草稿保存成功后打开/定位 YAML 编辑器：纯前端导航契约（video 面板 →
-/// gamer-yaml:automation 面板 + 编辑器加载），无服务端往返。
-pub(crate) const AUTOMATION_OPEN_EDITOR: &str = "automation.open_editor";
 
 /// 动作 surface（见模块注释）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +39,6 @@ pub(crate) enum ActionSurface {
     Native,
     /// 复用既有 REST 端点（`mapping` 给出映射）。
     Rest,
-    /// 纯前端契约（调用方自行解析，无服务端调用）。
-    Frontend,
 }
 
 /// 公开动作清单条目（唯一契约声明点）。
@@ -77,11 +67,34 @@ pub(crate) struct PublicAction {
 
 /// gamer-yaml 公开动作清单（唯一声明点；顺序即文档顺序）。
 pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
+    authoring_action("generation.export", &[Permission::ResourceRead]),
+    authoring_action("generation.import_draft", &[Permission::ResourceRead]),
+    authoring_action("authoring.list", &[Permission::ResourceRead]),
+    authoring_action("authoring.get", &[Permission::ResourceRead]),
+    authoring_action("authoring.create", &[Permission::ResourceRead]),
+    authoring_action("authoring.cancel", &[Permission::ResourceRead]),
+    authoring_action("authoring.save", &[Permission::ResourceRead]),
+    authoring_action("authoring.publish", &[Permission::ResourceRead]),
+    authoring_action("authoring.validate", &[Permission::ResourceRead]),
+    authoring_action(
+        "authoring.run",
+        &[
+            Permission::ResourceRead,
+            Permission::DeviceRead,
+            Permission::InputTap,
+        ],
+    ),
+    authoring_action("authoring.delete_preview", &[Permission::ResourceRead]),
+    authoring_action("authoring.delete", &[Permission::ResourceRead]),
+    authoring_action("authoring.import", &[Permission::ResourceRead]),
+    authoring_action("authoring.crop_template", &[Permission::ResourceRead]),
+    authoring_action("authoring.template", &[Permission::ResourceRead]),
+    authoring_action("authoring.match_template", &[Permission::ResourceRead]),
     PublicAction {
         name: "generation.template",
         version: 1,
         surface: ActionSurface::Native,
-        summary: "Preview one candidate template cropped from selected evidence",
+        summary: "Read one frozen historical candidate template",
         caller: "user-management",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -90,70 +103,10 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         mapping: "",
     },
     PublicAction {
-        name: "generation.apply_proposal",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "User-approved application of a staged AI candidate proposal",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &["candidate_id", "expected_revision", "proposal_id"],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.readiness",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &[],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.create",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.start",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.repair",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "Repair the selected failed run from its source snapshot and validate all selected samples",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &["name", "run_id", "goal", "samples"],
-        mapping: "",
-    },
-    PublicAction {
         name: "generation.get",
         version: 1,
         surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
+        summary: "Read-only historical candidate or deterministic source validation",
         caller: "user-management",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -165,67 +118,7 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         name: "generation.list",
         version: 1,
         surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.edit",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.validate",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.retry",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead, Permission::AiConnect],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.cancel",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.save",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
+        summary: "Read-only historical candidate or deterministic source validation",
         caller: "user-management",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -237,19 +130,7 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         name: "generation.history",
         version: 1,
         surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
-        caller: "user-management",
-        required_permissions: &[Permission::ResourceRead],
-        caller_permissions: &[],
-        context: &["package_id"],
-        params: &[],
-        mapping: "",
-    },
-    PublicAction {
-        name: "generation.rollback",
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
+        summary: "Read-only historical candidate or deterministic source validation",
         caller: "user-management",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -261,7 +142,7 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         name: "automation.validate_source",
         version: 1,
         surface: ActionSurface::Native,
-        summary: "AI generation candidate and offline validation management",
+        summary: "Read-only historical candidate or deterministic source validation",
         caller: "user-management",
         required_permissions: &[Permission::ResourceRead],
         caller_permissions: &[],
@@ -330,44 +211,22 @@ pub(crate) const PUBLIC_ACTIONS: &[PublicAction] = &[
         mapping:
             "POST /api/capabilities/vision/test（Core vision 能力位；离线帧身份随附 frame 字段）",
     },
+];
+
+const fn authoring_action(name: &'static str, permissions: &'static [Permission]) -> PublicAction {
     PublicAction {
-        name: AUTOMATION_CREATE_DRAFT,
+        name,
         version: 1,
         surface: ActionSurface::Native,
-        summary: "录制操作事件 → YAML v2 草稿文本（不落盘不执行；不可映射事件进诊断）",
-        caller: "gamer-video",
-        required_permissions: &[],
-        caller_permissions: &[Permission::MediaEventsRead],
-        context: &["recording_id"],
-        params: &["event_ids?", "comments?"],
-        mapping: "",
-    },
-    PublicAction {
-        name: AUTOMATION_SAVE_DRAFT,
-        version: 1,
-        surface: ActionSurface::Native,
-        summary: "v2 未验证草稿文本保存为当前 Package 的 automations 脚本（保存边界 v2 校验）",
-        caller: "gamer-video",
-        required_permissions: &[Permission::ResourceRead],
+        summary: "User-guided script authoring and immutable script revisions",
+        caller: "user-management",
+        required_permissions: permissions,
         caller_permissions: &[],
         context: &["package_id"],
-        params: &["name", "yaml", "overwrite?"],
-        mapping: "",
-    },
-    PublicAction {
-        name: AUTOMATION_OPEN_EDITOR,
-        version: 1,
-        surface: ActionSurface::Frontend,
-        summary: "打开/定位 YAML 编辑器到刚保存的脚本（自动化面板 + 载入编辑态）",
-        caller: "gamer-video",
-        required_permissions: &[],
-        caller_permissions: &[],
-        context: &["package_id", "script_id"],
         params: &[],
-        mapping:
-            "前端契约：切到 gamer-yaml:automation 面板并编辑 script_id（automationEditorBridge）",
-    },
-];
+        mapping: "",
+    }
+}
 
 /// native_call_action 缝的 gamer-yaml 侧分发入口（extensions/mod.rs 调用）：
 /// 命中清单内 Native 动作 → 应答；其余返回 `None` 交回通用路径。
@@ -381,12 +240,10 @@ pub(crate) fn native_call_action(
         return None;
     }
     let result = match action {
-        AUTOMATION_CREATE_DRAFT => video_draft::create_draft(values, data_dir),
         super::settings::GET_SETTINGS | super::settings::SAVE_SETTINGS => {
             super::settings::dispatch(action, values, data_dir)
                 .map_err(|e| ExtensionError::CallRejected(e.to_string()))
         }
-        AUTOMATION_SAVE_DRAFT => save_draft(values, data_dir),
         TEMPLATE_CREATE_FROM_FRAME => create_template_from_frame(values, data_dir),
         _ => return None,
     };
@@ -517,89 +374,6 @@ fn validate_relative_name(name: &str, field: &str) -> Result<String, ExtensionEr
         }
     }
     Ok(name.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// automation.save_draft
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SaveDraftRequest {
-    package_id: String,
-    name: String,
-    yaml: String,
-    #[serde(default)]
-    overwrite: bool,
-    #[serde(default)]
-    expected_version: Option<String>,
-}
-
-/// `automation.save_draft`：草稿文本 → `automations/<name>.yaml`（v2 保存钩子
-/// 强制校验；非法结构结构化拒绝）。`overwrite=false` 且目标已存在 → 名字冲突。
-fn save_draft(values: &Value, data_dir: &Path) -> ExtensionResult<Value> {
-    let request: SaveDraftRequest = serde_json::from_value(values.clone()).map_err(|error| {
-        rejected(format!(
-            "automation.save_draft 入参无效（需要 package_id/name/yaml）: {error}"
-        ))
-    })?;
-    let package_id = request.package_id.trim().to_string();
-    if package_id.is_empty() {
-        return Err(rejected("package_id（Package Context）不能为空"));
-    }
-    let raw_name = request.name.trim();
-    let with_ext = if raw_name.to_ascii_lowercase().ends_with(".yaml")
-        || raw_name.to_ascii_lowercase().ends_with(".yml")
-    {
-        raw_name.to_string()
-    } else {
-        format!("{raw_name}.yaml")
-    };
-    let rel = validate_relative_name(&with_ext, "name")?;
-    let path = format!("automations/{rel}");
-    let store = store_for(data_dir)?;
-    // 保存边界 v2 校验（与 REST PUT 同一钩子）；诊断原样回传（结构化数组）。
-    store
-        .validate_save(SaveValidation {
-            package: &package_id,
-            plugin: YAML_EXTENSION_ID,
-            path: &path,
-            content: &request.yaml,
-            store: &store,
-        })
-        .map_err(|diagnostics| {
-            rejected(format!(
-                "草稿未通过 YAML v2 校验: {}",
-                serde_json::to_string(&diagnostics).unwrap_or_default()
-            ))
-        })?;
-    let exists = store
-        .read_text(&package_id, YAML_EXTENSION_ID, &path)
-        .map_err(|error| rejected(format!("读取目标脚本失败: {error:#}")))?
-        .is_some();
-    if exists && !request.overwrite {
-        return Err(rejected(format!(
-            "自动化脚本已存在: {package_id}/{path}（确认覆盖请带 overwrite:true）"
-        )));
-    }
-    let entry = store
-        .write_text(
-            &package_id,
-            YAML_EXTENSION_ID,
-            &path,
-            &request.yaml,
-            request.expected_version.as_deref(),
-            false,
-        )
-        .map_err(|error| rejected(format!("保存脚本失败: {error:#}")))?;
-    Ok(json!({
-        "action": AUTOMATION_SAVE_DRAFT,
-        "version": 1,
-        "id": format!("{package_id}/{with_ext}"),
-        "path": entry.path,
-        "package_id": package_id,
-        "content_version": entry.version(),
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -881,35 +655,31 @@ mod tests {
         let dispatch_branches = [
             super::super::settings::GET_SETTINGS,
             super::super::settings::SAVE_SETTINGS,
-            AUTOMATION_CREATE_DRAFT,
-            AUTOMATION_SAVE_DRAFT,
             TEMPLATE_CREATE_FROM_FRAME,
         ];
         for name in &native_in_catalog {
             assert!(
                 (dispatch_branches.contains(name)
-                    || super::super::generation::ACTIONS.contains(name)),
+                    || super::super::generation::ACTIONS.contains(name)
+                    || super::super::generation::AUTHORING_ACTIONS.contains(name)),
                 "清单声明 Native 但无分发分支: {name}"
             );
         }
-        for name in &dispatch_branches {
+        for name in dispatch_branches
+            .iter()
+            .chain(super::super::generation::ACTIONS.iter())
+            .chain(super::super::generation::AUTHORING_ACTIONS.iter())
+        {
             assert!(
                 native_in_catalog.contains(name),
                 "分发分支未在清单声明: {name}"
             );
         }
-        // Rest surface 必须带映射说明；Frontend 必须带上下文契约。
+        // Rest surface 必须带映射说明。
         for action in PUBLIC_ACTIONS {
             match action.surface {
                 ActionSurface::Rest => {
                     assert!(!action.mapping.is_empty(), "{} 缺 REST 映射", action.name);
-                }
-                ActionSurface::Frontend => {
-                    assert!(
-                        !action.context.is_empty(),
-                        "{} 缺前端上下文契约",
-                        action.name
-                    );
                 }
                 ActionSurface::Native => {}
             }
@@ -947,11 +717,11 @@ mod tests {
         // 清单内动作 → Some（入参缺失给结构化 CallRejected，不 panic）
         let error = native_call_action(
             YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
+            TEMPLATE_CREATE_FROM_FRAME,
             &json!({}),
             &data_dir,
         )
-        .expect("save_draft 必须由本缝应答")
+        .expect("template action must be dispatched")
         .unwrap_err();
         assert!(error.to_string().contains("入参无效"), "{error}");
     }
@@ -1154,89 +924,6 @@ mod tests {
             compose_template_name("x", &[0.5, 0.5, 0.5005, 1.0], false),
             "x#500_500_500_999.png"
         );
-    }
-
-    /// save_draft：v2 直存、非法结构拒绝、重名需 overwrite、覆盖成功、id 组装。
-    #[test]
-    fn save_draft_validates_v2_and_enforces_name_conflict() {
-        let (_store, dir) = temp_store("draft-ok");
-        let v1 = "version: 2\nrun:\n  - log: 草稿\n";
-        let values = json!({ "package_id": "draft-ok", "name": "daily", "yaml": v1 });
-        let result = native_call_action(
-            YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
-            &values,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result["id"], "draft-ok/daily.yaml",
-            "脚本资源 id 含扩展名（与 listScripts/getScript 同形）"
-        );
-        assert_eq!(result["path"], "automations/daily.yaml");
-        let on_disk = dir
-            .path()
-            .join("packages/draft-ok/plugins/gamer-yaml/automations/daily.yaml");
-        assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), v1);
-
-        // 重名：无 overwrite 拒绝；带 overwrite 覆盖
-        let error = native_call_action(
-            YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
-            &values,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap_err();
-        assert!(error.to_string().contains("已存在"), "{error}");
-        let mut overwrite = values.clone();
-        overwrite["overwrite"] = json!(true);
-        overwrite["expected_version"] = json!(crate::core::fs::content_version(v1));
-        overwrite["yaml"] = json!("version: 2\nrun:\n  - log: 第二版\n");
-        native_call_action(
-            YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
-            &overwrite,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(std::fs::read_to_string(&on_disk)
-            .unwrap()
-            .contains("第二版"));
-
-        // 旧 v3 源 → 版本迁移诊断
-        let mut legacy = values.clone();
-        legacy["name"] = json!("legacy");
-        legacy["yaml"] = json!("version: 3\nsteps: []\n");
-        let error = native_call_action(
-            YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
-            &legacy,
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap_err();
-        assert!(error.to_string().contains("yaml.version"), "{error}");
-
-        // 非法路径段
-        let mut evil = values.clone();
-        evil["name"] = json!("a/../b");
-        let error = native_call_action(YAML_EXTENSION_ID, AUTOMATION_SAVE_DRAFT, &evil, dir.path())
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("非法路径段"), "{error}");
-        // 缺 Package Context
-        let error = native_call_action(
-            YAML_EXTENSION_ID,
-            AUTOMATION_SAVE_DRAFT,
-            &json!({ "name": "x", "yaml": v1 }),
-            dir.path(),
-        )
-        .unwrap()
-        .unwrap_err();
-        assert!(error.to_string().contains("package_id"), "{error}");
     }
 
     /// base64 往返（无外部依赖实现的最小自证）。

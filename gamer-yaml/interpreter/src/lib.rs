@@ -5,7 +5,7 @@
 //! - 生产执行：`gamer-yaml` 官方 guest（`plugins/gamer-yaml/guest`，WASM
 //!   Component）链接本 crate，经 `capability.invoke("__fn", …)` 调宿主函数、
 //!   `capability.invoke("__event", …)` 发运行事件；
-//! - 离线验证：server 原生链接本 crate，以只读素材回放 HostFunctions 驱动
+//! - 宿主测试：server 原生链接本 crate，使用测试 HostFunctions 验证相同运行语义
 //!   同一解释器；测试也复用此入口，不另写参考执行器。
 //!
 //! 视觉 V2 在源端降线为统一 wire；`run` 指令包括函数调用 / `if` /
@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// Wire/semantic contract checked before a host permits guest side effects.
-pub const RUNTIME_CONTRACT: &str = "gamer-yaml.visual.v2/2";
+pub const RUNTIME_CONTRACT: &str = "gamer-yaml.visual.v2/3";
 
 /// 步数预算：每个逻辑步（顶层、分支体、repeat 体每轮每子步、函数体全计）
 /// 执行前 +1，超限即终止。
@@ -122,8 +122,6 @@ pub trait EventSink: Send + Sync {
 
 #[derive(Debug, Deserialize)]
 pub struct Program {
-    #[serde(default)]
-    pub require_goal: bool,
     #[serde(default)]
     pub trace: Value,
     /// 入口帧初始值（已绑定参数 + vars 字面量，宿主绑定产出）。
@@ -255,8 +253,6 @@ enum Flow {
     Continue,
     Break,
     Return(Value),
-    /// Explicit visual completion terminates the entire task, even in a function.
-    Finish(Value),
 }
 
 // ---------------------------------------------------------------------------
@@ -302,13 +298,11 @@ pub fn run(
         next_frame_id: 0,
         parent_frame_id: None,
         function: None,
-        goal_reached: false,
     };
     interp.run(program)
 }
 
 struct Interpreter<'a> {
-    goal_reached: bool,
     host: &'a dyn HostFunctions,
     events: Option<&'a dyn EventSink>,
     functions: BTreeMap<String, FunctionDef>,
@@ -339,16 +333,13 @@ impl<'a> Interpreter<'a> {
                 Flow::Break => {
                     Err("yaml.break.outside_loop: break 只能在当前函数的循环内使用".into())
                 }
-                _ if program.require_goal && !self.goal_reached => {
-                    Err("GOAL_NOT_REACHED: 脚本未在最后一次动作后验证 finish 目标".into())
-                }
                 flow => Ok(flow),
             });
         match outcome {
             Ok(flow) => {
                 self.emit(serde_json::json!({ "ev": "run_end", "ok": true }));
                 Ok(match flow {
-                    Flow::Return(value) | Flow::Finish(value) => value,
+                    Flow::Return(value) => value,
                     Flow::Break => unreachable!("break is rejected above"),
                     Flow::Continue => values.remove(RETURN_KEY).unwrap_or(Value::Null),
                 })
@@ -366,7 +357,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn emit(&self, mut event: Value) {
-        if self.trace.is_object() {
+        {
             let source = self
                 .function
                 .as_ref()
@@ -615,31 +606,13 @@ impl<'a> Interpreter<'a> {
             .host
             .invoke(name, args)
             .map_err(|error| error.to_string())?;
-        if name == "finish" {
-            self.goal_reached = !result.is_null() && result != Value::Bool(false);
-            if !self.goal_reached {
-                return Err("GOAL_NOT_REACHED: finish 没有返回已观察完成目标".into());
-            }
-        } else if matches!(
-            name,
-            "tap"
-                | "swipe"
-                | "key"
-                | "input_text"
-                | "launch"
-                | "stop_app"
-                | "tap_template"
-                | "wait_find"
-        ) {
-            self.goal_reached = false;
+        if name == "finish" && (result.is_null() || result == Value::Bool(false)) {
+            return Err("VISUAL_TIMEOUT: finish 没有返回已观察视觉目标".into());
         }
         self.detail(
             "result",
             serde_json::json!({"function":name,"value":result,"as":save_as}),
         );
-        if name == "finish" {
-            return Ok(Flow::Finish(result));
-        }
         if let Some(save_as) = save_as {
             values.insert(save_as.clone(), result);
         }
@@ -672,6 +645,10 @@ impl<'a> Interpreter<'a> {
             serde_json::json!({ "ev": "call_start", "target": name, "depth": self.call_depth }),
         );
         let outcome = self.run_package_function(name, args, save_as, values);
+        self.emit(match &outcome {
+            Ok(_) => serde_json::json!({"ev":"call_end", "target":name, "depth":self.call_depth, "ok":true}),
+            Err(error) => serde_json::json!({"ev":"call_end", "target":name, "depth":self.call_depth, "ok":false, "error":error}),
+        });
         (self.frame_id, self.parent_frame_id, self.function) = previous;
         self.call_depth -= 1;
         outcome
@@ -716,7 +693,6 @@ impl<'a> Interpreter<'a> {
         );
         let return_value = match self.run_steps(&def.run, &mut frame)? {
             Flow::Return(value) => value,
-            Flow::Finish(value) => return Ok(Flow::Finish(value)),
             Flow::Continue => Value::Null,
             Flow::Break => return Err("yaml.break.outside_loop: break 不能跳出调用方的循环".into()),
         };
@@ -857,7 +833,6 @@ mod tests {
 
     fn program(run: Vec<Step>) -> Program {
         Program {
-            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run,
@@ -969,7 +944,6 @@ mod tests {
     fn if_takes_bool_and_null_only() {
         let host = FakeHost::default();
         let program = Program {
-            require_goal: false,
             trace: Value::Null,
             vars: serde_json::Map::from_iter([
                 ("flag".into(), Value::Bool(true)),
@@ -1097,7 +1071,6 @@ mod tests {
             }),
         );
         let program = Program {
-            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![
@@ -1142,7 +1115,6 @@ mod tests {
             }),
         );
         let program = Program {
-            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![fn_step(
@@ -1171,7 +1143,6 @@ mod tests {
             }),
         );
         let program = Program {
-            require_goal: false,
             trace: Value::Null,
             vars: Default::default(),
             run: vec![fn_step("loop", None, None, "run[0]")],
@@ -1284,19 +1255,21 @@ mod tests {
         assert_eq!(last["error"], error);
     }
     #[test]
-    fn finish_terminates_entire_task_through_nested_functions_branches_and_loops() {
+    fn visual_assertion_continues_through_nested_functions_and_caller() {
         let program:Program=serde_json::from_value(serde_json::json!({
-            "require_goal":true,
-            "functions":{"complete":{"run":[{"op":"if","cond":{"expr":"lit","value":true},"path":"complete.run[0]","then":[{"op":"repeat","times":{"expr":"lit","value":3},"path":"complete.run[0].then[0]","do":[{"op":"fn","fn":"finish","path":"complete.finish"},{"op":"fn","fn":"tap","path":"complete.must_not_tap"}]}]},{"op":"fn","fn":"fail","path":"complete.must_not_fail"}]}},
+
+            "functions":{"complete":{"run":[{"op":"if","cond":{"expr":"lit","value":true},"path":"complete.run[0]","then":[{"op":"repeat","times":{"expr":"lit","value":3},"path":"complete.run[0].then[0]","do":[{"op":"fn","fn":"finish","path":"complete.finish"},{"op":"fn","fn":"tap","path":"complete.after_assertion"}]}]},{"op":"fn","fn":"log","path":"complete.after_loop"}]}},
             "run":[{"op":"fn","fn":"complete","path":"run[0]"},{"op":"fn","fn":"tap","path":"run[1]"}]
         })).unwrap();
         let host = FakeHost::with("finish", serde_json::json!({"goal":true}));
-        assert_eq!(
-            run(&program, &host, None).unwrap(),
-            serde_json::json!({"goal":true})
-        );
+        assert_eq!(run(&program, &host, None).unwrap(), Value::Null);
         let calls = host.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "finish");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["finish", "tap", "finish", "tap", "finish", "tap", "log", "tap"]
+        );
     }
 }

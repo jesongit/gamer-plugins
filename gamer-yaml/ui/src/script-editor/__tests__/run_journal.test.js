@@ -6,10 +6,92 @@ import { actionRunRows, buildRunTree, filterRunRows, flattenRunTree, runRowState
 import { useRunJournal } from '../../components/console/useRunJournal'
 import RunDetails from '../../components/console/RunDetails.vue'
 import { api } from '../../../../../../web/src/api'
-vi.mock('../../../../../../web/src/api', () => ({ api: { listRunHistory: vi.fn(), getRun: vi.fn(), getRunEvents: vi.fn() } }))
+import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
+vi.mock('../../../../../../web/src/api', () => ({ api: { listRunHistory: vi.fn(), getRun: vi.fn(), getRunEvents: vi.fn(), cancelRun: vi.fn(), listExtensions: vi.fn(), getRunTrace: vi.fn() } }))
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks() })
 const record = (id = 'a') => ({ run_id: id, device_id: 'd', entrypoint: 'p/main.yaml', started_at: '2026-09-23T00:00:00Z', finished_at: '2026-09-23T00:00:02Z', state: 'failed', error: '未找到模板' })
 const event = (id, ev, extra = {}) => ({ id, ev, time: `2026-09-23T00:00:0${id}Z`, trace: { frame_id: 0 }, ...extra })
+
+it('opens the latest task run without replacing device history selection and retains task scope through pagination', async () => {
+  const latest = { ...record('task-latest'), task_id: 'task-one' }
+  const older = { ...record('task-older'), task_id: 'task-one', device_id: 'previous-device' }
+  const deviceRun = record('device-selection')
+  api.listRunHistory.mockImplementation((device, entrypoint, before, task) => Promise.resolve(task ? before ? [older] : Array.from({ length: 30 }, (_, i) => i ? { ...record(`task-${i}`), task_id: task } : latest) : [deviceRun]))
+  api.getRun.mockImplementation(id => Promise.resolve(id === deviceRun.run_id ? deviceRun : id === older.run_id ? older : latest))
+  api.getRunEvents.mockResolvedValue({ events: [], next: 0, has_more: false })
+  const scope = effectScope(); let deviceJournal, taskJournal
+  scope.run(() => {
+    deviceJournal = useRunJournal(ref('task-scope-device'), ref(''))
+    taskJournal = useRunJournal(ref('task-scope-device'), ref(''), ref(true), ref('task-one'))
+  })
+  try {
+    await flushPromises()
+    expect(taskJournal.selected.value).toBe('task-latest')
+    expect(deviceJournal.selected.value).toBe('device-selection')
+    expect(api.listRunHistory).toHaveBeenCalledWith(undefined, undefined, undefined, 'task-one')
+    await taskJournal.loadOlder(); await flushPromises()
+    expect(api.listRunHistory).toHaveBeenLastCalledWith(undefined, undefined, 'task-29', 'task-one')
+    taskJournal.selected.value = older.run_id; await flushPromises()
+    expect(taskJournal.record.value.device_id).toBe('previous-device')
+    expect(deviceJournal.selected.value).toBe('device-selection')
+  } finally { scope.stop() }
+})
+
+it('discards late history responses after switching tasks on the same device', async () => {
+  let resolveFirst
+  api.listRunHistory.mockImplementation((device, entrypoint, before, task) => task === 'slow-task' ? new Promise(resolve => { resolveFirst = resolve }) : Promise.resolve([{ ...record('fast-run'), task_id: task }]))
+  api.getRun.mockResolvedValue({ ...record('fast-run'), task_id: 'fast-task' })
+  api.getRunEvents.mockResolvedValue({ events: [], next: 0, has_more: false })
+  const task = ref('slow-task'), scope = effectScope(); let journal
+  scope.run(() => { journal = useRunJournal(ref('shared-device'), ref(''), ref(true), task) })
+  task.value = 'fast-task'; await flushPromises()
+  resolveFirst([{ ...record('stale-run'), task_id: 'slow-task' }]); await flushPromises()
+  expect(journal.records.value.map(run => run.run_id)).toEqual(['fast-run'])
+  expect(journal.selected.value).toBe('fast-run')
+  scope.stop()
+})
+
+it('opens the failing action inspector from the task recovery button', async () => {
+  const run = { ...record('task-root-failure'), task_id: 'task-inspect' }
+  api.listRunHistory.mockResolvedValue([run]); api.getRun.mockResolvedValue(run)
+  let finishLoading
+  api.getRunEvents.mockReturnValue(new Promise(resolve => { finishLoading = resolve }))
+  const wrapper = mount(RunDetails, { props: { taskId: 'task-inspect', deviceId: 'd' } })
+  try {
+    await flushPromises()
+    expect(wrapper.find('.run-recovery button').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('.run-recovery button').text()).toBe('正在读取异常动作…')
+    finishLoading({ events: [
+    event(1, 'step_start', { path: 'run[0]', desc: '外层调用' }),
+    event(2, 'step_start', { path: 'functions.test.run[0]', desc: '明确失败' }),
+    event(3, 'step_end', { path: 'functions.test.run[0]', ok: false, error: '实际失败' }),
+    event(4, 'step_end', { path: 'run[0]', ok: false, error: '实际失败' }),
+    ], next: 4, has_more: false })
+    await flushPromises()
+    expect(wrapper.find('.run-recovery button').attributes('disabled')).toBeUndefined()
+    await wrapper.find('.run-recovery button').trigger('click'); await flushPromises()
+    expect(wrapper.find('.journal-inspector').exists()).toBe(true)
+    expect(wrapper.find('.inspector-header strong').text()).toBe('明确失败')
+  } finally { wrapper.unmount() }
+})
+
+it('stops the selected active run and never offers stop for an old finished record', async () => {
+  const active = { ...record('cancel-live'), state: 'running', finished_at: undefined, error: undefined }
+  const old = record('cancel-old')
+  api.listRunHistory.mockResolvedValue([active, old])
+  api.getRun.mockImplementation(async id => id === active.run_id ? active : old)
+  api.getRunEvents.mockResolvedValue({ events: [], next: 0, has_more: false })
+  api.cancelRun.mockImplementation(async () => { active.state = 'stopping'; return { cancelling: true } })
+  const wrapper = mount(RunDetails, { props: { deviceId: 'cancel-device', liveRun: active.run_id } })
+  try {
+    await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === '停止运行').trigger('click'); await flushPromises()
+    expect(api.cancelRun).toHaveBeenCalledExactlyOnceWith('cancel-live')
+    expect(wrapper.findAll('button').find(b => b.text() === '正在停止…').attributes('disabled')).toBeDefined()
+    await wrapper.find('select').setValue('cancel-old'); await flushPromises()
+    expect(wrapper.findAll('button').some(b => ['停止运行', '正在停止…'].includes(b.text()))).toBe(false)
+  } finally { wrapper.unmount() }
+})
 
 it('keeps the chosen run when switching scripts/functions and remounting either panel', async () => {
   const runs = [record('switch-new'), { ...record('switch-old'), entrypoint: 'p#领取奖励' }]
@@ -279,4 +361,22 @@ it('summarizes false and zero return values without treating them as errors', ()
     expect(stepSummary(rows[0].node)).toBe(`result = ${value}`)
     expect(runRowState(rows[0].node)).toBe('success')
   }
+})
+it('a failed run offers anomaly review while AI actions remain unavailable across package boundaries', async () => {
+  const failed = { ...record('package-boundary'), runner_id: 'gamer-yaml', content_package: 'p' }
+  api.listRunHistory.mockResolvedValue([failed]); api.getRun.mockResolvedValue(failed)
+  api.getRunEvents.mockResolvedValue({ events: [event(1,'step_start',{path:'run[0]',desc:'等待模板'}),event(2,'step_end',{path:'run[0]',ok:false})], next:2, has_more:false })
+  api.listExtensions.mockResolvedValue({ extensions: [{ id:'gamer-ai', state:'running' }] })
+  api.getRunTrace.mockResolvedValue({ enabled:false, status:'disabled', images:[], gaps:[] })
+  const wrapper = mount(RunDetails, { props:{deviceId:'scope-device'}, global:{provide:{[WORKSPACE_CONTEXT_KEY]:{getSnapshot:()=>({currentPackageId:'other'})}}} })
+  try {
+    await flushPromises()
+    const button = label => wrapper.findAll('button').find(item=>item.text()===label)
+    expect(button('复制 Agent 引用')).toBeDefined()
+    expect(button('交给 AI 分析')).toBeUndefined()
+    expect(button('查看失败版本').attributes('disabled')).toBeDefined()
+    await button('查看异常动作').trigger('click'); await flushPromises()
+    expect(wrapper.get('.issue-filter input').element.checked).toBe(true)
+    expect(api.cancelRun).not.toHaveBeenCalled()
+  } finally {wrapper.unmount()}
 })

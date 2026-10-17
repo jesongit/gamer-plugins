@@ -26,7 +26,7 @@ use crate::core::events::{RuntimeEvent, RuntimeEventKind};
 use crate::extensions::host_api::HostApi;
 use crate::extensions::wit;
 
-/// Request/response Component runtime for YAML V2. Unlike the generic
+/// Request/response Component runtime for YAML. Unlike the generic
 /// lifecycle runtime this invokes a supplied lowered program and does not
 /// compile the interpreter source into the host process.
 ///
@@ -156,11 +156,13 @@ impl crate::core::events::EventSink for TracedSink {
 }
 
 struct YamlHostState {
+    execution_policy: Option<crate::core::ExecutionPolicy>,
     contract_ready: bool,
     contract_deadline: Option<Instant>,
     run_state: Arc<super::yaml_extension::YamlRunState>,
     notification: Option<super::notification::Sender>,
     ocr: Option<super::ocr_bridge::Recognizer>,
+    live_switcher: Option<super::live_bridge::Switcher>,
     current_trace: Option<serde_json::Value>,
     settings: super::settings::Settings,
     host: HostApi,
@@ -177,11 +179,13 @@ impl YamlHostState {
         sink: Option<Arc<dyn crate::core::events::EventSink>>,
     ) -> Self {
         Self {
+            execution_policy: None,
             contract_ready: false,
             contract_deadline: None,
             run_state: Arc::new(super::yaml_extension::YamlRunState::new()),
             notification: None,
             ocr: None,
+            live_switcher: None,
             current_trace: None,
             host,
             cancelled,
@@ -215,6 +219,26 @@ impl YamlHostState {
         }
         *self.run_state.trace_context.write().unwrap() =
             self.current_trace.clone().unwrap_or(serde_json::json!({}));
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(args_json) {
+            if event["ev"] == "call_end" {
+                let frame = event["trace"]["frame_id"].as_u64().unwrap_or(0);
+                let ok = event["ok"] == true;
+                let results = block_on_yaml(async {
+                    Ok(self
+                        .run_state
+                        .result_notifications
+                        .settle(
+                            Some(frame),
+                            ok,
+                            event["error"].as_str(),
+                            self.notification.as_ref(),
+                        )
+                        .await)
+                })
+                .unwrap_or_default();
+                self.emit_notification_results(results);
+            }
+        }
         let sink = self.sink.clone();
         let context = self.app_context.clone();
         let args_json = args_json.to_string();
@@ -247,6 +271,23 @@ impl YamlHostState {
                 tracing::debug!(%error, "yaml run event emit failed");
                 Ok("null".to_string())
             }
+        }
+    }
+
+    fn emit_notification_results(&self, results: Vec<serde_json::Value>) {
+        let (Some(sink), Some(context)) = (&self.sink, &self.app_context) else {
+            return;
+        };
+        for result in results {
+            let mut event = RuntimeEvent::new(
+                context.device_id.clone(),
+                RuntimeEventKind::Detail {
+                    name: "notification_result".into(),
+                    data: result,
+                },
+            );
+            event.trace = self.current_trace.clone();
+            let _ = block_on_yaml(sink.emit(event));
         }
     }
 }
@@ -291,7 +332,9 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
             let settings = self.settings.clone();
             let notification = self.notification.clone();
             let ocr = self.ocr.clone();
+            let live_switcher = self.live_switcher.clone();
             let run_state = self.run_state.clone();
+            let execution_policy = self.execution_policy.clone();
             let result = block_on_yaml(async move {
                 let context =
                     context.ok_or_else(|| anyhow::anyhow!("capability.invoke 需要 AppContext"))?;
@@ -320,7 +363,9 @@ impl wit::yaml::gamer::host::capability::Host for YamlHostState {
                     settings,
                     notification,
                     ocr,
+                    live_switcher,
                     run_state,
+                    execution_policy,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&value)?)
@@ -409,7 +454,6 @@ impl LazyYamlWasmtimeRuntime {
         &self,
         request: YamlWasmRunRequest,
     ) -> Result<YamlWasmRunResult, anyhow::Error> {
-        let require_goal = request.program["require_goal"].as_bool().unwrap_or(false);
         let mut digest = [0u8; 32];
         digest.copy_from_slice(Sha256::digest(&request.wasm).as_slice());
         let component = {
@@ -445,6 +489,16 @@ impl LazyYamlWasmtimeRuntime {
         );
         state.notification = request.notification;
         state.ocr = request.ocr;
+        state.live_switcher = request.live_switcher;
+        state.execution_policy = request.execution_policy;
+        *state.run_state.private_templates.write().unwrap() = request.private_templates;
+        *state.run_state.required_checks.write().unwrap() = request
+            .program
+            .get("_required_checkpoints")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
         *state.run_state.trace_context.write().unwrap() = request
             .program
             .get("trace")
@@ -565,26 +619,43 @@ impl LazyYamlWasmtimeRuntime {
                 ));
             }
         }
-        let (result,) = match call_result {
-            Ok(result) => result,
-            Err(error) => {
-                if request.stop.load(Ordering::Relaxed) {
-                    // epoch trap 取消：与 capability 边界的 Cancelled 同形，
-                    // 错误文本带机器可读码。
-                    anyhow::bail!("CANCELLED: guest 执行被宿主取消打断（epoch trap）");
+        let outcome = (|| -> Result<YamlWasmRunResult, anyhow::Error> {
+            let (result,) = match call_result {
+                Ok(result) => result,
+                Err(error) => {
+                    if request.stop.load(Ordering::Relaxed) {
+                        // epoch trap 取消：与 capability 边界的 Cancelled 同形，
+                        // 错误文本带机器可读码。
+                        anyhow::bail!("CANCELLED: guest 执行被宿主取消打断（epoch trap）");
+                    }
+                    // 非取消类 trap（栈溢出等）映射为运行失败，保留 trap 摘要。
+                    anyhow::bail!("YAML guest 执行失败: {error:#}");
                 }
-                // 非取消类 trap（栈溢出等）映射为运行失败，保留 trap 摘要。
-                anyhow::bail!("YAML guest 执行失败: {error:#}");
-            }
-        };
-        let result = result.map_err(|error| anyhow::anyhow!("YAML guest 返回错误: {error}"))?;
-        anyhow::ensure!(
-            !require_goal || store.data().run_state.goal_verified.load(Ordering::Relaxed),
-            "GOAL_NOT_REACHED: 宿主未确认最后一次输入后的完成画面"
-        );
-        let value = serde_json::from_str::<serde_json::Value>(&result)
-            .map_err(|error| anyhow::anyhow!("YAML guest 返回值不是 JSON: {error}"))?;
-        Ok(YamlWasmRunResult { value })
+            };
+            let result = result.map_err(|error| anyhow::anyhow!("YAML guest 返回错误: {error}"))?;
+            let value = serde_json::from_str::<serde_json::Value>(&result)
+                .map_err(|error| anyhow::anyhow!("YAML guest 返回值不是 JSON: {error}"))?;
+            Ok(YamlWasmRunResult { value })
+        })();
+        // Interpreter events can be skipped by a host trap or malformed return.
+        // Settle every still-active scope after final result validation.
+        let error = outcome.as_ref().err().map(ToString::to_string);
+        let data = store.data();
+        let results = block_on_yaml(async {
+            Ok(data
+                .run_state
+                .result_notifications
+                .settle(
+                    None,
+                    outcome.is_ok(),
+                    error.as_deref(),
+                    data.notification.as_ref(),
+                )
+                .await)
+        })
+        .unwrap_or_default();
+        data.emit_notification_results(results);
+        outcome
     }
 }
 

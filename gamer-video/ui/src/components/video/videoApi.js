@@ -7,7 +7,7 @@
 // 集成者后续可决定是否把本封装收编进 api.js。
 
 import { handleUnauthorized } from '../../../../../../web/src/auth'
-import { GAMER_VIDEO_PLUGIN_ID, GAMER_YAML_PLUGIN_ID, VIDEO_PROJECT_DIR } from '../../../../../../web/src/gamer-plugin-ids'
+import { GAMER_VIDEO_PLUGIN_ID, GAMER_YAML_PLUGIN_ID } from '../../../../../../web/src/gamer-plugin-ids'
 
 /** 视频工作台 API 的稳定错误形态：调用方按 status / code / data 判断。 */
 function makeError(status, code, message, data = null, cause) {
@@ -79,16 +79,6 @@ export function ptsFromTime(seconds) {
   const t = Number(seconds)
   if (!Number.isFinite(t) || t <= 0) return 0
   return Math.round(t * 1e6)
-}
-
-/** 项目资源 URL（GET/PUT/DELETE 同形；不发请求）。 */
-function projectUrlOf(packageId, projectId) {
-  const pkg = encodeURIComponent(requireId(packageId, 'package_id'))
-  const path = `${VIDEO_PROJECT_DIR}/${requireId(projectId, 'project_id')}.json`
-  return `/api/packages/${pkg}/plugins/${encodeURIComponent(GAMER_VIDEO_PLUGIN_ID)}/resources/${path
-    .split('/')
-    .map(segment => encodeURIComponent(segment))
-    .join('/')}`
 }
 
 /**
@@ -205,48 +195,8 @@ export const videoApi = {
     `/api/media/${encodeURIComponent(requireId(id, 'media_id'))}/frames/${Math.max(0, Math.round(Number(index) || 0))}`,
   ),
 
-  // ---- 项目（Phase 6：Package 资源 API 承载，plugins/gamer-video/projects/<id>.json）----
+
   // 文本 JSON + 乐观并发 expected_version（Core 不解释内容；409/400 诊断原样上抛）。
-
-  /** GET /api/packages/:pkg/plugins/gamer-video/resources?prefix=projects/ → 资源条目数组。 */
-  listProjectEntries: async (packageId) => {
-    const pkg = encodeURIComponent(requireId(packageId, 'package_id'))
-    const base = `/api/packages/${pkg}/plugins/${encodeURIComponent(GAMER_VIDEO_PLUGIN_ID)}/resources`
-    const rep = await request('GET', `${base}?prefix=${encodeURIComponent(`${VIDEO_PROJECT_DIR}/`)}`)
-    return Array.isArray(rep?.resources) ? rep.resources : []
-  },
-
-  /** 项目资源 URL（GET/PUT/DELETE 同形；不发请求）。 */
-  projectUrl: projectUrlOf,
-
-  /** GET 项目 → 资源条目 `{content, version, path, updated_at, ...}`（含注记字段）。 */
-  getProject: async (packageId, projectId) => request('GET', projectUrlOf(packageId, projectId)),
-
-  /** PUT 项目：content 文本 + expected_version 乐观并发（force 显式跳过）。 */
-  putProject: async (packageId, projectId, content, { expectedVersion, force } = {}) => request(
-    'PUT',
-    projectUrlOf(packageId, projectId),
-    {
-      content: requireId(content, 'content'),
-      expected_version: expectedVersion || undefined,
-      force: force === true || undefined,
-    },
-  ),
-
-  /** DELETE 项目 → 204 → null。 */
-  deleteProject: async (packageId, projectId) => request('DELETE', projectUrlOf(packageId, projectId)),
-
-  /** POST rename：项目重命名（资源原子移动；body `{path, new_path}`）。 */
-  renameProject: async (packageId, projectId, newProjectId) => {
-    const pkg = encodeURIComponent(requireId(packageId, 'package_id'))
-    const base = `/api/packages/${pkg}/plugins/${encodeURIComponent(GAMER_VIDEO_PLUGIN_ID)}/rename`
-    return request('POST', base, {
-      path: `${VIDEO_PROJECT_DIR}/${requireId(projectId, 'project_id')}.json`,
-      new_path: `${VIDEO_PROJECT_DIR}/${requireId(newProjectId, 'new_project_id')}.json`,
-    })
-  },
-
-  // ---- 录制（合同 §2）----
 
   /** POST /api/recording/start {device_id} → 202 RecordingSessionMeta；设备已有活动会话 409。 */
   recordingStart: async (deviceId) => request(
@@ -294,21 +244,35 @@ export const videoApi = {
     return Array.isArray(rep?.events) ? rep.events : []
   },
 
-  // Samples are video-owned evidence. Script generation belongs to automation.
-  listSamples: async packageId => {
-    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.list', values: { package_id: requireId(packageId, 'package_id') } })
+  // Samples are independent video evidence, shared across automation Packages.
+  listSamples: async () => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.list', values: {} })
     return (result?.data || result)?.samples || []
   },
   createSample: async values => {
     const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.create', values })
     return result?.data || result
   },
-  readSample: async (packageId, sampleId) => {
-    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.read', values: { package_id: requireId(packageId, 'package_id'), sample_id: requireId(sampleId, 'sample_id') } })
+  readSample: async sampleId => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.read', values: { sample_id: requireId(sampleId, 'sample_id') } })
     return result?.data || result
   },
-  sampleUrl: (packageId, sampleId) => `/api/packages/${encodeURIComponent(requireId(packageId, 'package_id'))}/plugins/${GAMER_VIDEO_PLUGIN_ID}/resources/samples/${encodeURIComponent(requireId(sampleId, 'sample_id'))}.gamersample`,
-  importSample: async (packageId, sampleId, bytes) => request('PUT', `/api/packages/${encodeURIComponent(requireId(packageId, 'package_id'))}/plugins/${GAMER_VIDEO_PLUGIN_ID}/resources/samples/${encodeURIComponent(requireId(sampleId, 'sample_id'))}.gamersample`, bytes, { raw: true, contentType: 'application/octet-stream' }),
+  importSample: async bytes => {
+    const array = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+    let binary = ''
+    for (let offset = 0; offset < array.length; offset += 32768) binary += String.fromCharCode(...array.subarray(offset, offset + 32768))
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.import', values: { base64: btoa(binary) } })
+    return result?.data || result
+  },
+  exportSample: async sampleId => {
+    const result = await request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.export', values: { sample_id: requireId(sampleId, 'sample_id') } })
+    const encoded = (result?.data || result).base64
+    const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0))
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }))
+    const link = document.createElement('a'); link.href = url; link.download = `${sampleId}.gamersample`; link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  },
+  deleteSample: sampleId => request('POST', `/api/extensions/${GAMER_VIDEO_PLUGIN_ID}/call`, { action: 'sample.delete', values: { sample_id: requireId(sampleId, 'sample_id') } }),
 
   /**
    * 从确定帧创建模板（Phase 7 §10.2，动作清单 template.create_from_frame）：
