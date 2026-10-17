@@ -527,6 +527,8 @@ fn create(
     Ok((manifest, bytes))
 }
 
+// Archive frame identity and media extraction context must travel together.
+#[allow(clippy::too_many_arguments)]
 fn add_frame(
     media: &MediaService,
     segments: &[SegmentMeta],

@@ -237,16 +237,10 @@ mod tests {
             calls,
             BTreeSet::from(["find_any".into(), "tap".into(), "log".into()])
         );
-        let renamed = rename_template_source(
-            &format!("{SOURCE}"),
-            "old.png",
-            "old.png",
-            "new.png",
-            "new.png",
-        )
-        .unwrap()
-        .unwrap()
-        .0;
+        let renamed = rename_template_source(SOURCE, "old.png", "old.png", "new.png", "new.png")
+            .unwrap()
+            .unwrap()
+            .0;
         assert!(renamed.contains("new.png") && renamed.contains("$other"));
         assert!(parse_script(&renamed).is_ok());
         let library = format!(

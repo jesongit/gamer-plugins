@@ -471,7 +471,7 @@ async fn run_process(
         _=tokio::time::sleep_until(deadline)=>Err(anyhow::anyhow!("OCR 识别超时")),
         status=child.wait()=>status.context("等待 OCR 进程失败"),
     };
-    if status.is_err() {
+    if let Err(error) = status {
         // No deadline here: lifecycle completion means the OS process has exited.
         let _ = child.start_kill();
         let waited = child.wait().await;
@@ -480,7 +480,7 @@ async fn run_process(
         let _ = output.await;
         let _ = diagnostic.await;
         waited.context("停止 OCR 进程失败")?;
-        return Err(status.unwrap_err());
+        return Err(error);
     }
     let status = status?;
     let written = writer.await.context("OCR 输入任务异常")?;

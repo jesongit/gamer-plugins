@@ -662,7 +662,7 @@ async fn same_draft_gate_covers_pending_submit_and_starting_run_blocks_deletion_
                 ..Default::default()
             })
             .unwrap(),
-            &[run.run_id.clone()]
+            std::slice::from_ref(&run.run_id)
         )
         .unwrap_err()
         .to_string()

@@ -112,16 +112,17 @@ async fn real_http_form_redacts_errors_deduplicates_and_rate_limits() {
     s.manual("next", "two").unwrap();
     wait_results(&s, 2).await;
     task.await.unwrap();
-    let rows = requests.lock();
-    assert_eq!(rows.len(), 2);
-    assert!(rows[1].0.duration_since(rows[0].0) >= Duration::from_millis(75));
-    assert!(rows[0].1.contains("SESSDATA=session-fixture; bili_jct="));
-    assert!(
-        rows[0].1.contains("roomid=123")
-            && rows[0].1.contains("csrf=0123456789abcdef0123456789abcdef")
-    );
-    assert!(rows[0].1.contains("Gamer"));
-    drop(rows);
+    {
+        let rows = requests.lock();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].0.duration_since(rows[0].0) >= Duration::from_millis(75));
+        assert!(rows[0].1.contains("SESSDATA=session-fixture; bili_jct="));
+        assert!(
+            rows[0].1.contains("roomid=123")
+                && rows[0].1.contains("csrf=0123456789abcdef0123456789abcdef")
+        );
+        assert!(rows[0].1.contains("Gamer"));
+    }
     let result = s.read();
     assert_eq!(result["recent"][0]["state"], "failed");
     assert!(result["last_error"].as_str().unwrap().contains("-101"));

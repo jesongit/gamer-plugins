@@ -87,184 +87,7 @@ impl VideoTools {
         )
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mcp::{AllowedObjects, CreateTokenRequest, CredentialStore, ReceiptStore};
-    fn context(root: &Path, sample: &str) -> InvocationContext {
-        let credentials = std::sync::Arc::new(CredentialStore::open(root).unwrap());
-        let token = credentials
-            .create(CreateTokenRequest {
-                label: "synthetic sample".into(),
-                scopes: [
-                    "plugin.gamer-video.read",
-                    "plugin.gamer-video.import",
-                    "media.read",
-                ]
-                .map(str::to_owned)
-                .into(),
-                allowed: AllowedObjects {
-                    plugins: ["gamer-video".into()].into(),
-                    media: [sample.into()].into(),
-                    ..Default::default()
-                },
-                expires_in_seconds: 60,
-            })
-            .unwrap();
-        InvocationContext::new(
-            credentials.authenticate(&token.token).unwrap(),
-            "synthetic".into(),
-            Some("synthetic-operation".into()),
-            credentials,
-            std::sync::Arc::new(ReceiptStore::open(root).unwrap()),
-        )
-    }
-    #[tokio::test]
-    async fn sample_export_checks_the_archive_snapshot_and_refuses_a_replaced_fingerprint() {
-        let (mut manifest, files) = super::super::tests::fixture();
-        let root = tempfile::tempdir().unwrap();
-        let ctx = context(&root.path().join("mcp"), &manifest.id);
-        let tools = VideoTools::new(root.path());
-        let original = encode_archive(&manifest, &files).unwrap();
-        let old = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256});
-        {
-            let _io = SAMPLE_IO.lock().unwrap();
-            save_standalone(root.path(), &manifest, &original).unwrap();
-        }
-        let first = tools
-            .call(ctx.clone(), "external.sample_export", old.clone())
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .decode(first["base64"].as_str().unwrap())
-                .unwrap(),
-            original
-        );
-        manifest.name = "replacement of the same sample id".into();
-        manifest.content_sha256 = fingerprint(&manifest).unwrap();
-        let replacement = encode_archive(&manifest, &files).unwrap();
-        // Management delete/import can reuse an ID. Every export chunk must
-        // validate and use one archive, rather than trusting an earlier read.
-        {
-            let _io = SAMPLE_IO.lock().unwrap();
-            std::fs::remove_file(sample_disk(root.path(), &manifest.id).unwrap()).unwrap();
-            save_standalone(root.path(), &manifest, &replacement).unwrap();
-        }
-        assert!(tools
-            .call(ctx.clone(), "external.sample_export", old)
-            .await
-            .is_err());
-        let next = tools
-            .call(
-                ctx,
-                "external.sample_export",
-                json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256}),
-            )
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .decode(next["base64"].as_str().unwrap())
-                .unwrap(),
-            replacement
-        );
-        assert_eq!(next["chunk_sha256"], hash(&replacement));
-    }
-    #[tokio::test]
-    async fn external_sample_images_events_and_exact_export_need_no_video_or_package() {
-        let (manifest, files) = super::super::tests::fixture();
-        let archive = encode_archive(&manifest, &files).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let ctx = context(&root.path().join("mcp"), &manifest.id);
-        let tools = VideoTools::new(root.path());
-        let import = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256,"base64":base64::engine::general_purpose::STANDARD.encode(&archive),"operation_id":"synthetic-import"});
-        let mut forged = ctx.clone();
-        forged.operation_id = None;
-        assert!(tools
-            .call(forged, "external.sample_import", import.clone())
-            .await
-            .is_err());
-        tools
-            .call(ctx.clone(), "external.sample_import", import.clone())
-            .await
-            .unwrap();
-        let args = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256});
-        let read = tools
-            .call(ctx.clone(), "external.sample_read", args.clone())
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert_eq!(read["original_video_required"], false);
-        let mut frames = args.clone();
-        frames["limit"] = json!(1);
-        let page = tools
-            .call(ctx.clone(), "external.sample_frames", frames)
-            .await
-            .unwrap()
-            .structured_content
-            .unwrap();
-        assert_eq!(page["items"].as_array().unwrap().len(), 1);
-        assert_eq!(page["next_offset"], 1);
-        let mut frame = args.clone();
-        frame["frame_id"] = json!("start");
-        let image = tools
-            .call(ctx.clone(), "external.sample_frame", frame)
-            .await
-            .unwrap();
-        assert!(image.content.iter().any(|block| block["type"] == "image"));
-        assert_eq!(image.structured_content.unwrap()["original_width"], 16);
-        let mut exported = vec![];
-        let mut offset = 0;
-        loop {
-            let mut range = args.clone();
-            range["offset"] = json!(offset);
-            range["max_bytes"] = json!(97);
-            let part = tools
-                .call(ctx.clone(), "external.sample_export", range)
-                .await
-                .unwrap()
-                .structured_content
-                .unwrap();
-            exported.extend(
-                base64::engine::general_purpose::STANDARD
-                    .decode(part["base64"].as_str().unwrap())
-                    .unwrap(),
-            );
-            if part["complete"] == true {
-                break;
-            }
-            offset = part["next_offset"].as_u64().unwrap();
-        }
-        assert_eq!(exported, archive);
-        let mut wrong = args.clone();
-        wrong["sample_id"] = json!("ungranted-sample");
-        wrong["package_id"] = json!("default");
-        assert!(tools
-            .call(ctx.clone(), "external.sample_read", wrong)
-            .await
-            .is_err());
-        let mut wrong_hash = args;
-        wrong_hash["content_sha256"] = json!("changed");
-        assert!(tools
-            .call(ctx.clone(), "external.sample_read", wrong_hash)
-            .await
-            .is_err());
-        let mut forged = import;
-        forged["content_sha256"] = json!("changed");
-        assert!(tools
-            .call(ctx, "external.sample_import", forged)
-            .await
-            .is_err());
-        assert!(!root.path().join("media").exists());
-        assert!(!root.path().join("packages").exists());
-    }
-}
+
 fn text<'a>(args: &'a Value, key: &str) -> Result<&'a str, McpError> {
     args[key]
         .as_str()
@@ -479,5 +302,184 @@ impl ExternalToolHandler for VideoTools {
         };
         ctx.check_active()?;
         Ok(ToolResult::json(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::{AllowedObjects, CreateTokenRequest, CredentialStore, ReceiptStore};
+    fn context(root: &Path, sample: &str) -> InvocationContext {
+        let credentials = std::sync::Arc::new(CredentialStore::open(root).unwrap());
+        let token = credentials
+            .create(CreateTokenRequest {
+                label: "synthetic sample".into(),
+                scopes: [
+                    "plugin.gamer-video.read",
+                    "plugin.gamer-video.import",
+                    "media.read",
+                ]
+                .map(str::to_owned)
+                .into(),
+                allowed: AllowedObjects {
+                    plugins: ["gamer-video".into()].into(),
+                    media: [sample.into()].into(),
+                    ..Default::default()
+                },
+                expires_in_seconds: 60,
+            })
+            .unwrap();
+        InvocationContext::new(
+            credentials.authenticate(&token.token).unwrap(),
+            "synthetic".into(),
+            Some("synthetic-operation".into()),
+            credentials,
+            std::sync::Arc::new(ReceiptStore::open(root).unwrap()),
+        )
+    }
+    #[tokio::test]
+    async fn sample_export_checks_the_archive_snapshot_and_refuses_a_replaced_fingerprint() {
+        let (mut manifest, files) = super::super::tests::fixture();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = context(&root.path().join("mcp"), &manifest.id);
+        let tools = VideoTools::new(root.path());
+        let original = encode_archive(&manifest, &files).unwrap();
+        let old = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256});
+        {
+            let _io = SAMPLE_IO.lock().unwrap();
+            save_standalone(root.path(), &manifest, &original).unwrap();
+        }
+        let first = tools
+            .call(ctx.clone(), "external.sample_export", old.clone())
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(first["base64"].as_str().unwrap())
+                .unwrap(),
+            original
+        );
+        manifest.name = "replacement of the same sample id".into();
+        manifest.content_sha256 = fingerprint(&manifest).unwrap();
+        let replacement = encode_archive(&manifest, &files).unwrap();
+        // Management delete/import can reuse an ID. Every export chunk must
+        // validate and use one archive, rather than trusting an earlier read.
+        {
+            let _io = SAMPLE_IO.lock().unwrap();
+            std::fs::remove_file(sample_disk(root.path(), &manifest.id).unwrap()).unwrap();
+            save_standalone(root.path(), &manifest, &replacement).unwrap();
+        }
+        assert!(tools
+            .call(ctx.clone(), "external.sample_export", old)
+            .await
+            .is_err());
+        let next = tools
+            .call(
+                ctx,
+                "external.sample_export",
+                json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256}),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(next["base64"].as_str().unwrap())
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(next["chunk_sha256"], hash(&replacement));
+    }
+    #[tokio::test]
+    async fn external_sample_images_events_and_exact_export_need_no_video_or_package() {
+        let (manifest, files) = super::super::tests::fixture();
+        let archive = encode_archive(&manifest, &files).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = context(&root.path().join("mcp"), &manifest.id);
+        let tools = VideoTools::new(root.path());
+        let import = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256,"base64":base64::engine::general_purpose::STANDARD.encode(&archive),"operation_id":"synthetic-import"});
+        let mut forged = ctx.clone();
+        forged.operation_id = None;
+        assert!(tools
+            .call(forged, "external.sample_import", import.clone())
+            .await
+            .is_err());
+        tools
+            .call(ctx.clone(), "external.sample_import", import.clone())
+            .await
+            .unwrap();
+        let args = json!({"sample_id":manifest.id,"content_sha256":manifest.content_sha256});
+        let read = tools
+            .call(ctx.clone(), "external.sample_read", args.clone())
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(read["original_video_required"], false);
+        let mut frames = args.clone();
+        frames["limit"] = json!(1);
+        let page = tools
+            .call(ctx.clone(), "external.sample_frames", frames)
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["next_offset"], 1);
+        let mut frame = args.clone();
+        frame["frame_id"] = json!("start");
+        let image = tools
+            .call(ctx.clone(), "external.sample_frame", frame)
+            .await
+            .unwrap();
+        assert!(image.content.iter().any(|block| block["type"] == "image"));
+        assert_eq!(image.structured_content.unwrap()["original_width"], 16);
+        let mut exported = vec![];
+        let mut offset = 0;
+        loop {
+            let mut range = args.clone();
+            range["offset"] = json!(offset);
+            range["max_bytes"] = json!(97);
+            let part = tools
+                .call(ctx.clone(), "external.sample_export", range)
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            exported.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(part["base64"].as_str().unwrap())
+                    .unwrap(),
+            );
+            if part["complete"] == true {
+                break;
+            }
+            offset = part["next_offset"].as_u64().unwrap();
+        }
+        assert_eq!(exported, archive);
+        let mut wrong = args.clone();
+        wrong["sample_id"] = json!("ungranted-sample");
+        wrong["package_id"] = json!("default");
+        assert!(tools
+            .call(ctx.clone(), "external.sample_read", wrong)
+            .await
+            .is_err());
+        let mut wrong_hash = args;
+        wrong_hash["content_sha256"] = json!("changed");
+        assert!(tools
+            .call(ctx.clone(), "external.sample_read", wrong_hash)
+            .await
+            .is_err());
+        let mut forged = import;
+        forged["content_sha256"] = json!("changed");
+        assert!(tools
+            .call(ctx, "external.sample_import", forged)
+            .await
+            .is_err());
+        assert!(!root.path().join("media").exists());
+        assert!(!root.path().join("packages").exists());
     }
 }

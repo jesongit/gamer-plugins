@@ -1402,7 +1402,7 @@ async fn cleanup_restart_requires_review_and_checks_the_cleanup_slot_when_resolv
     f.finish("run-1", "failed");
     *f.active_override.lock() = Some(json!({"run_id":"run-1","state":"failed"}));
     assert!(restored
-        .control("resolve", &[item_id.clone()], "")
+        .control("resolve", std::slice::from_ref(&item_id), "")
         .await
         .is_err());
     *f.active_override.lock() = None;
@@ -2415,17 +2415,23 @@ async fn checkpoint_review_after_restart_settles_actual_goal_without_replaying_c
             .store(evidence == "unavailable", Ordering::SeqCst);
         *f.active_override.lock() = Some(json!({"run_id":"run-0","state":"failed"}));
         assert!(
-            q.control("resolve", &[item_id.clone()], "").await.is_err(),
+            q.control("resolve", std::slice::from_ref(&item_id), "")
+                .await
+                .is_err(),
             "owned slot must actually be released"
         );
         *f.active_override.lock() = None;
-        let result = q.control("resolve", &[item_id.clone()], "").await;
+        let result = q
+            .control("resolve", std::slice::from_ref(&item_id), "")
+            .await;
         if evidence == "unavailable" {
             assert!(result.is_err());
             assert_eq!(q.status(0, "").await["current"]["state"], "review");
             assert_eq!(account(&q).await["reserved"], 1);
             f.checkpoint_error.store(false, Ordering::SeqCst);
-            q.control("resolve", &[item_id.clone()], "").await.unwrap();
+            q.control("resolve", std::slice::from_ref(&item_id), "")
+                .await
+                .unwrap();
         } else {
             result.unwrap();
         }

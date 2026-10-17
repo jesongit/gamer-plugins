@@ -502,58 +502,6 @@ fn yaml_finish_hook(
     })
 }
 
-#[cfg(test)]
-mod finish_hook_tests {
-    use super::*;
-    use crate::run_manager::{RunRecord, RunState};
-
-    #[tokio::test]
-    async fn error_level_log_does_not_change_a_successful_run_into_a_failed_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
-            crate::store::Store::open(&crate::config::Config {
-                data_dir: dir.path().into(),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        let completion = Arc::new(parking_lot::Mutex::new(None));
-        let result = completion.clone();
-        let hook = yaml_finish_hook(
-            db,
-            "target".into(),
-            "default/test.yaml".into(),
-            "task".into(),
-            Some(123),
-            Arc::new(move |value| *result.lock() = Some(value)),
-        );
-        let record = RunRecord {
-            run_id: "run".into(),
-            device_id: "target".into(),
-            runner_id: "gamer-yaml".into(),
-            entrypoint: "default/test.yaml".into(),
-            content_package: Some("default".into()),
-            script_id: "default/test.yaml".into(),
-            source: RunSource::Scheduled,
-            task_id: Some("task".into()),
-            scheduled_at: Some(123),
-            state: RunState::Success,
-            started_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            error: None,
-        };
-        hook(
-            &record,
-            &RunOutcome::Success(vec![("error".into(), "诊断日志，步骤正常结束".into())]),
-        );
-        let actual = completion.lock().take().unwrap();
-        assert!(matches!(actual.outcome, TimerOutcome::Success));
-        assert_eq!(actual.run_id, "run");
-        assert_eq!(actual.task_id, "task");
-        assert_eq!(actual.scheduled_at, Some(123));
-    }
-}
-
 /// P11.2 / ADR-13：ExtensionService 生命周期回调的 YAML 侧绑定。扩展边界在
 /// 此自声明两件事：本扩展拥有的 runner 如何构造（`extension_started`），以及
 /// 本扩展的执行模型是按调用惰性实例化（`executes_without_instance`——`start`
@@ -620,5 +568,57 @@ impl crate::extensions::TimerRunnerRegistrar for YamlTimerRunnerRegistrar {
 
     fn executes_without_instance(&self, extension_id: &str) -> bool {
         extension_id == YAML_EXTENSION_ID
+    }
+}
+
+#[cfg(test)]
+mod finish_hook_tests {
+    use super::*;
+    use crate::run_manager::{RunRecord, RunState};
+
+    #[tokio::test]
+    async fn error_level_log_does_not_change_a_successful_run_into_a_failed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            crate::store::Store::open(&crate::config::Config {
+                data_dir: dir.path().into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let completion = Arc::new(parking_lot::Mutex::new(None));
+        let result = completion.clone();
+        let hook = yaml_finish_hook(
+            db,
+            "target".into(),
+            "default/test.yaml".into(),
+            "task".into(),
+            Some(123),
+            Arc::new(move |value| *result.lock() = Some(value)),
+        );
+        let record = RunRecord {
+            run_id: "run".into(),
+            device_id: "target".into(),
+            runner_id: "gamer-yaml".into(),
+            entrypoint: "default/test.yaml".into(),
+            content_package: Some("default".into()),
+            script_id: "default/test.yaml".into(),
+            source: RunSource::Scheduled,
+            task_id: Some("task".into()),
+            scheduled_at: Some(123),
+            state: RunState::Success,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            error: None,
+        };
+        hook(
+            &record,
+            &RunOutcome::Success(vec![("error".into(), "诊断日志，步骤正常结束".into())]),
+        );
+        let actual = completion.lock().take().unwrap();
+        assert!(matches!(actual.outcome, TimerOutcome::Success));
+        assert_eq!(actual.run_id, "run");
+        assert_eq!(actual.task_id, "task");
+        assert_eq!(actual.scheduled_at, Some(123));
     }
 }

@@ -115,6 +115,8 @@ impl AuthoringService {
             .authoring_call_with_policy(action, values, None, Some(admission))
             .await
     }
+    // Keep the frozen source, templates, materials and admission as explicit inputs.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn import_candidate(
         &self,
         package: &str,

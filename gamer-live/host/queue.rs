@@ -679,8 +679,12 @@ impl Queue {
             }) {
                 emitted.push(Self::notice_item(&next, item, &billing.state));
             }
-            if item.main_result.is_some() && old.is_none_or(|old| old.main_result.is_none()) {
-                let state = item.main_result.as_ref().unwrap().state.as_str();
+            if let Some(result) = item
+                .main_result
+                .as_ref()
+                .filter(|_| old.is_none_or(|old| old.main_result.is_none()))
+            {
+                let state = result.state.as_str();
                 emitted.push(Self::notice_item(
                     &next,
                     item,

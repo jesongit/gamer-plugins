@@ -384,7 +384,7 @@ mod tests {
         let fixtures: Value =
             serde_json::from_str(include_str!("../tests/reference-types.json")).unwrap();
         for fixture in fixtures.as_array().unwrap() {
-            let source = format!("{}", fixture["source"].as_str().unwrap());
+            let source = fixture["source"].as_str().unwrap().to_string();
             let source = source.as_str();
             let diagnostics = if fixture["kind"] == "function_library" {
                 let library = super::super::syntax::parse_function_library(source).unwrap();

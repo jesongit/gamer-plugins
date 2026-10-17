@@ -303,6 +303,105 @@ fn functions(stored: &Stored) -> Result<BTreeMap<String, String>> {
         .map(|(path, bytes)| Ok((path.clone(), String::from_utf8(bytes.clone())?)))
         .collect()
 }
+
+impl Inner {
+    pub(super) async fn legacy_extra(
+        self: &Arc<Self>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        self.legacy_extra_admitted(action, args, None).await
+    }
+    async fn legacy_extra_admitted(
+        self: &Arc<Self>,
+        action: &str,
+        args: &Value,
+        admission: Option<authoring::Admission>,
+    ) -> Result<Value> {
+        if let Some(check) = &admission {
+            check()?;
+        }
+        let package = required(args, "package_id")?;
+        let id = required(args, "candidate_id")?;
+        let _activity = self.packages.acquire_activity(package)?;
+        let metadata_path = self.file(package, id)?;
+        let metadata =
+            super::super::authoring_materials::read_bounded_json(&metadata_path, 8 * 1024 * 1024)?;
+        ensure!(
+            metadata["candidate"]["package_id"] == package && metadata["candidate"]["id"] == id,
+            "candidate scope mismatch"
+        );
+        if action == "generation.export" {
+            let part = args["part"].as_str().unwrap_or("metadata");
+            let path = match part {
+                "metadata" => metadata_path,
+                "snapshot" => self.root(package)?.join(format!("{id}.snapshot")),
+                _ => anyhow::bail!("invalid export part"),
+            };
+            let maximum = if part == "metadata" {
+                8 * 1024 * 1024
+            } else {
+                280 * 1024 * 1024
+            };
+            let stat = std::fs::symlink_metadata(&path)?;
+            ensure!(
+                stat.is_file() && !stat.file_type().is_symlink() && stat.len() <= maximum,
+                "invalid frozen file"
+            );
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            ensure!(offset <= stat.len(), "offset outside file");
+            let count = args["max_bytes"].as_u64().unwrap_or(256 * 1024);
+            ensure!(count > 0 && count <= 256 * 1024, "invalid chunk size");
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![];
+            file.take(count).read_to_end(&mut bytes)?;
+            let next = offset + bytes.len() as u64;
+            return Ok(
+                json!({"candidate_id":id,"part":part,"offset":offset,"total_bytes":stat.len(),
+                "chunk_sha256":format!("{:x}",Sha256::digest(&bytes)),"base64":base64::engine::general_purpose::STANDARD.encode(bytes),
+                "next_offset":if next<stat.len(){Some(next)}else{None},"complete":next==stat.len(),"original_bytes":true}),
+            );
+        }
+        ensure!(
+            action == "generation.import_draft",
+            "unsupported legacy action"
+        );
+        let (metadata, templates, materials, functions) = {
+            let _gate = self.gate.lock();
+            let metadata = super::super::authoring_materials::read_bounded_json(
+                &metadata_path,
+                8 * 1024 * 1024,
+            )?;
+            ensure!(
+                metadata["candidate"]["package_id"] == package && metadata["candidate"]["id"] == id,
+                "candidate scope mismatch"
+            );
+            let stored = self.read(package, id)?;
+            let templates = all_templates(&stored)?;
+            // Capture the same frozen snapshot under the shared mutation gate.
+            ensure!(
+                templates.values().map(Vec::len).sum::<usize>() <= 32 * 1024 * 1024,
+                "legacy template budget exceeded"
+            );
+            let materials=stored.samples.iter().map(|sample|json!({"plugin_id":"gamer-yaml","candidate_id":id,
+                "sample_id":sample.manifest["id"],"content_sha256":sample.manifest["content_sha256"]})).collect();
+            (metadata, templates, materials, functions(&stored)?)
+        };
+        self.authoring
+            .import_candidate(
+                package,
+                required(args, "new_script_id")?,
+                &metadata["candidate"],
+                templates,
+                materials,
+                functions,
+                admission,
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,102 +535,5 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert_eq!(std::fs::read(snapshot_path).unwrap(), snapshot);
-    }
-}
-impl Inner {
-    pub(super) async fn legacy_extra(
-        self: &Arc<Self>,
-        action: &str,
-        args: &Value,
-    ) -> Result<Value> {
-        self.legacy_extra_admitted(action, args, None).await
-    }
-    async fn legacy_extra_admitted(
-        self: &Arc<Self>,
-        action: &str,
-        args: &Value,
-        admission: Option<authoring::Admission>,
-    ) -> Result<Value> {
-        if let Some(check) = &admission {
-            check()?;
-        }
-        let package = required(args, "package_id")?;
-        let id = required(args, "candidate_id")?;
-        let _activity = self.packages.acquire_activity(package)?;
-        let metadata_path = self.file(package, id)?;
-        let metadata =
-            super::super::authoring_materials::read_bounded_json(&metadata_path, 8 * 1024 * 1024)?;
-        ensure!(
-            metadata["candidate"]["package_id"] == package && metadata["candidate"]["id"] == id,
-            "candidate scope mismatch"
-        );
-        if action == "generation.export" {
-            let part = args["part"].as_str().unwrap_or("metadata");
-            let path = match part {
-                "metadata" => metadata_path,
-                "snapshot" => self.root(package)?.join(format!("{id}.snapshot")),
-                _ => anyhow::bail!("invalid export part"),
-            };
-            let maximum = if part == "metadata" {
-                8 * 1024 * 1024
-            } else {
-                280 * 1024 * 1024
-            };
-            let stat = std::fs::symlink_metadata(&path)?;
-            ensure!(
-                stat.is_file() && !stat.file_type().is_symlink() && stat.len() <= maximum,
-                "invalid frozen file"
-            );
-            let offset = args["offset"].as_u64().unwrap_or(0);
-            ensure!(offset <= stat.len(), "offset outside file");
-            let count = args["max_bytes"].as_u64().unwrap_or(256 * 1024);
-            ensure!(count > 0 && count <= 256 * 1024, "invalid chunk size");
-            let mut file = std::fs::File::open(&path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = vec![];
-            file.take(count).read_to_end(&mut bytes)?;
-            let next = offset + bytes.len() as u64;
-            return Ok(
-                json!({"candidate_id":id,"part":part,"offset":offset,"total_bytes":stat.len(),
-                "chunk_sha256":format!("{:x}",Sha256::digest(&bytes)),"base64":base64::engine::general_purpose::STANDARD.encode(bytes),
-                "next_offset":if next<stat.len(){Some(next)}else{None},"complete":next==stat.len(),"original_bytes":true}),
-            );
-        }
-        ensure!(
-            action == "generation.import_draft",
-            "unsupported legacy action"
-        );
-        let (metadata, templates, materials, functions) = {
-            let _gate = self.gate.lock();
-            let metadata = super::super::authoring_materials::read_bounded_json(
-                &metadata_path,
-                8 * 1024 * 1024,
-            )?;
-            ensure!(
-                metadata["candidate"]["package_id"] == package && metadata["candidate"]["id"] == id,
-                "candidate scope mismatch"
-            );
-            let stored = self.read(package, id)?;
-            let templates = all_templates(&stored)?;
-            // Capture the same frozen snapshot under the shared mutation gate.
-            ensure!(
-                templates.values().map(Vec::len).sum::<usize>() <= 32 * 1024 * 1024,
-                "legacy template budget exceeded"
-            );
-            let materials=stored.samples.iter().map(|sample|json!({"plugin_id":"gamer-yaml","candidate_id":id,
-                "sample_id":sample.manifest["id"],"content_sha256":sample.manifest["content_sha256"]})).collect();
-            (metadata, templates, materials, functions(&stored)?)
-        };
-        self.authoring
-            .import_candidate(
-                package,
-                required(args, "new_script_id")?,
-                &metadata["candidate"],
-                templates,
-                materials,
-                functions,
-                admission,
-            )
-            .await
     }
 }
