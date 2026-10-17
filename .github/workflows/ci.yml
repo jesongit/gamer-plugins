@@ -47,6 +47,7 @@ jobs:
         shell: pwsh
         run: |
           $sdk = Get-Content source/sdk/lock.json -Raw | ConvertFrom-Json
+          if ($sdk.snapshot) { throw 'Integration CI requires a committed host SDK snapshot, not a working-tree baseline' }
           if ($sdk.commit -notmatch '^[a-f0-9]{40}$') { throw 'Invalid pinned host commit' }
           "commit=$($sdk.commit)" >> $env:GITHUB_OUTPUT
       - uses: actions/checkout@v4
@@ -81,10 +82,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: official-plugins
-          path: host/web/public
+          path: host/server/target/plugin-test-fixtures
       - run: cargo test --locked --manifest-path host/server/Cargo.toml
         env:
           GAMER_PROFILE: dev
+          GAMER_PLUGIN_TEST_FIXTURE_ROOT: ${{ github.workspace }}/host/server/target/plugin-test-fixtures
       - name: Verify live media output with FFmpeg on loopback
         run: cargo test --locked --manifest-path host/server/Cargo.toml media::output::tests -- --include-ignored
         env:

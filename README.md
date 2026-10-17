@@ -4,13 +4,13 @@
 
 | 插件 | 当前源码版本 | 执行类型 | 使用说明 |
 | --- | --- | --- | --- |
-| `gamer-yaml` 自动化 | `0.1.7` | WASM | [自动化](gamer-yaml/README.md) |
-| `gamer-keymap` 键盘映射 | `0.1.5` | WASM | [键盘映射](gamer-keymap/README.md) |
-| `gamer-video` 视频工作台 | `0.1.4` | builtin | [视频工作台](gamer-video/README.md) |
+| `gamer-yaml` 自动化 | `0.3.21` | WASM | [自动化](gamer-yaml/README.md) |
+| `gamer-keymap` 键盘映射 | `0.1.6` | WASM | [键盘映射](gamer-keymap/README.md) |
+| `gamer-video` 视频工作台 | `0.2.6` | builtin | [视频工作台](gamer-video/README.md) |
 | `gamer-package-publisher` 配置包发布 | `0.1.0` | builtin | [配置包发布](gamer-package-publisher/README.md) |
-| `gamer-live` 直播助手 | `0.2.5` | builtin | [直播助手](gamer-live/README.md) |
-| `gamer-notify` 通知助手 | `0.1.0` | builtin | [通知助手](gamer-notify/README.md) |
-| `gamer-ai` AI 助手 | `0.3.10` | builtin | [AI 助手](gamer-ai/README.md) |
+| `gamer-live` 直播助手 | `0.2.15` | builtin | [直播助手](gamer-live/README.md) |
+| `gamer-notify` 通知助手 | `0.1.1` | builtin | [通知助手](gamer-notify/README.md) |
+| `gamer-ocr` 文字识别 | `0.1.1` | builtin | [文字识别](gamer-ocr/README.md) |
 
 源码迁自 `jesongit/gamer` 的 `689cc47b1fcaa2780fc97cd357db25f23da84ddd:plugins/`；迁移前历史保留在主仓。
 
@@ -24,12 +24,14 @@
 ./gamer-yaml/build.ps1
 ```
 
-构建只需要本仓库，输出在 dist/；不要求兄弟目录存在 Gamer。sdk/ 是固定宿主提交导出的 WIT、UI 构建桥和打包工具快照，sdk/lock.json 记录来源和逐文件 SHA256，构建前强制校验。SDK v1 通过宿主提供的 globalThis.__gamerPluginSdkV1 绑定共享 UI 能力，不打包宿主源码。更新 SDK 使用固定 Gamer checkout 中的 tools/export-plugin-sdk.ps1，审查锁文件变化并执行两仓测试。
+构建只需要本仓库，输出在 dist/；不要求兄弟目录存在 Gamer。sdk/ 保存 WIT、UI 构建桥和打包工具快照，sdk/lock.json 记录真实来源基线和逐文件 SHA256，构建前强制校验。开发中的 working_tree 快照明确标注尚未提交，不能当作该基线提交的发布产物；正式发行须从已提交宿主重新导出并完成两仓测试。SDK v1 通过宿主提供的 globalThis.__gamerPluginSdkV1 绑定共享 UI 能力，不打包宿主源码。更新 SDK 使用 Gamer checkout 中的 tools/export-plugin-sdk.ps1。
+
+统一 MCP 由 Gamer Core 提供。插件只通过 manifest 的显式 `[[tools]]` 声明接入，声明引用的 `schemas/**` 随归档打包，并由打包工具与真实宿主分别校验。通知、发送器和配置发布动作不自动成为外部工具。内置 AI 插件不再进入构建和发行目录；用户自行连接成熟 Agent，已有脚本、素材和历史数据继续保留。
 
 ## 测试与联调
 
 解释器测试可以独立运行：`cargo test --locked --manifest-path gamer-yaml/interpreter/Cargo.toml`。
-UI 与 host 集成测试需显式检出 sdk/lock.json 指定的 Gamer 提交，并把本仓检出到其 plugins/ 目录；CI 的 integration job 固定执行此布局，不跟随 Gamer main。Keymap UI 目前无独立测试文件，不能计为覆盖。
+UI 与 host 集成测试需显式检出 sdk/lock.json 指定的 Gamer 来源，并把本仓检出到其 plugins/ 目录；working_tree 快照另需包含锁定哈希对应的未提交源码，不能只检出基线提交代替。CI 的 integration job 固定执行已提交宿主布局，不跟随 Gamer main。Keymap UI 目前无独立测试文件，不能计为覆盖。
 
 主仓使用固定 gitlink 引用本仓。涉及 host/ 或 builtin 的变更仍需发布新版 Gamer；WASM/UI 可在声明的宿主 API 范围内独立发布。
 
@@ -49,4 +51,4 @@ Gamer 启动器首次安装使用主仓发行锁指定的插件 Release，完整
 
 直播助手 `gamer-live` 的音视频输出与 B 站接入方式见 [使用说明](gamer-live/README.md)。它包含新的原生服务，需与对应 Gamer 本体一起发布；尚未加入已有发行的首装种子。
 
-AI 助手 `gamer-ai` 提供通用视觉自动游玩与本机 MCP，支持 Responses 和 Chat Completions 显式选择。人工操作须先暂停 AI 并等待暂停完成；使用方法与令牌/控制租约说明见 [使用说明](gamer-ai/README.md)。它是 builtin 插件，新增宿主能力需要与匹配的 Gamer 版本一起发布。
+文字识别 `gamer-ocr` 使用本机 Tesseract 按需识别。外部 Agent 只可引用已授权设备截图、运行证据、配置包 PNG 或独立素材帧，无法提交本机路径、引擎路径或任意图片字节。

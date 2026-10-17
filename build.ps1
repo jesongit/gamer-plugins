@@ -14,6 +14,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Assert-OfficialBuildPlugin {
+    param([string]$Id)
+    if ($Id -eq 'gamer-ai') { throw 'gamer-ai 已退休，官方构建不再分发；请通过 Core MCP 使用外部 Agent' }
+}
+function Test-RetiredOfficialBuildMetadata {
+    param([object]$Metadata)
+    return ($Metadata.id -eq 'gamer-ai' -or ($Metadata.PSObject.Properties['execution'] -and $Metadata.execution.PSObject.Properties['builtin_id'] -and $Metadata.execution.builtin_id -eq 'gamer-ai') -or ($Metadata.PSObject.Properties['permissions'] -and @($Metadata.permissions | Where-Object { $_ -is [string] -and $_.Trim() -eq 'ai.connect' }).Count -gt 0))
+}
+Assert-OfficialBuildPlugin -Id $Plugin
 
 $RepoRoot = $PSScriptRoot
 $PackerDir = Join-Path $RepoRoot 'sdk\plugin-packer'
@@ -99,6 +108,7 @@ Invoke-Native 'cargo' @(
 # ---- 2. 枚举 manifest 并解析元数据 ----
 Write-Host "===[2/6] 读取插件 manifest（$ManifestsRoot）===" -ForegroundColor Cyan
 $manifestFiles = @(Get-ChildItem -Path $ManifestsRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne 'gamer-ai' } |
     Where-Object { -not $Plugin -or $_.Name -eq $Plugin } |
     ForEach-Object { Join-Path $_.FullName 'manifest.toml' } |
     Where-Object { Test-Path $_ } |
@@ -114,6 +124,7 @@ foreach ($manifestPath in $manifestFiles) {
     Invoke-Native $PackerExe @('inspect', '--manifest', $manifestPath, '--meta-out', $metaPath) $RepoRoot | Out-Null
     $meta = Read-JsonFile $metaPath
     $id = $meta.id
+    Assert-OfficialBuildPlugin -Id $id
     $kind = $meta.execution.kind
     if (-not $id -or -not $meta.version -or -not $kind) { throw "manifest 元数据不完整: $manifestPath" }
     $package = [pscustomobject]@{
@@ -175,6 +186,15 @@ foreach ($package in $packages) {
     $packArgs = @('pack', '--manifest', $package.Manifest, '--out', $out)
     if ($package.Component) { $packArgs += @('--wasm', $package.Component) }
     $sourceRoot = Split-Path -Parent $package.Manifest
+    # Tool schemas are archive content. Pack/verify and the real host both
+    # reject missing schemas declared by an installed manifest.
+    $schemaRoot = Join-Path $sourceRoot 'schemas'
+    if (Test-Path -LiteralPath $schemaRoot) {
+        foreach ($schema in Get-ChildItem -LiteralPath $schemaRoot -File -Recurse | Sort-Object FullName) {
+            $relative = Get-RelativeReleasePath $schemaRoot $schema.FullName
+            $packArgs += @('--file', "schemas/$relative=$($schema.FullName)")
+        }
+    }
     if (Test-Path -LiteralPath (Join-Path $sourceRoot 'ui\package.json')) {
         Invoke-Native 'node' @((Join-Path $RepoRoot 'tools\build-ui.mjs'), $package.Id) $RepoRoot | Out-Host
         $uiRoot = Join-Path $sourceRoot 'dist\ui'
@@ -241,13 +261,14 @@ function New-RegistryEntry {
 
 $entries = @($packages | ForEach-Object { New-RegistryEntry $_ })
 if ($Plugin -and (Test-Path -LiteralPath $RegistryFile)) {
-    $entries += @((Read-JsonFile $RegistryFile).plugins | Where-Object { $_.id -ne $Plugin })
+    $entries += @((Read-JsonFile $RegistryFile).plugins | Where-Object { $_.id -ne $Plugin -and -not (Test-RetiredOfficialBuildMetadata $_) })
 }
+$sdkProvenance = Read-JsonFile (Join-Path $RepoRoot 'sdk/lock.json')
 $registry = [ordered]@{
     schema_version = 2
     generated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     host_api = '1.0.0'
-    provenance = [ordered]@{ plugin_commit = ((& git -C $RepoRoot rev-parse HEAD) | Out-String).Trim(); sdk_host_commit = (Read-JsonFile (Join-Path $RepoRoot 'sdk/lock.json')).commit }
+    provenance = [ordered]@{ plugin_commit = ((& git -C $RepoRoot rev-parse HEAD) | Out-String).Trim(); sdk_host_commit = $sdkProvenance.commit; sdk_snapshot_kind = $(if ($sdkProvenance.snapshot) { $sdkProvenance.snapshot.kind } else { 'commit' }) }
     plugins = $entries
 }
 $registryJson = ($registry | ConvertTo-Json -Depth 8) + "`n"
