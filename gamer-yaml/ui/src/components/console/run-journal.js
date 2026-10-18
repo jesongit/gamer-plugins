@@ -46,7 +46,7 @@ export function eventText(e) {
   if (e.ev === 'run_end') return e.ok ? '执行完成' : `执行失败：${e.error || '未知错误'}`
   if (e.ev === 'budget') return `运行终止：${e.kind}`
   if (e.name === 'log') return e.data?.message || ''
-  if (e.ev === 'vision') return `${e.template} ${e.found ? '命中' : '未命中'}`
+  if (e.ev === 'vision') return `${e.template} ${e.found ? '命中' : '未命中'}${e.aggregation?.additional_observations ? ` · 合并 ${e.aggregation.additional_observations} 次观察` : ''}`
   return `${e.name || e.ev} ${JSON.stringify(e.data || {})}`
 }
 export const detailText = name => ({ click_delay: '点击延迟', key_delay: '按键延迟', arguments: '调用参数', effective_args: '实际参数（含默认值）', result: '返回值', branch: '分支选择', iteration: '循环进度', tap: '点击坐标', swipe: '滑动坐标' }[name] || name)
@@ -111,7 +111,8 @@ export function stepSummary(node) {
   }
   if (node.matches.length) {
     const hits = node.matches.filter(match => match.found)
-    parts.push(`匹配 ${node.matches.length} 次 · ${hits.length ? `命中 ${[...new Set(hits.map(match => match.template))].join('、')}` : '未命中'}`)
+    const observations = node.matches.reduce((total, match) => total + (match.aggregation?.additional_observations || 1), 0)
+    parts.push(`匹配 ${observations} 次 · ${hits.length ? `命中 ${[...new Set(hits.map(match => match.template))].join('、')}` : '未命中'}`)
   }
   const log = node.logs.at(-1)
   if (log) parts.push(log.data?.message)

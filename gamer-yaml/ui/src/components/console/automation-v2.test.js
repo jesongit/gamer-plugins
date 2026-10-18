@@ -75,6 +75,14 @@ describe('source-only YAML', () => {
 })
 
 describe('trace evidence and imported samples', () => {
+  it('removes compacted image IDs and exposes production sampling without inventing frames', async () => {
+    const run=ref('compact-run'), visible=ref(true)
+    const client={getRunTrace:vi.fn().mockResolvedValueOnce({status:'available',enabled:true,images:[{image_id:'first'},{image_id:'old'}],image_ids:['first','old'],next:2}).mockResolvedValueOnce({status:'available',enabled:true,images:[{image_id:'last'}],image_ids:['first','last'],capture_policy:'production',sampled_out:30,compacted_images:10,next:3})}
+    const scope=effectScope();scopes.push(scope)
+    const trace=scope.run(()=>useRunTrace(run,visible,client));await flushPromises();await trace.refresh()
+    expect(trace.images.value.map(image=>image.image_id)).toEqual(['first','last'])
+    expect(trace.collection.value).toEqual({policy:'production',sampled:30,compacted:10})
+  })
   it('rejects missing assets and traversal before handing imported JSON to backend', () => {
     expect(() => parseSampleFile('{"manifest":{},"files":[]}')).toThrow('缺少图片')
     expect(() => parseSampleFile(JSON.stringify({ manifest: {}, files: [{ path: '../secret', base64: 'AAAA' }] }))).toThrow('不安全')

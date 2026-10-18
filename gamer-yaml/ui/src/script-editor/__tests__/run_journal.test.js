@@ -7,7 +7,7 @@ import { useRunJournal } from '../../components/console/useRunJournal'
 import RunDetails from '../../components/console/RunDetails.vue'
 import { api } from '../../../../../../web/src/api'
 import { WORKSPACE_CONTEXT_KEY } from '../../../../../../web/src/workspace/context'
-vi.mock('../../../../../../web/src/api', () => ({ api: { listRunHistory: vi.fn(), getRun: vi.fn(), getRunEvents: vi.fn(), cancelRun: vi.fn(), listExtensions: vi.fn(), getRunTrace: vi.fn() } }))
+vi.mock('../../../../../../web/src/api', () => ({ api: { listRunHistory: vi.fn(), getRun: vi.fn(), getRunEvents: vi.fn(), cancelRun: vi.fn(), listExtensions: vi.fn(), getRunTrace: vi.fn(), runDiagnosticsUrl: id => `/api/runs/${encodeURIComponent(id)}/diagnostics`, runDiagnosticsFilename: id => `gamer-diagnostics-${id}.zip` } }))
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks() })
 const record = (id = 'a') => ({ run_id: id, device_id: 'd', entrypoint: 'p/main.yaml', started_at: '2026-09-23T00:00:00Z', finished_at: '2026-09-23T00:00:02Z', state: 'failed', error: '未找到模板' })
 const event = (id, ev, extra = {}) => ({ id, ev, time: `2026-09-23T00:00:0${id}Z`, trace: { frame_id: 0 }, ...extra })

@@ -20,9 +20,9 @@
         <section v-for="detail in node.details || []" :key="detail.id" class="parameter-record"><strong>{{ detailText(detail.name) }}</strong><pre>{{ formatRunValue(detail.data) }}</pre></section>
         <p v-if="!node.details?.length" class="inspector-empty">没有参数或返回值记录。</p>
       </template>
-      <RunTraceImages v-else-if="tab === 'images'" :run-id="runId" :images="nodeImages" :status="traceStatus" :enabled="traceEnabled" :gaps="traceGaps" />
+      <RunTraceImages v-else-if="tab === 'images'" :run-id="runId" :images="nodeImages" :status="traceStatus" :enabled="traceEnabled" :gaps="traceGaps" :collection="traceCollection" />
       <template v-else>
-        <div v-for="match in node.matches || []" :key="match.id" class="match-record"><time>{{ timeText(match.time) }}</time><strong>{{ match.template }}</strong><span :class="match.found ? 'success' : ''">{{ match.found ? `命中 · ${Number(match.score || 0).toFixed(3)}` : '未命中' }}</span><span v-if="match.center">坐标 {{ match.center.join(', ') }}</span></div>
+        <div v-for="match in node.matches || []" :key="match.id" class="match-record"><time>{{ timeText(match.time) }}</time><strong>{{ match.template }}</strong><span :class="match.found ? 'success' : ''">{{ match.found ? `命中 · ${Number(match.score || 0).toFixed(3)}` : '未命中' }}</span><span v-if="match.aggregation">合并 {{ match.aggregation.additional_observations }} 次 · 最高分 {{ Number(match.aggregation.max_score || 0).toFixed(3) }}</span><span v-if="match.center">坐标 {{ match.center.join(', ') }}</span></div>
         <p v-if="!node.matches?.length" class="inspector-empty">没有匹配记录。</p>
       </template>
     </div>
@@ -33,7 +33,7 @@ import { computed, ref, watch } from 'vue'
 import RunTraceImages from './RunTraceImages.vue'
 import { traceImagesForNode } from './useRunTrace'
 import { detailText, eventText, formatRunValue, rowStateText, runDuration, runRowState, stepSummary, timeText } from './run-journal'
-const props = defineProps({ row: { type: Object, required: true }, now: Number, runId: String, images: { type: Array, default: () => [] }, traceStatus: String, traceEnabled: Boolean, traceGaps: { type: Array, default: () => [] }, allowLocate: { type: Boolean, default: true } })
+const props = defineProps({ row: { type: Object, required: true }, now: Number, runId: String, images: { type: Array, default: () => [] }, traceStatus: String, traceEnabled: Boolean, traceGaps: { type: Array, default: () => [] }, traceCollection: { type: Object, default: () => ({}) }, allowLocate: { type: Boolean, default: true } })
 defineEmits(['close', 'locate'])
 const node = computed(() => props.row.node)
 const nodeImages = computed(() => traceImagesForNode(props.images, node.value))

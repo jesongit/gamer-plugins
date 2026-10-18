@@ -26,6 +26,7 @@ export function traceBoxStyle(box, width, height) {
 }
 export function useRunTrace(runId, visible, client = api) {
   const images = ref([]), gaps = ref([]), status = ref('unavailable'), enabled = ref(false), loading = ref(false), error = ref(''), hasMore = ref(false), snapshot = ref(null)
+  const collection = ref({})
   let generation = 0, cursor = 0, inFlight = null
   async function refresh() {
     if (!runId.value || !visible.value || inFlight === generation) return
@@ -35,7 +36,9 @@ export function useRunTrace(runId, visible, client = api) {
       const result = await client.getRunTrace(id, cursor, 100)
       if (token !== generation) return
       status.value = result.status; enabled.value = result.enabled; gaps.value = result.gaps || []; snapshot.value = result.snapshot
-      images.value = result.status === 'expired' ? [] : [...new Map([...images.value, ...(result.images || [])].map(image => [image.image_id, image])).values()]
+      collection.value = { policy: result.capture_policy, sampled: result.sampled_out || 0, compacted: result.compacted_images || 0 }
+      const retainedIds = Array.isArray(result.image_ids) ? new Set(result.image_ids) : null
+      images.value = result.status === 'expired' ? [] : [...new Map([...images.value, ...(result.images || [])].map(image => [image.image_id, image])).values()].filter(image => !retainedIds || retainedIds.has(image.image_id))
       cursor = result.next; hasMore.value = !!result.has_more; error.value = ''
     } catch (e) { if (token === generation) { error.value = e.message; if (e.status === 410) { status.value = 'expired'; images.value = [] } } }
     finally { if (token === generation) { loading.value = false; inFlight = null } }
@@ -44,5 +47,6 @@ export function useRunTrace(runId, visible, client = api) {
   watch(visible, value => { if (value) void refresh() })
   const timer = setInterval(refresh, 1500)
   onScopeDispose(() => { generation++; clearInterval(timer) })
-  return { images, gaps, status, enabled, loading, error, hasMore, snapshot, refresh }
+  watch(runId, () => { collection.value = {} }, { flush: 'sync' })
+  return { images, gaps, status, enabled, loading, error, hasMore, snapshot, collection, refresh }
 }

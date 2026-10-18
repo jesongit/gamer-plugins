@@ -14,6 +14,7 @@ use std::sync::{Arc, Weak};
 
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map as JsonMap, Value};
+use sha2::Digest;
 
 use crate::core::{
     ActivityKind, ActivityLease, AndroidPackageName, AppContext, AppPackageId, DeviceId,
@@ -590,6 +591,15 @@ impl YamlRunAdapter {
             }
         }
         program["_source_files"] = Value::Object(source_files);
+        program["_diagnostic_identity"] = json!({
+            "runner":"gamer-yaml",
+            "host_version":env!("CARGO_PKG_VERSION"),
+            "host_commit":crate::build_info::build_info().commit,
+            "sources":program["_source_files"].as_object().map(|files|files.iter().map(|(path,source)| {
+                (path.clone(),json!(format!("{:x}",sha2::Sha256::digest(source.as_str().unwrap_or_default().as_bytes()))))
+            }).collect::<serde_json::Map<_,_>>()),
+            "templates":program["_template_versions"],
+        });
         program["trace"] = json!({ "run_id": spec.context.run_id.as_str(), "entry": source, "functions": sources });
         if let Some(policy) = execution_policy {
             super::private_trial::validate_external_policy(&program, policy)?;

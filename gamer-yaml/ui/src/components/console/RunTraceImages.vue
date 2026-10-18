@@ -1,10 +1,10 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { safeTraceImageUrl, traceBoxStyle, traceImageFilename } from './useRunTrace'
-const props = defineProps({ runId: String, images: { type: Array, default: () => [] }, status: String, enabled: Boolean, gaps: { type: Array, default: () => [] } })
+const props = defineProps({ runId: String, images: { type: Array, default: () => [] }, status: String, enabled: Boolean, gaps: { type: Array, default: () => [] }, collection: { type: Object, default: () => ({}) } })
 const selectedId = ref(''), broken = ref(new Set()), templateBroken = ref(false)
 const selected = computed(() => props.images.find(image => image.image_id === selectedId.value))
-const labels = { consumed: '实际观察帧', trace_on: '开启 Trace', trace_off: '关闭 Trace', error_last_consumed: '报错前最后观察帧', error_fresh: '报错后新截图', action_before: '操作前', action_after: '操作后' }
+const labels = { consumed: '实际观察帧', completion: '结束前最后观察帧', trace_on: '开启 Trace', trace_off: '关闭 Trace', error_last_consumed: '报错前最后观察帧', error_fresh: '报错后新截图', action_before: '操作前', action_after: '操作后' }
 // Same-origin downloads carry the existing HttpOnly session cookie, like the
 // original image request. No canvas encoding, blob rewriting, or fabricated media ID.
 const canSaveFrame = computed(() => !!selected.value && ['available', 'retained'].includes(props.status) && !broken.value.has(selected.value.image_id))
@@ -18,6 +18,8 @@ watch(() => props.images, images => { if (!images.some(image => image.image_id =
 </script>
 <template>
   <section class="trace-images" aria-label="运行图像证据">
+    <p v-if="collection.policy === 'production'" class="hint">生产模式按间隔保留判断画面；成功后最多保留关键截图，失败另留现场。未保留的时段不代表没有操作。<span v-if="collection.sampled || collection.compacted"> 本次采样省略 {{ collection.sampled || 0 }} 次，成功后精简 {{ collection.compacted || 0 }} 张。</span></p>
+    <p v-else-if="collection.policy === 'preserved'" class="hint">历史图像证据按原样保留。</p>
     <p v-if="status === 'expired'" class="warning">图像证据已过期，文字记录仍可查看</p>
     <p v-else-if="status === 'unavailable'" class="hint">本次运行没有可用图像证据</p>
     <p v-else-if="!enabled" class="hint">Trace 已关闭，仅展示已采集证据；空白时段不代表没有操作</p>

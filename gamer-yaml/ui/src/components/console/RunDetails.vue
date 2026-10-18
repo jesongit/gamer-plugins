@@ -14,7 +14,9 @@
     </div>
     <section v-if="journal.record?.state === 'failed'" class="run-recovery" aria-label="运行失败后的下一步"><strong>这次运行没有完成</strong><p>先查看异常动作和当时的判断画面，再修改脚本。需要 Agent 协助时，可复制这次运行的引用。</p><button class="btn btn-sm" :disabled="journal.loading || journal.hasMore || !hasFailedAction" @click="showFailureDetails">{{ journal.loading || journal.hasMore ? '正在读取异常动作…' : hasFailedAction ? '查看异常动作' : '暂无异常动作记录' }}</button></section>
     <div v-if="journal.record" class="trace-toolbar"><button class="btn btn-sm" :aria-expanded="showTrace" @click="showTrace = !showTrace">判断画面 ({{ trace.images.length }})</button><button class="btn btn-sm" @click="copyAgentReference">复制 Agent 引用</button><button class="btn btn-sm" :disabled="!canReview" title="查看这次失败运行当时的工作稿版本" @click="reviewFailedSource">查看失败版本</button><button class="btn btn-sm" :disabled="!journal.record?.finished_at || !trace.images.length || trace.status === 'retained' || retaining" @click="retainTrace">{{ trace.status === 'retained' ? '证据已保留' : '长期保留证据' }}</button><span v-if="trace.loading">正在读取判断截图…</span><span v-else-if="trace.status === 'expired'">判断截图已过期</span><span v-else-if="!trace.enabled && !trace.error">未开启判断截图；基本日志仍可查看</span><span v-if="trace.gaps.length">{{ trace.gaps.length }} 处截图证据缺口</span></div>
-    <RunTraceImages v-if="showTrace" class="run-trace" :run-id="journal.selected" :images="trace.images" :status="trace.status" :enabled="trace.enabled" :gaps="trace.gaps" />
+    <div v-if="journal.record" class="trace-toolbar"><a v-if="journal.record.finished_at" class="btn btn-sm" :href="api.runDiagnosticsUrl(journal.selected)" :download="api.runDiagnosticsFilename(journal.selected)">下载诊断包</a><button v-else class="btn btn-sm" disabled>运行结束后可下载诊断包</button><span>包含本次记录和判断画面；参数值与私密配置不导出。</span></div>
+    <p v-if="journal.detailsStatus === 'expired'" class="timeline-hint">详细步骤已到期，运行结果仍保留。诊断包会注明已缺少的证据。</p>
+    <RunTraceImages v-if="showTrace" class="run-trace" :run-id="journal.selected" :images="trace.images" :status="trace.status" :enabled="trace.enabled" :gaps="trace.gaps" :collection="trace.collection" />
     <p v-if="trace.error" class="failure-text">{{ trace.error }}</p>
     <button v-if="showTrace && trace.hasMore" class="btn btn-sm" :disabled="trace.loading" @click="trace.refresh">加载更多图像</button>
     <div v-if="journal.error" class="failure-text" role="alert">{{ journal.error }}</div>
@@ -34,7 +36,7 @@
       <p v-if="!visibleRows.length" class="empty">{{ rows.length ? '没有符合筛选条件的记录。' : journal.loading ? '正在读取运行详情…' : journal.record?.state === 'starting' ? '正在准备设备与执行环境…' : journal.record ? '本次运行没有步骤记录。' : '运行脚本后在这里查看步骤、匹配结果和日志。' }}</p>
       <p v-if="journal.hasMore" class="empty">正在读取后续记录…</p>
     </div>
-    <RunJournalInspector v-if="selectedRow" :key="journal.selected" :row="selectedRow" :now="clock" :run-id="journal.selected" :images="trace.images" :trace-status="trace.status" :trace-enabled="trace.enabled" :trace-gaps="trace.gaps" :allow-locate="!taskId" @close="selectedEvent = null" @locate="$emit('locate', trace.snapshot ? { ...$event, source_snapshot: trace.snapshot } : $event)" />
+    <RunJournalInspector v-if="selectedRow" :key="journal.selected" :row="selectedRow" :now="clock" :run-id="journal.selected" :images="trace.images" :trace-status="trace.status" :trace-enabled="trace.enabled" :trace-gaps="trace.gaps" :trace-collection="trace.collection" :allow-locate="!taskId" @close="selectedEvent = null" @locate="$emit('locate', trace.snapshot ? { ...$event, source_snapshot: trace.snapshot } : $event)" />
     <div class="details-footer"><span :title="journal.selected">已加载 {{ journal.events.length }} 条事件{{ journal.hasMore ? ' · 继续加载中' : ' · 服务端保存' }}</span><button class="btn btn-sm" @click="scrollStart">查看开头</button><button class="btn btn-sm" @click="resumeFollow">{{ follow && !filtering ? '正在跟随最新记录' : '回到最新' }}</button></div>
   </section>
 </template>

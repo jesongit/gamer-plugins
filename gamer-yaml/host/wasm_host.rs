@@ -452,10 +452,12 @@ impl LazyYamlWasmtimeRuntime {
     /// only the Engine, compiled component cache and epoch ticker are shared.
     fn run_blocking(
         &self,
-        request: YamlWasmRunRequest,
+        mut request: YamlWasmRunRequest,
     ) -> Result<YamlWasmRunResult, anyhow::Error> {
         let mut digest = [0u8; 32];
         digest.copy_from_slice(Sha256::digest(&request.wasm).as_slice());
+        request.program["_diagnostic_identity"]["runtime_wasm_sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(&request.wasm)));
         let component = {
             let mut components = self
                 .components

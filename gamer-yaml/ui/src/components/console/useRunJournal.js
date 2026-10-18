@@ -9,6 +9,7 @@ const HISTORY_PAGE_SIZE = 30
 export function useRunJournal(device, liveRun, visible = ref(true), taskId = ref('')) {
   const records = ref([]), events = ref([]), error = ref(''), loading = ref(false), hasMore = ref(false)
   const hasOlder = ref(false), olderLoading = ref(false)
+  const detailsStatus = ref('available')
   // Task history owns its selection. Opening it starts at the latest task run
   // without changing the script/function panels' device-wide selection.
   const taskSelection = ref('')
@@ -69,6 +70,8 @@ export function useRunJournal(device, liveRun, visible = ref(true), taskId = ref
         const result = await api.getRunEvents(id, cursor)
         if (token !== generation) return
         events.value.push(...result.events)
+        detailsStatus.value = result.status || 'available'
+        if (detailsStatus.value === 'expired') events.value = []
         cursor = result.next; hasMore.value = result.has_more
         if (!result.has_more) break
       }
@@ -77,13 +80,13 @@ export function useRunJournal(device, liveRun, visible = ref(true), taskId = ref
     finally { if (token === generation) { loading.value = false; inFlight = null } }
   }
   watch([device, taskId], () => {
-    scope++; generation++; records.value = []; events.value = []; error.value = ''; loading.value = false
+    scope++; generation++; records.value = []; events.value = []; error.value = ''; loading.value = false; detailsStatus.value = 'available'
     taskSelection.value = ''
     cursor = 0; hasMore.value = false; hasOlder.value = false; olderLoading.value = false; olderCursor = null
     history()
   }, { immediate: true, flush: 'sync' })
   watch([device, taskId, selected], () => {
-    generation++; cursor = 0; events.value = []; hasMore.value = false; error.value = ''; loading.value = false
+    generation++; cursor = 0; events.value = []; hasMore.value = false; error.value = ''; loading.value = false; detailsStatus.value = 'available'
     refresh()
   }, { immediate: true, flush: 'sync' })
   watch([device, liveRun], ([deviceId, id]) => {
@@ -95,5 +98,5 @@ export function useRunJournal(device, liveRun, visible = ref(true), taskId = ref
   watch(visible, value => { if (value) { history(); refresh() } })
   const timer = setInterval(() => { if (visible.value) { refresh(); if (++ticks % 5 === 0) history() } }, 1000)
   onScopeDispose(() => { clearInterval(timer); scope++; generation++ })
-  return { records, selected, events, record, error, loading, hasMore, hasOlder, olderLoading, refresh, history, loadOlder }
+  return { records, selected, events, record, error, loading, hasMore, hasOlder, olderLoading, detailsStatus, refresh, history, loadOlder }
 }
