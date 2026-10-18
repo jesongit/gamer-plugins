@@ -31,8 +31,8 @@ impl Settings {
             Err(_) => anyhow::bail!("无法读取直播接入配置"),
         };
         ensure!(bytes.len() <= 64 * 1024, "直播接入配置文件过大");
-        let bytes =
-            protect(&self.path, &bytes, false).context("无法解密直播接入配置，请使用保存配置的系统账号")?;
+        let bytes = protect(&self.path, &bytes, false)
+            .context("无法解密直播接入配置，请使用保存配置的系统账号")?;
         // Do not include serde's input excerpt in an API error.
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("直播接入配置文件损坏"))
     }

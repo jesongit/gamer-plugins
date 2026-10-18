@@ -138,7 +138,8 @@ impl Sender {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = crate::core::secrets::protect_file(&self.path, &serde_json::to_vec(config)?, true)?;
+        let bytes =
+            crate::core::secrets::protect_file(&self.path, &serde_json::to_vec(config)?, true)?;
         crate::core::fs::atomic_write(&self.path, &bytes).context("发言账号保存失败")?;
         #[cfg(unix)]
         {
