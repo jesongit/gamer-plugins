@@ -93,7 +93,7 @@ impl Sender {
         let config = match std::fs::read(&path) {
             Ok(bytes) => {
                 ensure!(bytes.len() <= 64 * 1024, "发言账号配置过大");
-                let plain = crate::core::secrets::protect(&bytes, false)
+                let plain = crate::core::secrets::protect_file(&path, &bytes, false)
                     .map_err(|_| anyhow::anyhow!("无法解密发言账号配置"))?;
                 serde_json::from_slice(&plain).map_err(|_| anyhow::anyhow!("发言账号配置损坏"))?
             }
@@ -138,7 +138,7 @@ impl Sender {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = crate::core::secrets::protect(&serde_json::to_vec(config)?, true)?;
+        let bytes = crate::core::secrets::protect_file(&self.path, &serde_json::to_vec(config)?, true)?;
         crate::core::fs::atomic_write(&self.path, &bytes).context("发言账号保存失败")?;
         #[cfg(unix)]
         {

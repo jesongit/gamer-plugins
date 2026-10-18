@@ -22,7 +22,7 @@ impl Settings {
             Err(_) => anyhow::bail!("无法读取 OCR 配置"),
         };
         ensure!(bytes.len() <= 32 * 1024, "OCR 配置过大");
-        let plain = crate::core::secrets::protect(&bytes, false)
+        let plain = crate::core::secrets::protect_file(path, &bytes, false)
             .context("无法解密 OCR 配置，请使用保存配置的系统账号")?;
         serde_json::from_slice(&plain).context("OCR 配置损坏")
     }
@@ -36,7 +36,7 @@ impl Settings {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = crate::core::secrets::protect(&serde_json::to_vec(self)?, true)?;
+        let bytes = crate::core::secrets::protect_file(path, &serde_json::to_vec(self)?, true)?;
         crate::core::fs::atomic_write(path, &bytes)?;
         #[cfg(unix)]
         {

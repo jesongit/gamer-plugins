@@ -29,7 +29,7 @@ impl Settings {
             Err(_) => anyhow::bail!("无法读取通知通道配置"),
         };
         ensure!(bytes.len() <= 256 * 1024, "通知通道配置过大");
-        let bytes = crate::core::secrets::protect(&bytes, false)
+        let bytes = crate::core::secrets::protect_file(path, &bytes, false)
             .context("无法解密通知配置，请使用保存配置的系统账号")?;
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("通知通道配置损坏"))
     }
@@ -43,7 +43,7 @@ impl Settings {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = crate::core::secrets::protect(&serde_json::to_vec(self)?, true)?;
+        let bytes = crate::core::secrets::protect_file(path, &serde_json::to_vec(self)?, true)?;
         crate::core::fs::atomic_write(path, &bytes)?;
         #[cfg(unix)]
         {

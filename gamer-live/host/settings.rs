@@ -32,7 +32,7 @@ impl Settings {
         };
         ensure!(bytes.len() <= 64 * 1024, "直播接入配置文件过大");
         let bytes =
-            protect(&bytes, false).context("无法解密直播接入配置，请使用保存配置的系统账号")?;
+            protect(&self.path, &bytes, false).context("无法解密直播接入配置，请使用保存配置的系统账号")?;
         // Do not include serde's input excerpt in an API error.
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("直播接入配置文件损坏"))
     }
@@ -45,7 +45,7 @@ impl Settings {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = protect(&serde_json::to_vec(saved)?, true)?;
+        let bytes = protect(&self.path, &serde_json::to_vec(saved)?, true)?;
         crate::core::fs::atomic_write(&self.path, &bytes).context("直播接入配置保存失败")?;
         #[cfg(unix)]
         {
@@ -119,7 +119,7 @@ impl Settings {
     }
 }
 
-use crate::core::secrets::protect;
+use crate::core::secrets::protect_file as protect;
 
 #[cfg(test)]
 mod tests {
