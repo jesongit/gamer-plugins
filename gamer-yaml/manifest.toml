@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-yaml"
-version = "0.3.22"
+version = "0.3.23-local.20261018"
 name = "自动化"
 description = "自动化：按用户步骤编写脚本、脚本版本管理、素材与运行验证"
 entry = "plugin.wasm"
