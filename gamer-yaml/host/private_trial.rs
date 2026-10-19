@@ -155,7 +155,7 @@ fn validate_external_program(program: &Value) -> Result<()> {
         &crate::core::ExecutionPolicy::external(
             String::new(),
             ["*".into()].into(),
-            ["plugin.gamer-ocr.recognize".into()].into(),
+            ["ocr.recognize".into()].into(),
         ),
     )
 }
@@ -169,8 +169,8 @@ pub(crate) fn authorize_external_native(
         .context("external native function is unavailable")?;
     if matches!(name, "ocr" | "find_text") {
         anyhow::ensure!(
-            policy.allows_plugin("gamer-ocr") && policy.has_scope("plugin.gamer-ocr.recognize"),
-            "external_execution_denied: OCR requires the OCR plugin and recognize scope"
+            policy.has_scope("ocr.recognize"),
+            "external_execution_denied: OCR requires the Core ocr.recognize scope"
         );
     }
     anyhow::ensure!(

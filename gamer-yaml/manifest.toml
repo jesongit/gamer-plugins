@@ -47,11 +47,6 @@ required = false
 
 
 [[dependencies]]
-id = "gamer-ocr"
-version = "^0.1"
-required = false
-
-[[dependencies]]
 id = "gamer-live"
 version = "^0.2.6"
 required = false

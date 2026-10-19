@@ -1,4 +1,6 @@
-# 文字识别插件
+# OCR 历史插件（已迁入 Core）
+
+OCR 已内置，无需安装或启用此插件。请在“设置 → 运行依赖”管理引擎和语言包，详见主仓 `docs/guides/runtime-dependencies.md`。旧私密配置、不可变安装与运行数据保留；下方仅为旧版文档，不再适用于新版安装。原有 YAML `ocr`、`find_text` 保持不变。Core MCP 使用 `ocr.read` / `ocr.recognize`，旧插件 scope 不自动获得新权限。
 
 `gamer-ocr` 是可选 builtin 插件，使用本机 Tesseract 识别自动化截图中的文字。每次识别启动一个进程，结束即退出；多个账号共用一个识别队列，不创建每账号常驻 OCR 服务。插件归档仅包含声明，不携带程序、语言包或私有路径配置。
 

@@ -623,7 +623,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             name: "ocr",
             display_name: "识别文字",
             description:
-                "按需识别原始截图文字；返回文字、置信度、行和单词；OCR 插件不可用时明确失败",
+                "按需识别原始截图文字；返回文字、置信度、行和单词；Core OCR 或本地引擎不可用时明确失败",
             params: ocr_params(),
             returns: "object",
             permissions: &[Permission::DeviceRead, Permission::VisionOcr],
@@ -777,7 +777,7 @@ pub fn native_schema_json(func: &NativeFunction) -> Value {
         "name": func.name,
         "description": func.description,
         "source": "plugin",
-        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "ocr" | "find_text" => Some("gamer-ocr"), "switch_live_device" | "wait_live_confirmation" => Some("gamer-live"), _ => None },
+        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "switch_live_device" | "wait_live_confirmation" => Some("gamer-live"), _ => None },
         "params": func.params.iter().map(|param| {
             let mut schema = json!({
             "name": param.name,

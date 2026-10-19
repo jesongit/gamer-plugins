@@ -22,7 +22,7 @@ impl NativeYamlHost {
         let recognizer = self
             .ocr
             .as_ref()
-            .ok_or_else(|| anyhow!("OCR_UNAVAILABLE: 请安装并启用 OCR 插件及本地引擎"))?;
+            .ok_or_else(|| anyhow!("OCR_UNAVAILABLE: 请在设置的运行依赖中准备文字识别引擎"))?;
         let mode = args.string("mode")?;
         if !matches!(mode.as_str(), "line" | "block" | "sparse") {
             bail!("OCR_INVALID_ARGUMENT: mode 必须是 line / block / sparse");

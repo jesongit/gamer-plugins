@@ -70,6 +70,6 @@ MCP `draft_get` 专用参数 `{package_id,script_id,offset?,limit?}` 默认每�
 
 私有试跑登记到调用 token，撤销、过期或登记失败时 cancel 并等待真实终态和租约清理。正式 Core run/task 的已接受委托独立存在，不借此恢复内置自主流程。
 
-外部执行 policy 由宿主类型化传入，客户端 JSON 不能伪造。运行前检查同一份冻结程序的完整可达函数/脚本闭包：首版拒绝 notify、媒体外发/直播切换与直播内部协作；OCR 还要求允许 gamer-ocr 及 `plugin.gamer-ocr.recognize`。管理 UI 的正式执行继续按原权限和输入屏障运行。
+外部执行 policy 由宿主类型化传入，客户端 JSON 不能伪造。运行前检查同一份冻结程序的完整可达函数/脚本闭包：首版拒绝 notify、媒体外发/直播切换与直播内部协作；OCR 还要求 Core `ocr.recognize` scope。管理 UI 的正式执行继续按原权限和输入屏障运行。
 
 本地合成回归验证协议、数据保留及授权边界；真实设备、外部 Agent 端到端和实际游戏效果另行验收。

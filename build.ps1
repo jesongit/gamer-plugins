@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 # Independent plugin build: locked SDK, guest, UI, .gplugin and registry.
 [CmdletBinding()]
 param(
@@ -16,11 +16,11 @@ param(
 $ErrorActionPreference = 'Stop'
 function Assert-OfficialBuildPlugin {
     param([string]$Id)
-    if ($Id -eq 'gamer-ai') { throw 'gamer-ai 已退休，官方构建不再分发；请通过 Core MCP 使用外部 Agent' }
+    if ($Id -in @('gamer-ai', 'gamer-ocr')) { throw 'gamer-ai 已退休，官方构建不再分发；请通过 Core MCP 使用外部 Agent' }
 }
 function Test-RetiredOfficialBuildMetadata {
     param([object]$Metadata)
-    return ($Metadata.id -eq 'gamer-ai' -or ($Metadata.PSObject.Properties['execution'] -and $Metadata.execution.PSObject.Properties['builtin_id'] -and $Metadata.execution.builtin_id -eq 'gamer-ai') -or ($Metadata.PSObject.Properties['permissions'] -and @($Metadata.permissions | Where-Object { $_ -is [string] -and $_.Trim() -eq 'ai.connect' }).Count -gt 0))
+    return ($Metadata.id -in @('gamer-ai', 'gamer-ocr') -or ($Metadata.PSObject.Properties['execution'] -and $Metadata.execution.PSObject.Properties['builtin_id'] -and $Metadata.execution.builtin_id -eq 'gamer-ai') -or ($Metadata.PSObject.Properties['permissions'] -and @($Metadata.permissions | Where-Object { $_ -is [string] -and $_.Trim() -eq 'ai.connect' }).Count -gt 0))
 }
 Assert-OfficialBuildPlugin -Id $Plugin
 
@@ -108,7 +108,7 @@ Invoke-Native 'cargo' @(
 # ---- 2. 枚举 manifest 并解析元数据 ----
 Write-Host "===[2/6] 读取插件 manifest（$ManifestsRoot）===" -ForegroundColor Cyan
 $manifestFiles = @(Get-ChildItem -Path $ManifestsRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ne 'gamer-ai' } |
+    Where-Object { $_.Name -notin @('gamer-ai', 'gamer-ocr') } |
     Where-Object { -not $Plugin -or $_.Name -eq $Plugin } |
     ForEach-Object { Join-Path $_.FullName 'manifest.toml' } |
     Where-Object { Test-Path $_ } |
