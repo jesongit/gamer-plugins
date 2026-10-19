@@ -64,57 +64,51 @@ test('notify release accepts the complete catalog and emits immutable notificati
   assert.ok(readFileSync(resolve(root, 'sha256sums.txt'), 'utf8').includes(`${yaml.sha256}  gamer-notify-0.1.0.gplugin`))
 })
 
-test('OCR release validates all seven current official artifacts and emits immutable URLs and checksums', () => {
+test('current release validates six active official artifacts and immutable URLs', () => {
   const root = fixture()
   const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
   const yaml = registry.plugins[0]
   const bytes = readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin'))
-  for (const id of ['gamer-keymap', 'gamer-video', 'gamer-package-publisher', 'gamer-live', 'gamer-notify', 'gamer-ocr']) {
+  for (const id of ['gamer-keymap', 'gamer-video', 'gamer-package-publisher', 'gamer-live', 'gamer-notify']) {
     registry.plugins.push({ ...yaml, id, version: '0.1.0' })
     writeFileSync(resolve(root, `plugins/${id}-0.1.0.gplugin`), bytes)
   }
   writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
-  const before = readFileSync(resolve(root, 'registry.json'))
-  assert.notEqual(spawnSync(process.execPath, [script, 'gamer-ocr-v0.1.1', root]).status, 0)
-  assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
-  assert.equal(spawnSync(process.execPath, [script, 'gamer-ocr-v0.1.0', root]).status, 0)
+  assert.equal(spawnSync(process.execPath, [script, 'gamer-yaml-v1.2.3', root]).status, 0)
   const released = JSON.parse(readFileSync(resolve(root, 'registry.json')))
   const sums = readFileSync(resolve(root, 'sha256sums.txt'), 'utf8')
-  assert.equal(released.plugins.length, 7)
+  assert.equal(released.plugins.length, 6)
   for (const plugin of released.plugins) {
     const name = `${plugin.id}-${plugin.version}.gplugin`
-    assert.equal(plugin.download_url, `https://github.com/jesongit/gamer-plugins/releases/download/gamer-ocr-v0.1.0/${name}`)
+    assert.equal(plugin.download_url, `https://github.com/jesongit/gamer-plugins/releases/download/gamer-yaml-v1.2.3/${name}`)
     assert.ok(sums.includes(`${plugin.sha256}  ${name}`))
     assert.deepEqual(readFileSync(resolve(root, 'plugins', name)), bytes)
   }
-  const digest = createHash('sha256').update(readFileSync(resolve(root, 'registry.json'))).digest('hex')
-  assert.ok(sums.includes(`${digest}  registry.json`))
 })
 
-test('release rejects retired AI and unknown artifacts before modifying the catalog', () => {
-  const root = fixture()
-  const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
-  const yaml = registry.plugins[0]
-  const bytes = readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin'))
-  for (const id of ['gamer-ai', 'gamer-unknown']) {
-    registry.plugins.push({ ...yaml, id, version: '0.1.0' })
-    writeFileSync(resolve(root, `plugins/${id}-0.1.0.gplugin`), bytes)
+test('release rejects retired AI, retired OCR and unknown artifacts before catalog changes', () => {
+  for (const id of ['gamer-ai', 'gamer-ocr', 'gamer-unknown']) {
+    const root = fixture()
+    const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
+    registry.plugins.push({ ...registry.plugins[0], id, version: '0.1.0' })
+    writeFileSync(resolve(root, `plugins/${id}-0.1.0.gplugin`), readFileSync(resolve(root, 'plugins/gamer-yaml-1.2.3.gplugin')))
+    writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
+    const before = readFileSync(resolve(root, 'registry.json'))
+    assert.notEqual(spawnSync(process.execPath, [script, 'gamer-yaml-v1.2.3', root]).status, 0)
+    assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
   }
-  writeFileSync(resolve(root, 'registry.json'), JSON.stringify(registry))
-  const before = readFileSync(resolve(root, 'registry.json'))
-  assert.notEqual(spawnSync(process.execPath, [script, 'gamer-yaml-v1.2.3', root]).status, 0)
-  assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
 })
 
-test('retired AI release tags are rejected before catalog changes', () => {
+test('retired AI and OCR release tags are rejected before catalog changes', () => {
   const root = fixture()
   const before = readFileSync(resolve(root, 'registry.json'))
   assert.notEqual(spawnSync(process.execPath, [script, 'gamer-ai-v0.1.0', root]).status, 0)
+  assert.notEqual(spawnSync(process.execPath, [script, 'gamer-ocr-v0.1.1', root]).status, 0)
   assert.deepEqual(readFileSync(resolve(root, 'registry.json')), before)
 })
 
 test('valid official IDs cannot release retired permissions or the removed builtin', () => {
-  for (const retiredMetadata of [{ permissions: [' ai.connect '] }, { execution: { kind: 'builtin', builtin_id: 'gamer-ai' } }, { permissions: 'ai.connect' }]) {
+  for (const retiredMetadata of [{ permissions: [' ai.connect '] }, { execution: { kind: 'builtin', builtin_id: 'gamer-ai' } }, { permissions: 'ai.connect' }, { execution: { kind: 'builtin', builtin_id: 'gamer-ocr' } }]) {
     const root = fixture()
     const registry = JSON.parse(readFileSync(resolve(root, 'registry.json')))
     Object.assign(registry.plugins[0], retiredMetadata)

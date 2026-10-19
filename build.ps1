@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 function Assert-OfficialBuildPlugin {
     param([string]$Id)
-    if ($Id -in @('gamer-ai', 'gamer-ocr')) { throw 'gamer-ai 已退休，官方构建不再分发；请通过 Core MCP 使用外部 Agent' }
+    if ($Id -in @('gamer-ai', 'gamer-ocr')) { throw 'AI 与 OCR 历史插件已退休，不再分发；请使用外部 Agent 和 Core OCR' }
 }
 function Test-RetiredOfficialBuildMetadata {
     param([object]$Metadata)

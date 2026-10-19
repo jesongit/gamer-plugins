@@ -24,7 +24,7 @@ media = "^1.0"
 # 独立 WASM guest：真实 plugin.wasm，按调用惰性实例化（无实例执行模型）。
 [execution]
 kind = "wasm"
-host_version = ">=0.3.0"
+host_version = ">=0.5.0"
 
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端
 # core-component-registry 解释（console.scripts = 自动化工作台，含脚本工作稿/素材/模板/旧候选历史/运行日志）。
