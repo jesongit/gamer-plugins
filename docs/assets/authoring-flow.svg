@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="328" viewBox="0 0 1200 328" role="img" aria-labelledby="title desc">
+  <title id="title">Gamer 自动化创作与使用流程</title>
+  <desc id="desc">接入设备或浏览器，选择插件和配置包，编写工作稿，检查与试跑，最后由用户审查发布并安排任务。日志和 Trace 反馈到工作稿修改环节。此图为流程示意，不是运行截图。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="m1 1 5 3-5 3" fill="none" stroke="#efca53" stroke-width="1.5"/></marker>
+    <style>text{font-family:"Segoe UI","Microsoft YaHei",sans-serif;fill:#ededeb}.title{font-size:20px;font-weight:600}.detail{font-size:15px;fill:#a4a7ad}.step{font-size:14px;fill:#efca53}</style>
+  </defs>
+  <rect width="1200" height="328" rx="16" fill="#151619"/>
+  <rect x="1" y="1" width="1198" height="326" rx="15" fill="none" stroke="#33353a"/>
+  <text x="32" y="42" font-size="23" font-weight="650">先走通一次，再交给任务。</text>
+  <text x="1168" y="42" text-anchor="end" font-size="13" fill="#a4a7ad">操作流程示意</text>
+  <g>
+    <rect x="32" y="75" width="204" height="128" rx="10" fill="#202227" stroke="#393c42"/>
+    <text x="50" y="104" class="step">01 / 接入目标</text>
+    <text x="50" y="139" class="title">设备或浏览器</text>
+    <text x="50" y="174" class="detail">查看画面，确认可操作</text>
+  </g>
+  <g>
+    <rect x="265" y="75" width="204" height="128" rx="10" fill="#202227" stroke="#393c42"/>
+    <text x="283" y="104" class="step">02 / 准备内容</text>
+    <text x="283" y="139" class="title">插件与配置包</text>
+    <text x="283" y="174" class="detail">安装能力，选择资源</text>
+  </g>
+  <g>
+    <rect x="498" y="75" width="204" height="128" rx="10" fill="#202227" stroke="#393c42"/>
+    <text x="516" y="104" class="step">03 / 编写工作稿</text>
+    <text x="516" y="139" class="title">按步骤组织流程</text>
+    <text x="516" y="174" class="detail">人工或外部 Agent 编写</text>
+  </g>
+  <g>
+    <rect x="731" y="75" width="204" height="128" rx="10" fill="#202227" stroke="#393c42"/>
+    <text x="749" y="104" class="step">04 / 检查与试跑</text>
+    <text x="749" y="139" class="title">核对画面与结果</text>
+    <text x="749" y="174" class="detail">素材检查 + 所选版本试跑</text>
+  </g>
+  <g>
+    <rect x="964" y="75" width="204" height="128" rx="10" fill="#29271f" stroke="#efca53"/>
+    <text x="982" y="104" class="step">05 / 审查发布</text>
+    <text x="982" y="139" class="title">手动或定时执行</text>
+    <text x="982" y="174" class="detail">用户发布，服务端运行</text>
+  </g>
+  <g fill="none" stroke="#efca53" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M239 139h19"/><path d="M472 139h19"/>
+    <path d="M705 139h19"/><path d="M938 139h19"/>
+  </g>
+  <path d="M1066 203v66H600v-54" fill="none" stroke="#77756d" stroke-width="1.5" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+  <rect x="677" y="251" width="321" height="32" rx="6" fill="#151619"/>
+  <text x="837" y="273" text-anchor="middle" class="detail">结合日志与 Trace，修改后再次验证</text>
+  <text x="32" y="300" font-size="13" fill="#a4a7ad">素材检查验证内容；真实操作效果以目标环境中的试跑为准。</text>
+</svg>
