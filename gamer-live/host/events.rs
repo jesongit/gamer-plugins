@@ -87,6 +87,7 @@ impl EventBuffer {
         let room = scalar(data.get("room_id"));
         let id = data
             .get("msg_id")
+            .filter(|v| v.is_string() || v.is_u64())
             .map(|v| scalar(Some(v)))
             .filter(|v| !v.is_empty());
         if let Some(id) = &id {

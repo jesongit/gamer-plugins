@@ -33,36 +33,107 @@ it('首行只有当前任务，忽略旧历史，完整保留等待FIFO且不截
   const document = await open()
   expect(document.querySelector('#activity').textContent).toBe('任务中')
   expect(document.querySelectorAll('#featured .task-title')).toHaveLength(1)
-  expect(document.querySelector('#featured').textContent).toContain('#88')
-  expect(document.querySelector('#featured').textContent).not.toContain('#87')
-  expect(document.querySelector('#featured').textContent).toContain('已进行 1分12秒')
+  expect(document.querySelector('#featured').textContent).toContain('观众88')
+  expect(document.querySelector('#featured').textContent).not.toContain('观众87')
+  expect(document.querySelector('#featured').textContent).not.toContain('已进行')
+  expect(document.querySelector('#featured').children).toHaveLength(2)
   expect(document.querySelectorAll('#waiting li')).toHaveLength(12)
-  expect([...document.querySelectorAll('#waiting .ticket')].map(node => node.textContent)).toEqual(Array.from({ length: 12 }, (_, index) => '#' + (89 + index)))
+  expect([...document.querySelectorAll('#waiting .position')].map(node => node.textContent)).toEqual(Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, '0')))
   expect(document.querySelector('#queue-total').textContent).toBe('12 项等待')
   expect(document.querySelector('#toast')).toBeNull()
 })
-it('完整展示姓名、粉丝牌、open_id与额度，确认倒计时使用服务端时间', async () => {
+it('当前任务两行显示姓名和额度，隐藏身份明细并将确认倒计时放进状态行', async () => {
   const openId = '完整标识ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
   snapshot.current = item(88, 'running', { viewer: '名字很长的观众', open_id: openId, medal_name: '星海', medal_level: 16, phase: 'awaiting_confirmation', confirmation: { state: 'awaiting_confirmation', deadline_at: snapshot.time + 300000 }, quota: { remaining: 4, reserved: 2, available: 2, unlimited: false } })
   const document = await open()
   expect(document.querySelector('#featured').dataset.state).toBe('awaiting_confirmation')
-  expect(document.querySelector('#featured .medal').textContent).toBe('星海 Lv16')
-  expect(document.querySelector('#featured .open-id').textContent).toContain(openId)
-  expect(document.querySelector('#featured .quota').textContent).toBe('剩余 4 · 预占 2 · 可用 2')
+  expect(document.querySelector('#featured .medal')).toBeNull()
+  expect(document.querySelector('#featured .task-title').textContent).toBe('名字很长的观众')
+  expect(document.querySelector('#featured .open-id')).toBeNull()
+  expect(document.querySelector('#featured').textContent).not.toContain(openId)
+  expect(document.querySelector('#featured').children).toHaveLength(2)
+  expect(document.querySelector('.task-status #confirmation-time')).not.toBeNull()
+  expect(document.querySelector('#featured .quota').textContent).toBe('剩余 2 次')
   expect(document.querySelector('#confirmation-time').textContent).toBe('确认剩余 5:00')
   snapshot.time += 1000
   await vi.advanceTimersByTimeAsync(1000); await flushPromises()
   expect(document.querySelector('#confirmation-time').textContent).toBe('确认剩余 4:59')
   await update({ current: item(89, 'running', { quota: { unlimited: true, reserved: 1 } }) })
-  expect(document.querySelector('#featured .quota').textContent).toBe('不限次数 ∞ · 预占 1')
+  expect(document.querySelector('#featured .quota').textContent).toBe('不限次')
   expect(document.querySelector('#confirmation-time')).toBeNull()
 })
-it('等待队列身份额度也完整显示，全部外部文字保持纯文本', async () => {
+it('等待队列仅保留两行摘要，隐藏标识和粉丝牌，外部文字保持纯文本', async () => {
   const injected = '<img src=x onerror=alert(1)>'
-  snapshot.waiting = [item(90, 'waiting', { open_id: injected, medal_name: injected, medal_level: 8, quota: { remaining: 1, reserved: 1, available: 0 } })]
+  snapshot.waiting = [item(90, 'waiting', { viewer: injected, open_id: injected, medal_name: injected, medal_level: 8, quota: { remaining: 1, reserved: 1, available: 0 } })]
   const document = await open()
-  expect(document.querySelector('#waiting .open-id').textContent).toContain(injected)
-  expect(document.querySelector('#waiting .quota').textContent).toContain('剩余 1')
+  expect(document.querySelector('#waiting .open-id')).toBeNull()
+  expect(document.querySelector('#waiting .medal')).toBeNull()
+  expect(document.querySelector('#waiting .waiting-title').textContent).toBe(injected)
+  expect(document.querySelector('.waiting-content').children).toHaveLength(2)
+  expect(document.querySelector('#waiting .quota').textContent).toBe('剩余 0 次')
+  expect(document.querySelectorAll('img')).toHaveLength(0)
+})
+it('扫码与重新扫码显示各自阶段及剩余期限，不再伪装成执行中', async () => {
+  snapshot.current = item(88, 'running', { phase: 'awaiting_scan', confirmation: { state: 'awaiting_scan', deadline_at: snapshot.time + 300000 } })
+  const document = await open()
+  expect(document.querySelector('.task-status').textContent).toBe('扫码剩余 5:00')
+  expect(document.querySelector('#confirmation-time').textContent).toBe('扫码剩余 5:00')
+  await update({ current: item(88, 'running', { phase: 'rescanning', confirmation: { state: 'rescan_requested', deadline_at: snapshot.time + 40000 } }) })
+  expect(document.querySelector('.task-status').textContent).toContain('重扫剩余')
+  expect(document.querySelector('#confirmation-time').textContent).toContain('重扫剩余')
+  await update({ current: item(88, 'running', { phase: 'cleanup', confirmation: { state: 'timeout' } }) })
+  expect(document.querySelector('.task-status').textContent).toBe('退出中')
+  expect(document.querySelector('#confirmation-time')).toBeNull()
+})
+
+it('同一排队观众的剩余可用次数随赠礼入账、预占和结算更新，无限次数明确显示', async () => {
+  const waiting = item(90, 'waiting', { quota: { remaining: 1, reserved: 1, available: 0, unlimited: false } })
+  snapshot.waiting = [waiting]; snapshot.waiting_count = 1
+  const document = await open()
+  expect(document.querySelector('#waiting .quota').textContent).toBe('剩余 0 次')
+  await update({ waiting: [{ ...waiting, quota: { remaining: 3, reserved: 1, available: 2, unlimited: false } }] })
+  expect(document.querySelector('#waiting .quota').textContent).toBe('剩余 2 次')
+  await update({ waiting: [{ ...waiting, quota: { remaining: 3, reserved: 2, available: 1, unlimited: false } }] })
+  expect(document.querySelector('#waiting .quota').textContent).toBe('剩余 1 次')
+  await update({ waiting: [{ ...waiting, quota: { remaining: 2, reserved: 1, available: 1, unlimited: false } }] })
+  expect(document.querySelector('#waiting .quota').textContent).toBe('剩余 1 次')
+  await update({ waiting: [{ ...waiting, quota: { reserved: 1, unlimited: true } }] })
+  expect(document.querySelector('#waiting .quota').textContent).toBe('不限次')
+})
+
+it('失败、结束和收尾优先于残留登录状态，不继续显示扫码倒计时', async () => {
+  const confirmation = { state: 'awaiting_scan', deadline_at: snapshot.time + 300000 }
+  snapshot.current = item(88, 'running', { phase: 'awaiting_scan', confirmation })
+  const document = await open()
+  expect(document.querySelector('#confirmation-time')).not.toBeNull()
+  await update({ current: item(88, 'running', { phase: 'cleanup', confirmation }) })
+  expect(document.querySelector('.task-status').textContent).toBe('退出中')
+  expect(document.querySelector('#confirmation-time')).toBeNull()
+  for (const [state, label] of [['failed', '失败'], ['cancelled', '已取消'], ['success', '已完成']]) {
+    await update({ current: null, featured: item(88, state, { phase: 'finished', confirmation }) })
+    expect(document.querySelector('#activity').textContent).toBe('空闲中')
+    expect(document.querySelector('.task-status').textContent).toBe(label)
+    expect(document.querySelector('#confirmation-time')).toBeNull()
+  }
+})
+
+it('当前和排队项展示本次消耗，0 或入队时免扣显示免费', async () => {
+  snapshot.current = item(88, 'running', { cost: 2, billing_state: 'reserved', quota: { unlimited: true, reserved: 2 } })
+  snapshot.waiting = [item(89, 'waiting', { cost: 0, billing_state: 'exempt' }), item(90, 'waiting', { cost: 3, billing_state: 'reserved' }), item(91, 'waiting', { cost: 5, billing_state: 'exempt' })]
+  const document = await open()
+  expect(document.querySelector('#featured .cost').textContent).toBe('本次消耗 2 次')
+  expect([...document.querySelectorAll('#waiting .cost')].map(n => n.textContent)).toEqual(['免费', '消耗 3 次', '免费'])
+  await update({ current: snapshot.waiting[0], waiting: [snapshot.waiting[1]], featured: null })
+  expect(document.querySelector('#featured .cost').textContent).toBe('免费')
+  expect(document.querySelector('#waiting .cost').textContent).toBe('消耗 3 次')
+  await update({ current: null, featured: item(89, 'success', { cost: 0, billing_state: 'exempt' }), waiting: [] })
+  expect(document.querySelector('#featured .cost').textContent).toBe('免费')
+})
+
+it('未提供有效消耗时不误报免费，也不展示任意文本', async () => {
+  snapshot.waiting = [undefined, null, -1, 1.5, '0', '<img src=x onerror=alert(1)>'].map((cost, i) => item(i + 1, 'waiting', { cost }))
+  const document = await open()
+  expect(document.querySelectorAll('.cost')).toHaveLength(0)
   expect(document.querySelectorAll('img')).toHaveLength(0)
 })
 
@@ -74,16 +145,16 @@ it('任务结束后仅保留一个最近结果，完成/失败/取消各有明�
   expect(document.querySelector('.task-status').textContent).toBe('已完成')
   await update({ featured: item(21, 'failed') })
   expect(document.querySelectorAll('#featured .task-title')).toHaveLength(1)
-  expect(document.querySelector('#featured').textContent).not.toContain('#20')
+  expect(document.querySelector('#featured').textContent).not.toContain('观众20')
   expect(document.querySelector('.task-status').textContent).toBe('失败')
   await update({ featured: item(22, 'cancelled') })
   expect(document.querySelector('.task-status').textContent).toBe('已取消')
-  expect(document.querySelector('#empty-waiting').hidden).toBe(false)
+  expect(document.querySelector('.waiting-section').hidden).toBe(true)
 })
 
 it('空队列没有假任务，公开名称和多行自定义文字按纯文本展示', async () => {
   const document = await open()
-  expect(document.querySelector('#featured').textContent).toContain('触发互动后')
+  expect(document.querySelector('#featured').textContent).toContain('等待互动')
   expect(document.querySelectorAll('#featured .task-title')).toHaveLength(0)
   const unsafe = '<img src=x onerror="alert(1)">\n发送日常即可排队'
   await update({ text: unsafe, featured: item(33, 'success', { name: '<script>bad()</script>', viewer: '<img src=x>' }) })
@@ -103,7 +174,7 @@ it('缺少更新时保留最后队列但标明中断，重新收到状态后恢�
   expect(document.body.classList.contains('stale')).toBe(true)
   expect(document.querySelector('#activity').textContent).toBe('更新中断')
   expect(document.querySelector('#connection').textContent).toContain('显示上次进度')
-  expect(document.querySelector('#featured').textContent).toContain('#8')
+  expect(document.querySelector('#featured').textContent).toContain('观众8')
   fetchMock.mockImplementation(async () => ({ ok: true, json: async () => ({ ...snapshot, current: null, featured: item(8, 'success') }) }))
   await vi.advanceTimersByTimeAsync(1000); await flushPromises()
   expect(document.body.classList.contains('stale')).toBe(false)

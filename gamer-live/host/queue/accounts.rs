@@ -1,7 +1,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-const MAX_BALANCE: u64 = 1_000_000_000;
+pub(super) const MAX_BALANCE: u64 = 1_000_000_000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -37,7 +37,7 @@ impl Account {
             "unlimited":self.unlimited,"version":self.version,"created_at":self.created_at,
             "updated_at":self.updated_at,"test":self.test})
     }
-    fn changed(&mut self) {
+    pub(super) fn changed(&mut self) {
         self.version += 1;
         self.updated_at = now();
     }
@@ -75,11 +75,11 @@ pub(super) fn account_key(e: &LiveEvent, test: bool) -> Result<(String, String)>
     ))?;
     Ok((format!("user-{:x}", Sha256::digest(key)), open_id.into()))
 }
-pub(super) fn reserve(s: &mut State, e: &LiveEvent, test: bool, cost: u64) -> Result<Billing> {
-    ensure!(
-        (1..=MAX_BALANCE).contains(&cost),
-        "扣除次数须为正整数且不超过上限"
-    );
+pub(super) fn account_for_event<'a>(
+    s: &'a mut State,
+    e: &LiveEvent,
+    test: bool,
+) -> Result<&'a mut Account> {
     let (id, open_id) = account_key(e, test)?;
     let synthetic = test || e.platform_id == "test";
     let name = e
@@ -108,21 +108,27 @@ pub(super) fn reserve(s: &mut State, e: &LiveEvent, test: bool, cost: u64) -> Re
         last_update: None,
     });
     user.name = name;
+    Ok(user)
+}
+pub(super) fn reserve(s: &mut State, e: &LiveEvent, test: bool, cost: u64) -> Result<Billing> {
+    ensure!(cost <= MAX_BALANCE, "扣除次数不能超过上限");
+    let user = account_for_event(s, e, test)?;
+    let chargeable = cost > 0 && !user.unlimited;
     ensure!(
-        user.unlimited || user.available() >= cost,
+        !chargeable || user.available() >= cost,
         "可用次数不足（可用{}，本次需要{}）",
         user.available(),
         cost
     );
-    if !user.unlimited {
+    if chargeable {
         user.reserved = user.reserved.checked_add(cost).context("预占次数溢出")?;
     }
     user.changed();
     Ok(Billing {
-        user_id: id,
+        user_id: user.id.clone(),
         cost,
-        state: if user.unlimited { "exempt" } else { "reserved" }.into(),
-        chargeable: !user.unlimited,
+        state: if chargeable { "reserved" } else { "exempt" }.into(),
+        chargeable,
         created_at: now(),
         settled_at: None,
         reason: None,
@@ -133,19 +139,20 @@ pub(super) fn reserve_existing(s: &mut State, user_id: &str, cost: u64) -> Resul
         .users
         .get_mut(user_id)
         .context("旧任务没有可用计费账户，请重新发送弹幕")?;
+    let chargeable = cost > 0 && !user.unlimited;
     ensure!(
-        user.unlimited || user.available() >= cost,
+        !chargeable || user.available() >= cost,
         "可用次数不足，不能重新入队"
     );
-    if !user.unlimited {
+    if chargeable {
         user.reserved = user.reserved.checked_add(cost).context("预占次数溢出")?;
     }
     user.changed();
     Ok(Billing {
         user_id: user_id.into(),
         cost,
-        state: if user.unlimited { "exempt" } else { "reserved" }.into(),
-        chargeable: !user.unlimited,
+        state: if chargeable { "reserved" } else { "exempt" }.into(),
+        chargeable,
         created_at: now(),
         settled_at: None,
         reason: None,
@@ -315,9 +322,14 @@ impl Queue {
                 cost
             ),
             "confirmation_required" => format!(
-                "#{} 登录已就绪，请本人在5分钟内发送“确认”或“取消”",
+                "#{} 登录已就绪，请本人限时发送“确认”“取消”或“扫码”",
                 item.number
             ),
+            "scan_required" => format!(
+                "#{} 请本人限时扫码登录；发送“取消”退出，“扫码”刷新",
+                item.number
+            ),
+            "rescan_requested" => format!("#{} 正在退出账号并重新扫码，期限不延长", item.number),
             "confirmed" => format!(
                 "#{} 已确认，开始执行；领奖成功后扣除{}次",
                 item.number, cost

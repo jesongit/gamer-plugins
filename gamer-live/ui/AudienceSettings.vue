@@ -48,7 +48,7 @@ onMounted(load)
 <template>
   <section class="audience-settings" aria-label="观众反馈">
     <div class="audience-heading">
-      <div><h3>观众反馈</h3><p class="hint">把任务进度和排队顺序放进直播画面。</p></div>
+      <h3>观众反馈</h3>
       <label class="enable-control"><span>{{ enabled ? '已启用' : '启用' }}</span><input type="checkbox" role="switch" aria-label="启用观众反馈" :aria-checked="enabled" :checked="enabled" :disabled="loading || busy || !loaded" @change="toggle" /></label>
     </div>
     <p v-if="loading" class="hint" role="status">正在读取设置…</p>
@@ -57,12 +57,12 @@ onMounted(load)
         <label for="audience-url">网页素材地址</label>
         <input id="audience-url" :value="url" readonly spellcheck="false" @focus="$event.target.select()" />
         <div class="address-actions"><button type="button" @click="copy">复制地址</button></div>
-        <p class="hint">将此固定 URL 填入同机直播姬的浏览器／网页素材。开关仅控制网页服务。{{ enabled ? '关闭后可用同一地址重新启用。' : '启用后网页可读取。' }}</p>
+        <p class="hint address-hint">同机直播姬 → 网页素材。关闭不会停止互动。</p>
       </div>
       <p v-else class="hint">启用后网页可读取。关闭不会停止互动任务。</p>
       <form class="audience-text" @submit.prevent="save">
         <label for="audience-text">底部提示文字<span class="optional">可留空</span></label>
-        <textarea id="audience-text" v-model="text" rows="3" :disabled="busy" :aria-invalid="characterCount > 1000" spellcheck="false" placeholder="例如：发送包含「日常」的弹幕，按顺序执行" aria-describedby="audience-text-count" />
+        <textarea id="audience-text" v-model="text" rows="2" :disabled="busy" :aria-invalid="characterCount > 1000" spellcheck="false" aria-describedby="audience-text-count" />
         <div class="text-actions"><span id="audience-text-count" class="hint" :class="{ error: characterCount > 1000 }">{{ characterCount }} / 1000</span><button type="submit" :disabled="loading || busy || !dirty || characterCount > 1000">{{ busy ? '处理中…' : '保存文字' }}</button></div>
       </form>
     </template>
@@ -73,11 +73,12 @@ onMounted(load)
 </template>
 
 <style scoped>
-.audience-settings{display:grid;gap:16px;min-width:0;padding:16px;border:1px solid var(--border,#3b3d42);border-radius:4px;color:var(--text-0,#eeece6);font-size:13px}
-.audience-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}.audience-heading>div{min-width:0}h3,p{margin:0}h3{font-size:14px;font-weight:600;margin-bottom:5px}.hint{font-size:12px;line-height:1.6;color:var(--text-2,#b6b6ae)}
+.audience-settings{display:grid;gap:10px;min-width:0;padding:10px;border:1px solid var(--border,#3b3d42);border-radius:4px;color:var(--text-0,#eeece6);font-size:13px}
+.audience-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.audience-heading>div{min-width:0}h3,p{margin:0}h3{font-size:14px;font-weight:600;margin-bottom:0}.hint{font-size:12px;line-height:1.6;color:var(--text-2,#b6b6ae)}
 .enable-control{display:flex;align-items:center;gap:8px;flex-shrink:0;font-size:12px}.enable-control input{accent-color:var(--accent,#dda951);width:32px;height:22px;margin:0;cursor:pointer}
 .audience-address,.audience-text{display:grid;gap:8px;min-width:0}label{font-weight:500}.optional{margin-left:8px;font-weight:400;color:var(--text-2,#b6b6ae);font-size:12px}
-input,textarea,button{box-sizing:border-box;min-width:0;max-width:100%;border:1px solid var(--border,#3b3d42);border-radius:3px;font:inherit;color:inherit}input[readonly],textarea{width:100%;background:var(--field,#191b1f);padding:8px 10px;line-height:1.6}input[readonly]{font-size:12px;color:var(--text-1,#cecac1)}textarea{resize:vertical;min-height:82px;caret-color:var(--accent,#dda951)}textarea::placeholder{color:var(--text-2,#b6b6ae)}
+input,textarea,button{box-sizing:border-box;min-width:0;max-width:100%;border:1px solid var(--border,#3b3d42);border-radius:3px;font:inherit;color:inherit}input[readonly],textarea{width:100%;background:var(--field,#191b1f);padding:6px 8px;line-height:1.6}input[readonly]{font-size:12px;color:var(--text-1,#cecac1)}textarea{resize:vertical;min-height:56px;caret-color:var(--accent,#dda951)}textarea::placeholder{color:var(--text-2,#b6b6ae)}
 .address-actions,.text-actions{display:flex;align-items:center;gap:14px}.text-actions{justify-content:space-between}button{padding:6px 10px;background:var(--bg-3,#34363b);cursor:pointer;font-size:12px;justify-self:start}button:hover:not(:disabled){background:var(--border,#3b3d42)}button:active:not(:disabled){background:var(--bg-2,#282a2f)}button:disabled,input:disabled,textarea:disabled{opacity:.55;cursor:default}a{color:var(--accent-2,#edbc6c);font-size:12px;text-underline-offset:3px}a:hover{color:var(--text-0,#eeece6)}:is(input,textarea,button,a):focus-visible{outline:2px solid var(--accent,#dda951);outline-offset:3px}.feedback{color:var(--ok,#8fc9ae);line-height:1.6}.error{color:var(--danger,#ed9696);line-height:1.6;overflow-wrap:anywhere}::selection{background:var(--accent,#dda951);color:var(--accent-ink,#201d16)}
 @media(max-width:360px){.audience-settings{padding:12px;gap:14px}.audience-heading{gap:10px;align-items:flex-start}}
+.audience-address{grid-template-columns:minmax(0,1fr) auto;align-items:center}.audience-address>label,.address-hint{grid-column:1/-1}
 </style>

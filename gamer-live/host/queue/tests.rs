@@ -213,6 +213,300 @@ async fn setup() -> (tempfile::TempDir, Arc<Fake>, Arc<Queue>) {
     (dir, f, q)
 }
 
+fn paid_gift(id: &str, price: u64, count: u64) -> LiveEvent {
+    let mut e = event(id);
+    e.kind = "gift".into();
+    e.payload =
+        json!({"paid":true,"price":price,"count":count,"gift_id":42,"gift_name":"测试礼物"});
+    e
+}
+
+#[tokio::test]
+async fn gift_credit_normalizes_official_event_and_never_uses_null_as_message_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = Queue::open(dir.path().join("queue.json"), Fake::new()).unwrap();
+    let mut buffer = super::super::events::EventBuffer::default();
+    let mut raw = json!({"cmd":"OPEN_LIVEROOM_SEND_GIFT","data":{"room_id":123,"open_id":"gift-viewer","uname":"送礼人","msg_id":"official-gift","gift_id":42,"gift_name":"测试礼物","gift_num":1,"price":1500,"paid":true}});
+    let gift = buffer
+        .push_scoped("connection", "approved-app", raw.clone())
+        .unwrap();
+    q.receive(gift).await;
+    raw["data"]["msg_id"] = Value::Null;
+    let invalid = buffer
+        .push_scoped("connection", "approved-app", raw)
+        .unwrap();
+    assert!(invalid.event_id.is_none());
+    q.receive(invalid).await;
+    let users = q.accounts_list(0, "").await;
+    assert_eq!(users["users"][0]["balance"], 3);
+    assert_eq!(users["users"][0]["name"], "送礼人");
+    assert_eq!(q.state.lock().await.gift_credits.len(), 1);
+}
+
+#[tokio::test]
+async fn gift_credit_uses_official_price_units_and_rounds_message_total_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = Fake::new();
+    let q = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
+    let mut expected = 1; // Existing new-viewer quota is retained.
+    for (index, (price, count, added)) in [
+        (1500, 1, 2),
+        (1000, 1, 1),
+        (1, 1, 1),
+        (500, 3, 2),
+        (1500, 2, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut gift = paid_gift(&format!("gift-{index}"), price, count);
+        gift.payload["actual_price"] = json!(999999);
+        gift.payload["combo"] = json!({"combo_count":1000});
+        q.receive(gift).await;
+        expected += added;
+        let users = q.accounts_list(0, "").await;
+        assert_eq!(users["users"][0]["balance"], expected);
+        let s = q.state.lock().await;
+        assert_eq!(
+            s.receipts.last().unwrap().event["gift_credit"]["added"],
+            added
+        );
+        assert!(
+            s.items.is_empty(),
+            "crediting gifts does not require or create a task"
+        );
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    let logs = q.logs(0, 0, "trigger", "", &[]).await;
+    assert!(logs.to_string().contains("赠礼增加 2 次"));
+}
+
+#[tokio::test]
+async fn gift_credit_persists_dedup_across_reconnection_restart_and_log_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.json");
+    let f = Fake::new();
+    let q = Queue::open(path.clone(), f.clone()).unwrap();
+    q.receive(paid_gift("stable-gift", 1500, 1)).await;
+    q.new_connection().await.unwrap();
+    let mut replay = paid_gift("stable-gift", 1500, 1);
+    replay.connection_id = "new-connection".into();
+    q.receive(replay.clone()).await;
+    {
+        let mut s = q.state.lock().await;
+        let mut n = s.clone();
+        n.receipts.clear();
+        n.seen.clear();
+        q.commit(&mut s, n).unwrap();
+    }
+    drop(q);
+    let restored = Queue::open(path, f).unwrap();
+    restored.receive(replay).await;
+    let users = restored.accounts_list(0, "").await;
+    assert_eq!(users["users"][0]["balance"], 3);
+    let s = restored.state.lock().await;
+    assert_eq!(s.gift_credits.len(), 1);
+    assert!(s.receipts.is_empty());
+}
+
+#[tokio::test]
+async fn gift_credit_updates_waiting_viewer_available_quota_without_touching_reservation() {
+    let (_dir, f, q) = setup().await;
+    q.accounts_save_settings(1, 1).await.unwrap();
+    f.busy.store(true, Ordering::SeqCst);
+    q.receive(event("waiting-job")).await;
+    assert_eq!(q.audience().await["waiting"][0]["quota"]["available"], 0);
+    q.receive(paid_gift("top-up", 1500, 1)).await;
+    assert_eq!(
+        q.audience().await["waiting"][0]["quota"],
+        json!({"remaining":3,"reserved":1,"available":2,"unlimited":false})
+    );
+    assert_eq!(q.state.lock().await.items.len(), 1);
+    // An administrator editing the earlier balance must see a version conflict.
+    let user = q.accounts_list(0, "").await["users"][0].clone();
+    assert!(q
+        .accounts_update(
+            user["id"].as_str().unwrap(),
+            1,
+            false,
+            user["version"].as_u64().unwrap() - 1,
+            "stale-admin"
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn gift_credit_still_works_when_task_admission_stopped_or_device_unavailable() {
+    let (_dir, f, q) = setup().await;
+    q.accounts_save_settings(0, 1).await.unwrap();
+    q.accepting.store(false, Ordering::SeqCst);
+    f.offline.store(true, Ordering::SeqCst);
+    q.receive(paid_gift("idle-gift", 1500, 1)).await;
+    assert_eq!(q.accounts_list(0, "").await["users"][0]["balance"], 2);
+    assert!(q.state.lock().await.items.is_empty());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gift_credit_and_matching_gift_rule_reservation_commit_together() {
+    let (_dir, f, q) = setup().await;
+    q.accounts_save_settings(0, 1).await.unwrap();
+    f.busy.store(true, Ordering::SeqCst);
+    {
+        let mut rules = f.rules.lock();
+        rules.rules[0].kind = "gift".into();
+        rules.rules[0].value = "42".into();
+    }
+    q.receive(paid_gift("gift-and-job", 1500, 1)).await;
+    let s = q.state.lock().await;
+    let user = s.users.values().next().unwrap();
+    assert_eq!((user.balance, user.reserved, user.available()), (2, 1, 1));
+    assert_eq!(s.gift_credits.len(), 1);
+    assert_eq!(s.items.len(), 1);
+}
+
+#[tokio::test]
+async fn gift_credit_requires_paid_valid_value_identity_and_message_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = Queue::open(dir.path().join("queue.json"), Fake::new()).unwrap();
+    let mut invalid = vec![
+        paid_gift("zero-price", 0, 1),
+        paid_gift("zero-count", 1500, 0),
+        paid_gift("overflow", u64::MAX, u64::MAX),
+    ];
+    let mut no_id = paid_gift("no-id", 1500, 1);
+    no_id.event_id = None;
+    invalid.push(no_id);
+    let mut no_actor = paid_gift("no-actor", 1500, 1);
+    no_actor.actor = None;
+    invalid.push(no_actor);
+    let mut no_app = paid_gift("no-app", 1500, 1);
+    no_app.identity_namespace.clear();
+    invalid.push(no_app);
+    let mut no_room = paid_gift("no-room", 1500, 1);
+    no_room.room_id.clear();
+    invalid.push(no_room);
+    let mut decimal = paid_gift("decimal-price", 1500, 1);
+    decimal.payload["price"] = json!(1.5);
+    invalid.push(decimal);
+    let mut no_price = paid_gift("r-price-only", 1500, 1);
+    no_price.payload["price"] = Value::Null;
+    no_price.payload["actual_price"] = json!(1500);
+    invalid.push(no_price);
+    for e in invalid {
+        q.receive(e).await;
+    }
+    for (id, paid) in [("free", json!(false)), ("unknown-paid", Value::Null)] {
+        let mut e = paid_gift(id, 1500, 1);
+        e.payload["paid"] = paid;
+        q.receive(e).await;
+    }
+    let s = q.state.lock().await;
+    assert!(s.users.is_empty());
+    assert!(s.gift_credits.is_empty());
+    assert!(s.receipts.iter().any(|r| r.reason == "gift_credit_invalid"));
+}
+
+#[tokio::test]
+async fn gift_credit_preview_and_simulation_never_change_real_or_test_balances() {
+    let (_dir, _f, q) = setup().await;
+    q.accept(paid_gift("preview", 1500, 1), false, true, "")
+        .await
+        .unwrap();
+    q.accept(paid_gift("simulation", 1500, 1), true, true, "test-gift")
+        .await
+        .unwrap();
+    let mut synthetic = paid_gift("synthetic", 1500, 1);
+    synthetic.platform_id = "test".into();
+    q.receive(synthetic).await;
+    let s = q.state.lock().await;
+    assert!(s.users.is_empty());
+    assert!(s.gift_credits.is_empty());
+}
+
+#[tokio::test]
+async fn gift_credit_concurrent_duplicate_is_applied_once() {
+    let (_dir, _f, q) = setup().await;
+    let gift = paid_gift("concurrent", 1500, 1);
+    tokio::join!(q.receive(gift.clone()), q.receive(gift));
+    let s = q.state.lock().await;
+    assert_eq!(s.users.values().next().unwrap().balance, 10002);
+    assert_eq!(s.gift_credits.len(), 1);
+}
+
+#[tokio::test]
+async fn gift_credit_identity_is_scoped_and_preserves_unlimited_and_balance_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let q = Queue::open(dir.path().join("queue.json"), Fake::new()).unwrap();
+    for (app, room, viewer) in [
+        ("app-one", "room-one", "viewer-one"),
+        ("app-two", "room-one", "viewer-one"),
+        ("app-one", "room-two", "viewer-one"),
+        ("app-one", "room-one", "viewer-two"),
+    ] {
+        let mut gift = paid_gift(&format!("same-id-{viewer}"), 1500, 1);
+        gift.identity_namespace = app.into();
+        gift.room_id = room.into();
+        gift.actor = Some(json!({"id":viewer,"name":"同名观众"}));
+        q.receive(gift).await;
+    }
+    {
+        let s = q.state.lock().await;
+        assert_eq!(s.users.len(), 4);
+        assert_eq!(s.gift_credits.len(), 4);
+        assert!(s.users.values().all(|u| u.balance == 3));
+    }
+    let user = q.accounts_list(0, "").await["users"][0].clone();
+    q.accounts_update(
+        user["id"].as_str().unwrap(),
+        accounts::MAX_BALANCE - 1,
+        true,
+        user["version"].as_u64().unwrap(),
+        "set-unlimited",
+    )
+    .await
+    .unwrap();
+    let mut gift = paid_gift("over-balance-cap", 1500, 1);
+    gift.identity_namespace = user["identity_namespace"].as_str().unwrap().into();
+    gift.room_id = user["room_id"].as_str().unwrap().into();
+    gift.actor = Some(json!({"id":user["open_id"],"name":"新昵称"}));
+    q.receive(gift.clone()).await;
+    {
+        let s = q.state.lock().await;
+        let account = &s.users[user["id"].as_str().unwrap()];
+        assert_eq!(account.balance, accounts::MAX_BALANCE - 1);
+        assert!(account.unlimited);
+        assert_eq!(s.gift_credits.len(), 4);
+    }
+    gift.event_id = Some("fits-balance-cap".into());
+    gift.payload["price"] = json!(1000);
+    q.receive(gift).await;
+    let s = q.state.lock().await;
+    let account = &s.users[user["id"].as_str().unwrap()];
+    assert_eq!(account.balance, accounts::MAX_BALANCE);
+    assert_eq!(account.name, "新昵称");
+    assert!(account.unlimited);
+}
+
+#[tokio::test]
+async fn gift_credit_and_dedup_roll_back_together_if_persistence_fails() {
+    let (dir, _f, q) = setup().await;
+    let path = dir.path().join("queue.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    q.receive(paid_gift("save-retry", 1500, 1)).await;
+    {
+        let s = q.state.lock().await;
+        assert!(s.users.is_empty());
+        assert!(s.gift_credits.is_empty());
+        assert!(s.seen.is_empty());
+    }
+    std::fs::remove_dir(&path).unwrap();
+    q.receive(paid_gift("save-retry", 1500, 1)).await;
+    assert_eq!(q.accounts_list(0, "").await["users"][0]["balance"], 10002);
+}
+
 #[tokio::test]
 async fn external_queue_filters_recorded_target_before_pagination_and_redacts_details() {
     let (_dir, f, q) = setup().await;
@@ -1727,6 +2021,258 @@ fn command(id: &str, text: &str) -> LiveEvent {
 }
 
 #[tokio::test]
+async fn scan_gate_is_owned_bounded_and_rejects_early_confirmation() {
+    let (_dir, f, q) = quota_setup().await;
+    install_confirmation(&f);
+    q.receive(event("login-task")).await;
+    q.tick().await;
+    let gate = q
+        .begin_scan("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    assert_eq!(gate["status"], "scanning");
+    let deadline = gate["deadline_at"].as_i64().unwrap();
+    assert!((299_000..=300_000).contains(&(deadline - now())));
+    assert_eq!(
+        q.begin_scan("run-0", "phone", "default", 300)
+            .await
+            .unwrap()["deadline_at"],
+        deadline
+    );
+    assert!(q
+        .begin_scan("run-0", "other", "default", 300)
+        .await
+        .is_err());
+    assert!(q
+        .begin_scan("run-0", "phone", "default", 301)
+        .await
+        .is_err());
+    q.receive(command("too-early", "确认")).await;
+    for text in ["取消", "扫码"] {
+        for (id, actor, ns, room) in [
+            ("viewer", "not-owner", "qa-app", "room"),
+            ("app", "viewer", "wrong-app", "room"),
+            ("room", "viewer", "qa-app", "wrong-room"),
+        ] {
+            let mut e = command(&format!("other-{text}-{id}"), text);
+            e.actor = Some(json!({"id":actor,"name":"旁观者"}));
+            e.identity_namespace = ns.into();
+            e.room_id = room.into();
+            q.receive(e).await;
+        }
+    }
+    assert_eq!(
+        q.poll_confirmation("run-0", "phone", "default")
+            .await
+            .unwrap()["status"],
+        "scanning"
+    );
+    assert_eq!(account(&q).await["reserved"], 1);
+    q.receive(command("self-cancel", "取消")).await;
+    assert_eq!(
+        q.begin_confirmation("run-0", "phone", "default", 300)
+            .await
+            .unwrap()["status"],
+        "cancelled"
+    );
+    assert_eq!(account(&q).await["balance"], 1);
+    assert_eq!(account(&q).await["reserved"], 0);
+    q.receive(command("late-confirm", "确认")).await;
+    assert_eq!(
+        q.poll_confirmation("run-0", "phone", "default")
+            .await
+            .unwrap()["status"],
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn login_setup_failure_keeps_cause_refunds_and_hides_stale_countdown_through_cleanup() {
+    let (_dir, f, q) = quota_setup().await;
+    install_confirmation(&f);
+    q.prepare_automatic("phone", "default", "videos")
+        .await
+        .unwrap();
+    q.activate_automatic().await.unwrap();
+    q.receive(event("setup-fails")).await;
+    q.tick().await;
+    q.begin_scan("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    assert_eq!(
+        q.audience().await["current"]["confirmation"]["state"],
+        "awaiting_scan"
+    );
+    f.runs.lock().insert(
+        "run-0".into(),
+        json!({"state":"failed","run_id":"run-0","error":"LIVE_QR_NOT_READY: login setup failed"}),
+    );
+    q.tick().await;
+    let status = q.status(0, "").await;
+    assert_eq!(status["current"]["phase"], "cleanup");
+    assert_eq!(
+        status["current"]["main_result"]["error"],
+        "LIVE_QR_NOT_READY: login setup failed"
+    );
+    assert_eq!(
+        status["current"]["cleanup_spec"]["entrypoint"],
+        "default/logout-only.yaml"
+    );
+    assert!(q.audience().await["current"]["confirmation"].is_null());
+    assert_eq!(account(&q).await["balance"], 1);
+    assert_eq!(account(&q).await["reserved"], 0);
+    q.tick().await;
+    f.finish("run-1", "success");
+    q.tick().await;
+    let audience = q.audience().await;
+    assert!(audience["current"].is_null());
+    assert_eq!(audience["featured"]["state"], "failed");
+    assert!(audience["featured"]["confirmation"].is_null());
+}
+
+#[tokio::test]
+async fn scan_timeout_refunds_but_next_user_waits_for_verified_cleanup() {
+    let (_dir, f, q) = quota_setup().await;
+    install_confirmation(&f);
+    q.prepare_automatic("phone", "default", "videos")
+        .await
+        .unwrap();
+    q.activate_automatic().await.unwrap();
+    q.receive(event("scan-timeout")).await;
+    q.tick().await;
+    q.begin_scan("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    q.state.lock().await.items[0]
+        .confirmation
+        .as_mut()
+        .unwrap()
+        .deadline_at = now() - 1;
+    q.tick().await;
+    assert_eq!(account(&q).await["reserved"], 0);
+    assert_eq!(account(&q).await["balance"], 1);
+    assert_eq!(
+        q.begin_confirmation("run-0", "phone", "default", 300)
+            .await
+            .unwrap()["status"],
+        "timeout"
+    );
+    q.receive(event("next-after-timeout")).await;
+    q.tick().await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.finish("run-0", "success");
+    q.tick().await;
+    q.tick().await;
+    assert_eq!(
+        f.submitted.lock()[1]["entrypoint"],
+        "default/logout-only.yaml"
+    );
+    assert_eq!(
+        q.status(0, "").await["waiting"].as_array().unwrap().len(),
+        1
+    );
+    f.finish("run-1", "success");
+    q.tick().await;
+    q.tick().await;
+    assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(q.status(0, "").await["paused"], false);
+}
+
+#[tokio::test]
+async fn rescan_requires_ready_again_and_never_extends_either_deadline() {
+    let (_dir, f, q) = quota_setup().await;
+    install_confirmation(&f);
+    q.receive(event("rescan-task")).await;
+    q.tick().await;
+    let scan = q
+        .begin_scan("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    q.receive(command("scan-again", "扫码")).await;
+    q.receive(command("scan-again-2", "扫码")).await;
+    assert_eq!(
+        q.begin_confirmation("run-0", "phone", "default", 300)
+            .await
+            .unwrap()["status"],
+        "rescan"
+    );
+    let resumed = q.finish_rescan("run-0", "phone", "default").await.unwrap();
+    assert_eq!(resumed["status"], "scanning");
+    assert_eq!(resumed["deadline_at"], scan["deadline_at"]);
+    let ready = q
+        .begin_confirmation("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    assert_eq!(ready["status"], "waiting");
+    let confirm_deadline = ready["deadline_at"].clone();
+    q.receive(command("new-qr-after-login", "扫码")).await;
+    q.receive(command("confirm-before-qr", "确认")).await;
+    assert_eq!(
+        q.poll_confirmation("run-0", "phone", "default")
+            .await
+            .unwrap()["status"],
+        "rescan"
+    );
+    assert_eq!(account(&q).await["reserved"], 1);
+    q.finish_rescan("run-0", "phone", "default").await.unwrap();
+    let mut stale = command("stale-confirm", "确认");
+    stale.received_at = chrono::DateTime::from_timestamp_millis(now() - 1000)
+        .unwrap()
+        .to_rfc3339();
+    q.begin_confirmation("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    q.receive(stale).await;
+    let gate = q
+        .poll_confirmation("run-0", "phone", "default")
+        .await
+        .unwrap();
+    assert_eq!(gate["status"], "waiting");
+    assert_eq!(gate["deadline_at"], confirm_deadline);
+    q.receive(command("real-confirm", "确认")).await;
+    for text in ["扫码", "取消", "确认"] {
+        q.receive(command(&format!("running-{text}"), text)).await;
+    }
+    assert_eq!(
+        q.poll_confirmation("run-0", "phone", "default")
+            .await
+            .unwrap()["status"],
+        "confirmed"
+    );
+    assert!(f.cancelled.lock().is_empty());
+    assert_eq!(account(&q).await["reserved"], 1);
+}
+
+#[tokio::test]
+async fn rescan_cancel_cannot_be_acknowledged_back_to_scanning_and_failed_logout_pauses() {
+    let (_dir, f, q) = quota_setup().await;
+    install_confirmation(&f);
+    q.receive(event("rescan-cancel")).await;
+    q.tick().await;
+    q.begin_scan("run-0", "phone", "default", 300)
+        .await
+        .unwrap();
+    q.receive(command("rescan-cancel-scan", "扫码")).await;
+    q.receive(command("rescan-cancel-cancel", "取消")).await;
+    assert_eq!(
+        q.finish_rescan("run-0", "phone", "default").await.unwrap()["status"],
+        "cancelled"
+    );
+    assert_eq!(account(&q).await["reserved"], 0);
+    q.receive(event("new-task-after-cancel")).await;
+    f.finish("run-0", "success");
+    q.tick().await;
+    q.tick().await;
+    f.finish("run-1", "failed");
+    q.tick().await;
+    q.tick().await;
+    let state = q.status(0, "").await;
+    assert_eq!(state["paused"], true);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state["waiting"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn default_credit_is_reserved_atomically_and_blocks_other_tasks_before_source_switch() {
     let (_dir, f, q) = quota_setup().await;
     let pictures = Arc::new(CleanupPicture::default());
@@ -1750,6 +2296,97 @@ async fn default_credit_is_reserved_atomically_and_blocks_other_tasks_before_sou
         q.status(0, "").await["waiting"].as_array().unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+async fn free_rules_admit_zero_balance_viewers_and_retry_without_reserving_or_charging() {
+    let (dir, f, q) = quota_setup().await;
+    q.accounts_save_settings(0, 0).await.unwrap();
+    f.rules.lock().rules[0].cost = 0;
+    let mut other = event("another-free-viewer");
+    other.actor = Some(json!({"id":"another","name":"另一位"}));
+    tokio::join!(q.receive(event("free-success")), q.receive(other));
+    let waiting = q.status(0, "").await["waiting"].clone();
+    assert_eq!(waiting.as_array().unwrap().len(), 2);
+    for item in waiting.as_array().unwrap() {
+        assert_eq!(item["billing"]["cost"], 0);
+        assert_eq!(item["billing"]["state"], "exempt");
+        assert_eq!(item["billing"]["chargeable"], false);
+    }
+    q.tick().await;
+    f.finish("run-0", "success");
+    q.tick().await;
+    q.tick().await;
+    f.finish("run-1", "failed");
+    q.tick().await;
+    let state = q.status(0, "").await;
+    let failed_id = state["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["state"] == "failed")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for item in state["history"].as_array().unwrap() {
+        assert_eq!(item["billing"]["state"], "exempt");
+    }
+    f.rules.lock().rules[0].cost = 100;
+    q.control("retry", &[failed_id], "free-retry")
+        .await
+        .unwrap();
+    let retry = q.status(0, "").await["waiting"][0].clone();
+    assert_eq!(retry["billing"]["cost"], 0);
+    assert_eq!(retry["billing"]["state"], "exempt");
+    drop(q);
+    let restored = Queue::open(dir.path().join("queue.json"), f.clone()).unwrap();
+    assert_eq!(
+        restored.status(0, "").await["waiting"][0]["billing"],
+        retry["billing"]
+    );
+    restored
+        .control("remove", &[retry["id"].as_str().unwrap().into()], "")
+        .await
+        .unwrap();
+    restored.receive(event("now-paid")).await;
+    assert!(restored.status(0, "").await["waiting"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let users = restored.accounts_list(0, "").await;
+    assert_eq!(users["total"], 2);
+    for user in users["users"].as_array().unwrap() {
+        assert_eq!(user["balance"], 0);
+        assert_eq!(user["reserved"], 0);
+        assert_eq!(user["available"], 0);
+        assert_eq!(user["unlimited"], false);
+    }
+}
+
+#[tokio::test]
+async fn changing_rule_to_free_preserves_existing_paid_reservation_and_final_charge() {
+    let (_dir, f, q) = quota_setup().await;
+    q.receive(event("paid-before-change")).await;
+    f.rules.lock().rules[0].cost = 0;
+    q.receive(event("free-after-change")).await;
+    let waiting = q.status(0, "").await["waiting"].clone();
+    assert_eq!(waiting.as_array().unwrap().len(), 2);
+    assert_eq!(waiting[0]["billing"]["cost"], 1);
+    assert_eq!(waiting[0]["billing"]["state"], "reserved");
+    assert_eq!(waiting[1]["billing"]["cost"], 0);
+    assert_eq!(waiting[1]["billing"]["state"], "exempt");
+    assert_eq!(account(&q).await["reserved"], 1);
+    q.tick().await;
+    f.finish("run-0", "success");
+    q.tick().await;
+    assert_eq!(account(&q).await["balance"], 0);
+    assert_eq!(account(&q).await["reserved"], 0);
+    q.tick().await;
+    f.finish("run-1", "success");
+    q.tick().await;
+    assert_eq!(account(&q).await["balance"], 0);
+    assert_eq!(account(&q).await["reserved"], 0);
 }
 
 #[tokio::test]
@@ -2057,6 +2694,8 @@ async fn reserved_controls_are_free_even_if_an_ordinary_rule_matches_them() {
     q.receive(command("confirm-outside", "确认")).await;
     f.rules.lock().rules[0].value = "取消".into();
     q.receive(command("cancel-outside", "取消")).await;
+    f.rules.lock().rules[0].value = "扫码".into();
+    q.receive(command("scan-outside", "扫码")).await;
     assert_eq!(q.accounts_list(0, "").await["total"], 0);
     assert!(q.status(0, "").await["waiting"]
         .as_array()

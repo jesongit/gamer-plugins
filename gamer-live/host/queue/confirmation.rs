@@ -5,6 +5,8 @@ pub struct Confirmation {
     pub state: String,
     pub started_at: i64,
     pub deadline_at: i64,
+    #[serde(default)]
+    pub confirmation_deadline_at: Option<i64>,
     pub decided_at: Option<i64>,
     pub decision_event_id: Option<String>,
 }
@@ -27,6 +29,55 @@ impl Confirmation {
     }
 }
 impl Queue {
+    pub async fn begin_scan(
+        &self,
+        run_id: &str,
+        device: &str,
+        package: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let _notices = NoticeGuard(self);
+        ensure!((1..=300).contains(&timeout_secs), "扫码等待须为1到300秒");
+        let mut s = self.state.lock().await;
+        let index = Self::confirmation_index(&s, run_id, device, package)?;
+        if s.items[index].confirmation.is_none() {
+            let mut n = s.clone();
+            n.items[index].phase = "awaiting_scan".into();
+            n.items[index].confirmation = Some(Confirmation {
+                state: "awaiting_scan".into(),
+                started_at: now(),
+                deadline_at: now() + timeout_secs as i64 * 1000,
+                confirmation_deadline_at: None,
+                decided_at: None,
+                decision_event_id: None,
+            });
+            self.commit(&mut s, n)?;
+        }
+        self.expire_confirmation(&mut s, index)?;
+        Ok(Self::confirmation_response(&s, index))
+    }
+    pub async fn finish_rescan(&self, run_id: &str, device: &str, package: &str) -> Result<Value> {
+        let _notices = NoticeGuard(self);
+        let mut s = self.state.lock().await;
+        let index = Self::confirmation_index(&s, run_id, device, package)?;
+        self.expire_confirmation(&mut s, index)?;
+        if s.items[index]
+            .confirmation
+            .as_ref()
+            .is_some_and(|c| c.state == "rescan_requested")
+        {
+            let mut n = s.clone();
+            let c = n.items[index].confirmation.as_mut().unwrap();
+            c.state = "awaiting_scan".into();
+            c.started_at = now();
+            c.decided_at = None;
+            c.decision_event_id = None;
+            // Keep the deadline; repeated QR requests never buy more time.
+            n.items[index].phase = "awaiting_scan".into();
+            self.commit(&mut s, n)?;
+        }
+        Ok(Self::confirmation_response(&s, index))
+    }
     fn confirmation_index(s: &State, run_id: &str, device: &str, package: &str) -> Result<usize> {
         let index = s
             .items
@@ -51,7 +102,7 @@ impl Queue {
     fn confirmation_response(s: &State, index: usize) -> Value {
         let item = &s.items[index];
         let confirmation = item.confirmation.as_ref();
-        json!({"status":confirmation.map(|c|if c.state == "awaiting_confirmation" {"waiting"} else {&c.state}).unwrap_or("not_started"),
+        json!({"status":confirmation.map(|c|match c.state.as_str() { "awaiting_confirmation" => "waiting", "awaiting_scan" => "scanning", "rescan_requested" => "rescan", _ => &c.state }).unwrap_or("not_started"),
             "item_id":item.id,"deadline_at":confirmation.map(|c|c.deadline_at),
             "viewer":item.event["message"]["actor"]["name"],
             "open_id":item.billing.as_ref().and_then(|b|s.users.get(&b.user_id)).map(|u|u.open_id.as_str())})
@@ -82,14 +133,44 @@ impl Queue {
                 )
                 .min(300);
             ensure!(seconds > 0, "确认等待配置无效");
+            let deadline = now() + seconds as i64 * 1000;
             n.items[index].phase = "awaiting_confirmation".into();
             n.items[index].confirmation = Some(Confirmation {
                 state: "awaiting_confirmation".into(),
                 started_at: now(),
-                deadline_at: now() + seconds as i64 * 1000,
+                deadline_at: deadline,
+                confirmation_deadline_at: Some(deadline),
                 decided_at: None,
                 decision_event_id: None,
             });
+            self.commit(&mut s, n)?;
+        }
+        // A visual login-ready observation may race cancellation, timeout or a
+        // new QR request. Only the live scan state can open a fresh gate.
+        self.expire_confirmation(&mut s, index)?;
+        if s.items[index]
+            .confirmation
+            .as_ref()
+            .is_some_and(|c| c.state == "awaiting_scan")
+        {
+            let mut n = s.clone();
+            let seconds = timeout_secs.min(
+                n.items[index]
+                    .confirmation_spec
+                    .as_ref()
+                    .unwrap()
+                    .timeout_secs,
+            );
+            let c = n.items[index].confirmation.as_mut().unwrap();
+            let deadline = *c
+                .confirmation_deadline_at
+                .get_or_insert_with(|| now() + seconds as i64 * 1000);
+            c.state = "awaiting_confirmation".into();
+            c.started_at = now();
+            c.deadline_at = deadline;
+            c.decided_at = None;
+            c.decision_event_id = None;
+            n.items[index].phase = "awaiting_confirmation".into();
             self.commit(&mut s, n)?;
         }
         self.expire_confirmation(&mut s, index)?;
@@ -109,11 +190,12 @@ impl Queue {
         Ok(Self::confirmation_response(&s, index))
     }
     pub(super) fn expire_confirmation(&self, s: &mut State, index: usize) -> Result<()> {
-        if s.items[index]
-            .confirmation
-            .as_ref()
-            .is_some_and(|c| c.state == "awaiting_confirmation" && now() >= c.deadline_at)
-        {
+        if s.items[index].confirmation.as_ref().is_some_and(|c| {
+            matches!(
+                c.state.as_str(),
+                "awaiting_scan" | "awaiting_confirmation" | "rescan_requested"
+            ) && now() >= c.deadline_at
+        }) {
             let mut n = s.clone();
             let confirmation = n.items[index].confirmation.as_mut().unwrap();
             confirmation.state = "timeout".into();
@@ -137,7 +219,7 @@ impl Queue {
         } else {
             ""
         };
-        if !["确认", "取消"].contains(&command) {
+        if !["确认", "取消", "扫码"].contains(&command) {
             return Ok(None);
         }
         let _notices = NoticeGuard(self);
@@ -173,10 +255,16 @@ impl Queue {
             i.active()
                 && i.state != "review"
                 && !i.stop_requested
-                && i.phase == "awaiting_confirmation"
-                && i.confirmation
-                    .as_ref()
-                    .is_some_and(|c| c.state == "awaiting_confirmation" && c.accepts_time(e))
+                && matches!(
+                    i.phase.as_str(),
+                    "awaiting_scan" | "awaiting_confirmation" | "rescanning"
+                )
+                && i.confirmation.as_ref().is_some_and(|c| {
+                    matches!(
+                        c.state.as_str(),
+                        "awaiting_scan" | "awaiting_confirmation" | "rescan_requested"
+                    ) && c.accepts_time(e)
+                })
                 && i.billing
                     .as_ref()
                     .and_then(|b| n.users.get(&b.user_id))
@@ -192,10 +280,38 @@ impl Queue {
         let mut result = "仅展示：当前不在本人确认阶段".to_string();
         if let Some(index) = index {
             let expired = now() >= n.items[index].confirmation.as_ref().unwrap().deadline_at;
+            let stage = n.items[index].confirmation.as_ref().unwrap().state.as_str();
+            if !expired
+                && ((command == "确认" && stage != "awaiting_confirmation")
+                    || (command == "扫码" && stage == "rescan_requested"))
+            {
+                n.receipts.push(Receipt {
+                    seq: n.next_seq,
+                    reason: "display_only".into(),
+                    public_name: String::new(),
+                    at: now(),
+                    event: summary(e),
+                    rule: None,
+                    item_id: Some(n.items[index].id.clone()),
+                    result: if command == "确认" {
+                        "尚未扫码登录，确认无效"
+                    } else {
+                        "正在重新扫码，请稍候"
+                    }
+                    .into(),
+                });
+                n.next_seq += 1;
+                self.commit(&mut s, n)?;
+                return Ok(Some(
+                    json!({"reason":"display_only","result":"当前登录阶段不接受此操作"}),
+                ));
+            }
             let decision = if expired {
                 "timeout"
             } else if command == "确认" {
                 "confirmed"
+            } else if command == "扫码" {
+                "rescan_requested"
             } else {
                 "cancelled"
             };
@@ -203,14 +319,20 @@ impl Queue {
             confirmation.state = decision.into();
             confirmation.decided_at = Some(now());
             confirmation.decision_event_id = e.event_id.clone();
-            n.items[index].phase = "main".into();
-            if decision != "confirmed" {
+            n.items[index].phase = if decision == "rescan_requested" {
+                "rescanning"
+            } else {
+                "main"
+            }
+            .into();
+            if matches!(decision, "cancelled" | "timeout") {
                 accounts::settle(&mut n, index, false, "confirmation_declined")?;
             }
             item_id = Some(n.items[index].id.clone());
             result = match decision {
                 "confirmed" => "已确认，领奖成功后扣次",
                 "cancelled" => "已取消，正在退出账号",
+                "rescan_requested" => "正在退出登录并重新扫码，等待期限不延长",
                 _ => "确认超时，正在退出账号",
             }
             .into();

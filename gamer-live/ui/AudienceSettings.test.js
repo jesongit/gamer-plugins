@@ -26,7 +26,7 @@ it('挂载只读取服务端状态，只有一个开关与文字编辑，没有�
   expect(wrapper.find('input[type="number"]').exists()).toBe(false)
   expect(wrapper.get('textarea').element.value).toBe(mock.saved.text)
   expect(wrapper.get('input[readonly]').element.value).toBe(mock.saved.url)
-  expect(wrapper.text()).toContain('启用后网页可读取')
+  expect(wrapper.text()).toContain('关闭不会停止互动')
   expect(button('保存文字').element.disabled).toBe(true)
 })
 
@@ -40,7 +40,7 @@ it('启用只提供网页服务和URL，无打开页面入口，重新挂载恢�
   expect(destination).toBe(mock.saved.url)
   expect(new URL(destination).search).toBe('')
   expect(wrapper.find('a').exists()).toBe(false)
-  expect(wrapper.text()).toContain('开关仅控制网页服务')
+  expect(wrapper.text()).toContain('关闭不会停止互动')
   wrapper.unmount(); await open()
   expect(wrapper.get('[role="switch"]').element.checked).toBe(true)
   expect(wrapper.get('input[readonly]').element.value).toBe(destination)
@@ -48,7 +48,7 @@ it('启用只提供网页服务和URL，无打开页面入口，重新挂载恢�
   await wrapper.get('[role="switch"]').setValue(false); await flushPromises()
   expect(wrapper.get('[role="switch"]').element.checked).toBe(false)
   expect(wrapper.get('input[readonly]').element.value).toBe(destination)
-  expect(wrapper.text()).toContain('启用后网页可读取')
+  expect(wrapper.text()).toContain('关闭不会停止互动')
   expect(mock.call.mock.calls.some(call => call[1].includes('queue'))).toBe(false)
 })
 

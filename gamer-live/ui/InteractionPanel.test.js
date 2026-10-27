@@ -32,17 +32,27 @@ it('示例默认停用、无真实入口，保存携带资源版本', async () =
   expect(saved.expected_version).toBe('v1'); expect(saved.ruleset.rules[0]).toMatchObject({ enabled: false, entrypoint: '', value: '跳', cost: 1 })
   expect(mock.call.mock.calls.some(c => c[1] === 'queue.test')).toBe(false)
 })
-it('规则消耗只接受正整数，编辑后保留隐藏完成条件和确认配置', async () => {
+it('规则消耗拒绝负数、小数和超出上限，编辑后保留隐藏完成条件和确认配置', async () => {
   mock.rules = [{ ...newRule(), entrypoint: 'default/test.yaml', completion: { checkpoint_id: 'gold' }, confirmation: { timeout_secs: 300, accept: '继续' } }]
   await open(); await button('编辑').trigger('click'); await flushPromises()
   const input = wrapper.get('[aria-label="每次消耗额度"]')
-  for (const value of ['0', '-1', '1.5']) {
+  for (const value of ['-1', '1.5', '1000001', '']) {
     await input.setValue(value); await button('保存规则').trigger('click'); await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('正整数')
+    expect(wrapper.get('[role="alert"]').text()).toContain('0～1000000 的整数')
   }
   expect(mock.call.mock.calls.some(c => c[1] === 'rules.save')).toBe(false)
   await input.setValue('2'); await button('保存规则').trigger('click'); await flushPromises()
   expect(mock.call.mock.calls.find(c => c[1] === 'rules.save')[2].ruleset.rules[0]).toMatchObject({ cost: 2, completion: { checkpoint_id: 'gold' }, confirmation: { timeout_secs: 300, accept: '继续' } })
+})
+it('免费规则读取和保存均保留 0 消耗', async () => {
+  mock.rules = [{ ...newRule(), cost: 0, entrypoint: 'default/test.yaml' }]
+  await open(); await button('编辑').trigger('click'); await flushPromises()
+  const input = wrapper.get('[aria-label="每次消耗额度"]')
+  expect(input.element.value).toBe('0'); expect(input.attributes('min')).toBe('0')
+  expect(wrapper.text()).toContain('0 表示免费')
+  await input.setValue('1'); await input.setValue('0')
+  await button('保存规则').trigger('click'); await flushPromises()
+  expect(mock.call.mock.calls.find(c => c[1] === 'rules.save')[2].ruleset.rules[0].cost).toBe(0)
 })
 it('模拟预览不入队，实际测试由独立操作提交', async () => {
   await open(); await button('仅预览匹配').trigger('click'); await flushPromises()

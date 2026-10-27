@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from '../../../web/src/api'
-const labels = { accepted: '加入队列', quota_rejected: '额度不足', confirmation_required: '等待观众确认', cancelled: '观众取消', timeout: '确认超时', success: '任务成功', failed: '任务失败' }
+const labels = { accepted: '加入队列', quota_rejected: '额度不足', scan_required: '等待扫码', confirmation_required: '等待观众确认', rescan_requested: '重新扫码', cancelled: '观众取消', timeout: '登录超时', success: '任务成功', failed: '任务失败' }
 const saved = ref({ enabled: false, configured: false, has_session: false, has_csrf: false, version: null })
 const draft = reactive({ enabled: false, room_id: '', session_cookie: '', csrf_token: '', templates: Object.fromEntries(Object.keys(labels).map(key => [key, ''])) })
 const loading = ref(true), loaded = ref(false), busy = ref(false), error = ref(''), feedback = ref(''), message = ref('')
@@ -61,15 +61,15 @@ onBeforeUnmount(() => { disposed = true })
 <template>
   <section class="sender-settings" aria-label="主动弹幕">
     <div class="head"><h3>主动弹幕</h3><span class="hint">{{ saved.account_name || (saved.configured ? '发言凭据已保存' : '尚未设置发言账号') }}</span></div>
-    <p class="hint">用单独的 B 站已登录账号发送排队与结果提醒。发言账号和接收弹幕的授权分别设置。</p>
     <p v-if="loading" class="hint" role="status">正在读取设置…</p>
     <form v-if="loaded" @submit.prevent="save" autocomplete="off"><fieldset :disabled="busy">
       <label class="check"><input v-model="draft.enabled" type="checkbox" role="switch" aria-label="启用主动弹幕" />启用自动提醒</label>
-      <label>直播间 ID<input v-model="draft.room_id" aria-label="发言直播间 ID" inputmode="numeric" placeholder="填写目标直播间 ID" /></label>
-      <label>登录凭据 SESSDATA<input v-model="draft.session_cookie" type="password" aria-label="SESSDATA" autocomplete="new-password" :placeholder="saved.has_session ? '已保存，留空沿用；输入可更新' : '填写已登录账号 Cookie 中的 SESSDATA 值'" /></label>
-      <label>登录校验 bili_jct<input v-model="draft.csrf_token" type="password" aria-label="bili_jct" autocomplete="new-password" :placeholder="saved.has_csrf ? '已保存，留空沿用；输入可更新' : '填写 Cookie 中的 bili_jct 值'" /></label>
-      <p class="hint">凭据只保存在服务端本机，保存后不再显示。账号登录失效时更新 Cookie。留空不会清除已有凭据。</p>
-      <details><summary>自动提醒文字</summary><p class="hint">每项最多 200 字符，不换行；留空可关闭对应提醒。可用变量：{viewer}、{number}、{position}、{cost}、{remaining}、{available}。提醒自动带【Gamer】前缀，替换变量后超过 40 字符会截短。模拟测试不自动发送。</p><label v-for="(label, key) in labels" :key="key">{{ label }}<input v-model="draft.templates[key]" :aria-label="`${label}提醒文字`" maxlength="200" /></label></details>
+      <label>直播间 ID<input v-model="draft.room_id" aria-label="发言直播间 ID" inputmode="numeric" /></label>
+      <details :open="!saved.configured"><summary>发言账号{{ saved.configured ? ' · 已保存' : '' }}</summary><div class="credential-fields">
+      <label>SESSDATA<input v-model="draft.session_cookie" type="password" aria-label="SESSDATA" autocomplete="new-password" :placeholder="saved.has_session ? '已保存' : undefined" /></label>
+      <label>bili_jct<input v-model="draft.csrf_token" type="password" aria-label="bili_jct" autocomplete="new-password" :placeholder="saved.has_csrf ? '已保存' : undefined" /></label>
+      </div><p class="hint">单独配置发言账号；凭据留空保留。</p></details>
+      <details><summary>自动提醒文字</summary><p class="hint">留空关闭对应提醒。可用：{viewer}、{number}、{position}、{cost}、{remaining}、{available}。</p><div class="template-fields"><label v-for="(label, key) in labels" :key="key">{{ label }}<input v-model="draft.templates[key]" :aria-label="`${label}提醒文字`" maxlength="200" /></label></div></details>
       <div class="actions"><button type="submit" :disabled="invalidTemplates">保存发言设置</button><button type="button" :disabled="!saved.has_session && !saved.has_csrf" @click="clear">清除发言账号</button></div>
     </fieldset></form>
     <form v-if="loaded" class="manual-send" @submit.prevent="send"><label>手动发送弹幕<input v-model="message" aria-label="手动弹幕内容" maxlength="33" :aria-invalid="messageLength > 33" :disabled="busy || !canSend" placeholder="填写要发送到直播间的文字" /></label><div class="actions"><button type="submit" :disabled="busy || !canSend || !message.trim() || messageLength > 33">提交发送</button><span class="hint">{{ messageLength }} / 33 · 自动带【Gamer】前缀</span></div><p v-if="!canSend" class="hint">保存完整的发言账号并启用后，可手动发送。</p></form>
@@ -80,5 +80,7 @@ onBeforeUnmount(() => { disposed = true })
 </template>
 
 <style scoped>
-.sender-settings{display:grid;gap:12px;min-width:0;padding:12px;border:1px solid var(--border,#3b3d42);border-radius:4px;color:var(--text-0,#eeece6);font-size:13px}.head,.actions{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.actions{justify-content:start}h3,p{margin:0}h3{font-size:14px}.hint{font-size:12px;line-height:1.6;color:var(--text-2,#b6b6ae)}form,fieldset,label{display:grid;gap:6px;min-width:0}form,fieldset{gap:10px}fieldset{margin:0;padding:0;border:0}input,textarea,button{box-sizing:border-box;min-width:0;max-width:100%;border:1px solid var(--control-border,#7d7b75);border-radius:3px;font:inherit;color:inherit;padding:7px 8px}input,textarea{width:100%;background:var(--field,#191b1f);caret-color:var(--accent,#dda951)}textarea{resize:vertical;line-height:1.5}button{background:var(--bg-3,#34363b);justify-self:start;cursor:pointer}button:hover:not(:disabled){background:var(--border,#3b3d42)}button:disabled,input:disabled,fieldset:disabled{opacity:.55;cursor:default}.check{display:flex;gap:8px;align-items:center}.check input{width:28px;height:20px;accent-color:var(--accent,#dda951);margin:0}.manual-send{border-top:1px solid var(--border,#3b3d42);padding-top:12px}details{display:grid;min-width:0}summary{cursor:pointer;font-weight:500}details>*+*{margin-top:10px}.feedback{color:var(--ok,#8fc9ae)}.error{color:var(--danger,#ed9696);overflow-wrap:anywhere}:is(input,textarea,button,summary):focus-visible{outline:2px solid var(--accent,#dda951);outline-offset:2px}::selection{background:var(--accent,#dda951);color:var(--accent-ink,#201d16)}
+.sender-settings{display:grid;gap:8px;min-width:0;padding:10px;border:1px solid var(--border,#3b3d42);border-radius:4px;color:var(--text-0,#eeece6);font-size:13px}.head,.actions{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.actions{justify-content:start}h3,p{margin:0}h3{font-size:14px}.hint{font-size:12px;line-height:1.6;color:var(--text-2,#b6b6ae)}form,fieldset,label{display:grid;gap:6px;min-width:0}form,fieldset{gap:8px}fieldset{margin:0;padding:0;border:0}input,textarea,button{box-sizing:border-box;min-width:0;max-width:100%;border:1px solid var(--control-border,#7d7b75);border-radius:3px;font:inherit;color:inherit;padding:5px 8px}input,textarea{width:100%;background:var(--field,#191b1f);caret-color:var(--accent,#dda951)}textarea{resize:vertical;line-height:1.5}button{background:var(--bg-3,#34363b);justify-self:start;cursor:pointer}button:hover:not(:disabled){background:var(--border,#3b3d42)}button:disabled,input:disabled,fieldset:disabled{opacity:.55;cursor:default}.check{display:flex;gap:8px;align-items:center}.check input{width:28px;height:20px;accent-color:var(--accent,#dda951);margin:0}.manual-send{border-top:1px solid var(--border,#3b3d42);padding-top:12px}details{display:grid;min-width:0}summary{cursor:pointer;font-weight:500}details>*+*{margin-top:8px}.feedback{color:var(--ok,#8fc9ae)}.error{color:var(--danger,#ed9696);overflow-wrap:anywhere}:is(input,textarea,button,summary):focus-visible{outline:2px solid var(--accent,#dda951);outline-offset:2px}::selection{background:var(--accent,#dda951);color:var(--accent-ink,#201d16)}
+.credential-fields,.template-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.manual-send{padding-top:8px}
+@media(max-width:360px){.credential-fields,.template-fields{grid-template-columns:1fr}}
 </style>

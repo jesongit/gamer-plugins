@@ -22,6 +22,8 @@ use uuid::Uuid;
 mod accounts;
 #[path = "queue/confirmation.rs"]
 mod confirmation;
+#[path = "queue/gifts.rs"]
+mod gifts;
 use accounts::{Account, Billing};
 use confirmation::Confirmation;
 pub trait NoticeSink: Send + Sync {
@@ -279,6 +281,8 @@ struct State {
     default_quota: u64,
     #[serde(default)]
     account_settings_version: u64,
+    #[serde(default)]
+    gift_credits: BTreeMap<String, gifts::GiftCredit>,
 }
 fn default_quota() -> u64 {
     1
@@ -303,6 +307,7 @@ impl Default for State {
             users: BTreeMap::new(),
             default_quota: 1,
             account_settings_version: 0,
+            gift_credits: BTreeMap::new(),
         }
     }
 }
@@ -663,10 +668,10 @@ impl Queue {
                 .as_ref()
                 .filter(|c| Some(c.state.as_str()) != old_confirmation)
             {
-                let kind = if confirmation.state == "awaiting_confirmation" {
-                    "confirmation_required"
-                } else {
-                    confirmation.state.as_str()
+                let kind = match confirmation.state.as_str() {
+                    "awaiting_confirmation" => "confirmation_required",
+                    "awaiting_scan" => "scan_required",
+                    _ => confirmation.state.as_str(),
                 };
                 emitted.push(Self::notice_item(&next, item, kind));
             }
@@ -819,10 +824,14 @@ impl Queue {
             });
             (match filter {
                 "trigger" => related,
-                "rejected" => related && r.item_id.is_none(),
-                "errors" => item.is_some_and(|i| {
-                    ["failed", "review"].contains(&i.state.as_str()) || i.cleanup_warning.is_some()
-                }),
+                "rejected" => related && r.item_id.is_none() && r.reason != "gift_credited",
+                "errors" => {
+                    r.reason == "gift_credit_invalid"
+                        || item.is_some_and(|i| {
+                            ["failed", "review"].contains(&i.state.as_str())
+                                || i.cleanup_warning.is_some()
+                        })
+                }
                 "system" => system,
                 _ => true,
             }) && (search.is_empty()
@@ -874,7 +883,7 @@ impl Queue {
             "state":i.state,"position":position,"started_at":i.started_at,"finished_at":i.finished_at,
             "changed_at":changed_at(i),"test":i.event["test"] == true,
             "open_id":user.map(|u|u.open_id.as_str()),"medal_name":i.event["message"]["actor"]["medal_name"],"medal_level":i.event["message"]["actor"]["medal_level"],
-            "phase":i.phase,"confirmation":i.confirmation.as_ref().map(|c|json!({"state":c.state,"deadline_at":c.deadline_at})),
+            "phase":i.phase,"confirmation":i.confirmation.as_ref().filter(|_|i.active() && matches!(i.phase.as_str(),"awaiting_scan"|"awaiting_confirmation"|"rescanning")).map(|c|json!({"state":c.state,"deadline_at":c.deadline_at})),
             "cost":i.billing.as_ref().map(|b|b.cost),"billing_state":i.billing.as_ref().map(|b|b.state.as_str()),
             "quota":user.map(|u|json!({"remaining":u.balance,"reserved":u.reserved,"available":if u.unlimited {Value::Null}else{json!(u.available())},"unlimited":u.unlimited}))})
         };
@@ -1190,7 +1199,7 @@ impl Queue {
             }
             _ => {}
         }
-        if !self.accepting.load(Ordering::SeqCst) {
+        if !self.accepting.load(Ordering::SeqCst) && event.kind != "gift" {
             return;
         }
         if let Err(e) = self.accept(event, true, false, "").await {
@@ -1206,7 +1215,7 @@ impl Queue {
     ) -> Result<Value> {
         let _notices = NoticeGuard(self);
         let mut s = self.state.lock().await;
-        if !test && !self.accepting.load(Ordering::SeqCst) {
+        if !test && !self.accepting.load(Ordering::SeqCst) && e.kind != "gift" {
             return Ok(json!({"result":"直播连接已停止"}));
         }
         if test && enqueue {
@@ -1238,7 +1247,28 @@ impl Queue {
                 n.seen.insert(key.clone(), now());
             }
         }
+        let credit = if enqueue && !test {
+            gifts::credit(&mut n, &e)
+        } else {
+            Ok(gifts::Outcome::Ignored)
+        };
+        let (gift_credit, gift_error) = match credit {
+            Ok(gifts::Outcome::Added(credit)) => (Some(credit), None),
+            Ok(gifts::Outcome::Duplicate) => {
+                return Ok(json!({"result":"重复礼物，未重复增加次数"}))
+            }
+            Ok(gifts::Outcome::Ignored) => (None, None),
+            Err(error) => (None, Some(error)),
+        };
         let result: Result<String> = async {
+            if let Some(error) = gift_error {
+                reason = "gift_credit_invalid";
+                return Err(error);
+            }
+            if !test && !self.accepting.load(Ordering::SeqCst) {
+                reason = "admission_stopped";
+                return Ok("互动执行已停止，未入队".into());
+            }
             if !test && !e.room_id.is_empty() {
                 if n.room_id.as_ref().is_some_and(|room| room != &e.room_id) {
                     reason = "room_changed";
@@ -1347,7 +1377,13 @@ impl Queue {
             Ok("已入队".into())
         }
         .await;
-        let result = result.unwrap_or_else(|e| format!("未入队：{e}"));
+        let mut result = result.unwrap_or_else(|e| format!("未入队：{e}"));
+        if let Some(credit) = &gift_credit {
+            result = format!("赠礼增加 {} 次；{result}", credit.added);
+            if matched.is_none() {
+                reason = "gift_credited";
+            }
+        }
         if enqueue {
             n.receipts.push(Receipt {
                 seq: n.next_seq,
@@ -1357,6 +1393,9 @@ impl Queue {
                 event: {
                     let mut event = summary(&e);
                     event["test"] = json!(test || e.platform_id == "test");
+                    if let Some(credit) = &gift_credit {
+                        event["gift_credit"] = serde_json::to_value(credit)?;
+                    }
                     event
                 },
                 rule: matched,
@@ -1366,7 +1405,9 @@ impl Queue {
             n.next_seq += 1;
             self.commit(&mut s, n)?;
         }
-        Ok(json!({"reason":reason,"result":result,"item_id":item_id,"resolved":resolved}))
+        Ok(
+            json!({"reason":reason,"result":result,"item_id":item_id,"resolved":resolved,"gift_credit":gift_credit}),
+        )
     }
     pub async fn control(&self, op: &str, ids: &[String], request_id: &str) -> Result<Value> {
         let _notices = NoticeGuard(self);
@@ -1751,7 +1792,7 @@ impl Queue {
                     main.state = "cancelled".into();
                     main.error = Some(
                         if item.confirmation.as_ref().unwrap().state == "timeout" {
-                            "本人确认超时"
+                            "登录等待超时，未取得本人确认"
                         } else {
                             "观众取消执行"
                         }
@@ -1762,8 +1803,17 @@ impl Queue {
                         .as_ref()
                         .map(|c| c.cancel_cleanup.clone());
                 } else if !confirmed {
+                    // Preserve the actual login/setup failure. An unconfirmed
+                    // successful run still cannot claim success or debit quota.
+                    let succeeded = main.state == "success";
                     main.state = "failed".into();
-                    main.error = Some("未取得任务发起者本人确认，不能判定成功".into());
+                    if succeeded || main.error.is_none() {
+                        main.error = Some("未取得任务发起者本人确认，不能判定成功".into());
+                    }
+                    n.items[index].cleanup_spec = item
+                        .confirmation_spec
+                        .as_ref()
+                        .map(|c| c.cancel_cleanup.clone());
                 } else if let Some(verified) = checkpoint {
                     if verified {
                         main.state = "success".into();
@@ -1930,6 +1980,10 @@ impl Queue {
                 Err(SubmitError::Busy) => return false,
                 Err(SubmitError::Blocked(error) | SubmitError::Failed(error)) => {
                     n.items[index].finish_cleanup("failed", Some(error));
+                    if item.confirmation_spec.is_some() {
+                        n.paused = true;
+                        n.blocked = Some("登录退出未完成，请核对目标账号状态后恢复队列".into());
+                    }
                     let _ = self.commit(s, n);
                     return true;
                 }
@@ -1951,6 +2005,10 @@ impl Queue {
                     .map(str::to_owned)
                     .or_else(|| cleanup.error.clone());
                 n.items[index].finish_cleanup(state, error);
+                if state != "success" && item.confirmation_spec.is_some() {
+                    n.paused = true;
+                    n.blocked = Some("登录退出未完成，请核对目标账号状态后恢复队列".into());
+                }
                 let _ = self.commit(s, n);
                 state != "success"
                     || item

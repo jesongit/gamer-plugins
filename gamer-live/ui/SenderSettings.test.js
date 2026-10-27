@@ -22,7 +22,8 @@ it('挂载只读取，密文不回填；留空保存沿用且保留全部提醒�
   expect(mock.call.mock.calls.map(c => c[1])).toEqual(['sender.read'])
   expect(wrapper.get('[aria-label="SESSDATA"]').element.value).toBe('')
   expect(wrapper.get('[aria-label="bili_jct"]').element.value).toBe('')
-  expect(wrapper.text()).toContain('发言账号和接收弹幕的授权分别设置')
+  expect(wrapper.text()).toContain('单独配置发言账号；凭据留空保留')
+  expect(wrapper.get('details').attributes('open')).toBeUndefined()
   await wrapper.findAll('form')[0].trigger('submit'); await flushPromises()
   const values = mock.call.mock.calls.find(c => c[1] === 'sender.save')[2]
   expect(values).toMatchObject({ enabled: true, room_id: '12345', expected_version: 'v1', templates: { accepted: '已排队', success: '已完成', timeout: '' } })

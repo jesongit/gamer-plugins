@@ -184,7 +184,7 @@ impl RuleSet {
                     && r.args.len() <= 64
                     && r.cooldown_secs <= 86400
                     && r.timeout_secs <= 86400
-                    && (1..=1_000_000).contains(&r.cost),
+                    && r.cost <= 1_000_000,
                 "规则超出限制"
             );
             for b in r.args.values() {
@@ -351,6 +351,26 @@ mod tests {
     fn rule() -> Value {
         json!({"id":"daily","name":"日常","enabled":true,"kind":"message",
             "value":"日常","entrypoint":"hsr/main.yaml"})
+    }
+
+    #[test]
+    fn cost_accepts_free_rules_and_bounded_integers_only() {
+        assert_eq!(serde_json::from_value::<Rule>(rule()).unwrap().cost, 1);
+        for cost in [0, 1, 1_000_000, 1_000_001] {
+            let mut value = rule();
+            value["cost"] = json!(cost);
+            let rules = RuleSet {
+                schema_version: 1,
+                rules: vec![serde_json::from_value(value).unwrap()],
+                external_origin: None,
+            };
+            assert_eq!(rules.validate("hsr").is_ok(), cost <= 1_000_000);
+        }
+        for cost in [json!(-1), json!(1.5), json!("0"), Value::Null] {
+            let mut value = rule();
+            value["cost"] = cost;
+            assert!(serde_json::from_value::<Rule>(value).is_err());
+        }
     }
 
     #[test]

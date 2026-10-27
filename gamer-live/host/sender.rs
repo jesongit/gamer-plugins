@@ -41,9 +41,11 @@ impl Default for Config {
             templates: [
                 ("accepted", "{viewer}已排队#{number}"),
                 ("quota_rejected", "{viewer}次数不足"),
-                ("confirmation_required", "{viewer}请在5分钟内发确认或取消"),
+                ("confirmation_required", "{viewer}登录后请发确认、取消或扫码"),
+                ("scan_required", "{viewer}请在5分钟内扫码，可发取消或扫码"),
+                ("rescan_requested", "{viewer}正在重新扫码，等待期限不延长"),
                 ("cancelled", "{viewer}已取消，次数退回"),
-                ("timeout", "{viewer}确认超时，次数退回"),
+                ("timeout", "{viewer}登录等待超时，次数退回"),
                 ("success", "{viewer}领奖成功，扣{cost}次"),
                 ("failed", "{viewer}任务失败，次数退回"),
             ]
@@ -200,8 +202,8 @@ impl Sender {
             "启用前请填写直播间、SESSDATA 和 bili_jct"
         );
         ensure!(
-            u.templates.len() <= 7
-                && u.templates.iter().all(|(k, v)| c.templates.contains_key(k)
+            u.templates.len() <= Config::default().templates.len()
+                && u.templates.iter().all(|(k, v)| Config::default().templates.contains_key(k)
                     && v.chars().count() <= 200
                     && !v.chars().any(char::is_control)),
             "提醒模板无效或超过 200 字"
@@ -416,6 +418,8 @@ impl NoticeSink for Sender {
             "queued" => "accepted",
             "rejected" if e["reason"] == "quota_unavailable" => "quota_rejected",
             "confirmation_required" => "confirmation_required",
+            "scan_required" => "scan_required",
+            "rescan_requested" => "rescan_requested",
             "cancelled" => "cancelled",
             "timeout" => "timeout",
             "succeeded" => "success",

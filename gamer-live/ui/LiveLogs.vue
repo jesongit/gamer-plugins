@@ -10,7 +10,9 @@ let disposed = false, timer, generation = 0, searchTimer, latest = 0
 const gap = ref(false)
 const time = ms => ms ? new Date(ms).toLocaleString() : '—'
 function status(row) {
-  if (row.item?.phase === 'cleanup') return `主任务${({ success: '成功', failed: '失败', cancelled: '已取消' })[row.item.main_result?.state] || '已结束'} · 收尾中`
+  const active = ['starting', 'running', 'cancelling'].includes(row.item?.state)
+  if (active && row.item?.phase === 'cleanup') return `主任务${({ success: '成功', failed: '失败', cancelled: '已取消' })[row.item.main_result?.state] || '已结束'} · 收尾中`
+  if (active && ['awaiting_scan', 'awaiting_confirmation', 'rescanning'].includes(row.item?.phase) && row.item?.confirmation) { const stage = ({ awaiting_scan: '等待扫码', awaiting_confirmation: '等待本人确认', rescan_requested: '重新扫码中' })[row.item.confirmation.state]; if (stage) return stage }
   return row.item ? states[row.item.state] || row.item.state : row.result
 }
 async function read(append = false) {

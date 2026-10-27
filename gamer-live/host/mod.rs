@@ -69,9 +69,19 @@ pub const ACTIONS: &[&str] = &[
     "sender.send",
     "confirmation.begin",
     "confirmation.poll",
+    "login.begin",
+    "login.poll",
+    "login.rescan_done",
 ];
 pub fn internal_action(action: &str) -> bool {
-    matches!(action, "confirmation.begin" | "confirmation.poll")
+    matches!(
+        action,
+        "confirmation.begin"
+            | "confirmation.poll"
+            | "login.begin"
+            | "login.poll"
+            | "login.rescan_done"
+    )
 }
 pub fn accepts(id: &str, action: &str) -> bool {
     id == ID && ACTIONS.contains(&action)
@@ -114,7 +124,10 @@ pub fn permissions(id: &str, action: &str) -> Option<&'static [Permission]> {
         | "sender.clear"
         | "sender.send"
         | "confirmation.begin"
-        | "confirmation.poll" => &[Permission::LiveConnect],
+        | "confirmation.poll"
+        | "login.begin"
+        | "login.poll"
+        | "login.rescan_done" => &[Permission::LiveConnect],
         _ => &[],
     })
 }
@@ -182,7 +195,11 @@ impl LiveService {
         let devices = runtime.devices.clone();
         let links = Arc::new(local_links::LocalLinks::open(
             &data_root.join("extension-data/gamer-live/local-links.json"),
-            devices.cfg.port,
+            devices
+                .cfg
+                .local_read
+                .published_port
+                .map_or(devices.cfg.port, |port| port.get()),
         )?);
         let queue = queue::Queue::open(
             data_root.join("extension-data/gamer-live/queue.json"),
@@ -290,7 +307,8 @@ impl LiveService {
                     )
                     .await
             }
-            "confirmation.begin" | "confirmation.poll" => {
+            "confirmation.begin" | "confirmation.poll" | "login.begin" | "login.poll"
+            | "login.rescan_done" => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Request {
@@ -308,7 +326,20 @@ impl LiveService {
                         && request.package_id.len() <= 256,
                     "确认上下文无效"
                 );
-                if action == "confirmation.begin" {
+                if action == "login.begin" {
+                    self.queue()?
+                        .begin_scan(
+                            &request.run_id,
+                            &request.device_id,
+                            &request.package_id,
+                            request.timeout_secs.unwrap_or(300),
+                        )
+                        .await
+                } else if action == "login.rescan_done" {
+                    self.queue()?
+                        .finish_rescan(&request.run_id, &request.device_id, &request.package_id)
+                        .await
+                } else if action == "confirmation.begin" {
                     self.queue()?
                         .begin_confirmation(
                             &request.run_id,
@@ -482,7 +513,7 @@ impl LiveService {
                     .ok()
                     .and_then(|output| output.as_ref().map(|h| h.status.lock().clone()));
                 Ok(
-                    json!({"stream":stream,"automatic":self.automatic.status().await?,"connection":self.status.lock().clone(),"features":{"workflow_cleanup":true,"queue_reconcile_success":true,"user_quotas":true,"viewer_confirmation":true,"danmaku_sender":true},"local_sources":{"stream_url":self.links.stream_url(),"audience_url":self.links.audience_url()},"platforms":[{"id":"bilibili","name":"哔哩哔哩","modes":["open_live","oauth"]}]}),
+                    json!({"stream":stream,"automatic":self.automatic.status().await?,"connection":self.status.lock().clone(),"features":{"workflow_cleanup":true,"queue_reconcile_success":true,"user_quotas":true,"viewer_confirmation":true,"viewer_scan_controls":true,"danmaku_sender":true},"local_sources":{"stream_url":self.links.stream_url(),"audience_url":self.links.audience_url()},"platforms":[{"id":"bilibili","name":"哔哩哔哩","modes":["open_live","oauth"]}]}),
                 )
             }
             "stream.start" => {
@@ -616,8 +647,8 @@ impl BuiltinService for LiveService {
             .map_err(|e| ExtensionError::CallRejected(e.to_string()))
     }
     async fn local_http(&self, path: &str, _headers: HeaderMap) -> Response {
-        // Core admits only real loopback peers with a valid loopback Host and
-        // same-origin request. This layer grants an exact read capability only.
+        // Core checks loopback access (or the explicit Docker read-only bridge),
+        // local Host and same origin. This layer grants an exact read capability.
         let response = match self.links.resolve(path) {
             Some(local_links::LocalTarget::Stream(name)) => {
                 let output = self.output.lock().await;

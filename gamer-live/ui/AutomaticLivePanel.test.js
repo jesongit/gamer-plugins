@@ -22,7 +22,7 @@ it('查看目录只请求文件列表，修改目录后丢弃旧列表', async (
   await button('查看视频列表').trigger('click'); await flushPromises()
   expect(perform).toHaveBeenCalledExactlyOnceWith('automatic.preview', { video_folder: 'D:\\clips' })
   expect(wrapper.findAll('ol li').map(item => item.text())).toEqual(['01.mp4', '02.webm'])
-  expect(wrapper.text()).toContain('Gamer 服务端的电脑')
+  expect(wrapper.text()).toContain('按文件名轮播，不含子目录')
   await wrapper.get('[aria-label="视频文件夹"]').setValue('D:\\other')
   expect(wrapper.find('ol').exists()).toBe(false)
 })

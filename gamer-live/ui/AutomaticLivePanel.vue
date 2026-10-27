@@ -77,12 +77,10 @@ async function stop() {
 <template>
   <div class="automatic-live">
     <p class="automatic-state" role="status">{{ stateLabel }}</p>
-    <p class="hint">空闲时轮播视频；弹幕触发后切到执行目标的实时画面，依次执行互动。队列清空后，视频从原位置继续。</p>
     <form @submit.prevent="start">
       <fieldset :disabled="busy || active">
-        <label>视频文件夹<input v-model="videoFolder" aria-label="视频文件夹" required placeholder="例如 D:\直播视频" @input="editFolder" /></label>
-        <p class="hint">填写运行 Gamer 服务端的电脑上的文件夹路径，按文件名顺序循环播放。不读取子文件夹。</p>
-        <button type="button" :disabled="!videoFolder.trim()" @click="preview">{{ operation === 'preview' ? '正在读取视频…' : '查看视频列表' }}</button>
+        <div class="folder-select"><label>视频文件夹<input v-model="videoFolder" aria-label="视频文件夹" required @input="editFolder" /></label><button type="button" :disabled="!videoFolder.trim()" @click="preview">{{ operation === 'preview' ? '正在读取视频…' : '查看视频列表' }}</button></div>
+        <p class="hint">按文件名轮播，不含子目录。</p>
         <div v-if="listing" class="folder-preview" role="status">
           <p v-if="files.length">找到 {{ files.length }} 个视频，按以下顺序循环：</p>
           <p v-else>此文件夹没有可播放的视频，请选择其他文件夹。</p>
@@ -90,13 +88,13 @@ async function stop() {
           <p v-if="files.length > 50" class="hint">这里只显示前 50 个，播放时使用完整列表。</p>
         </div>
         <label>输出方式<select v-model="output.mode" aria-label="自动直播输出方式"><option value="local">直播姬多媒体素材（推荐）</option><option value="rtmp">手动 RTMP / RTMPS 推流</option></select></label>
-        <label v-if="output.mode === 'rtmp'">完整推流地址<input v-model="output.push_url" type="password" aria-label="自动直播推流地址" autocomplete="off" required placeholder="rtmp://服务器/路径/推流码" /></label>
-        <div class="row"><label>帧率<input v-model.number="output.fps" type="number" aria-label="自动直播帧率" min="10" max="60" required /></label><label>码率 Kbps<input v-model.number="output.bitrate_kbps" type="number" aria-label="自动直播码率" min="500" max="20000" required /></label></div>
+        <label v-if="output.mode === 'rtmp'">完整推流地址<input v-model="output.push_url" type="password" aria-label="自动直播推流地址" autocomplete="off" required /></label>
+        <details><summary>画质设置</summary><div class="row"><label>帧率<input v-model.number="output.fps" type="number" aria-label="自动直播帧率" min="10" max="60" required /></label><label>码率 Kbps<input v-model.number="output.bitrate_kbps" type="number" aria-label="自动直播码率" min="500" max="20000" required /></label></div></details>
         <label class="check"><input v-model="output.audio" type="checkbox" />包含视频和游戏声音</label>
         <p v-if="target?.device_id?.startsWith('browser-')" class="hint">浏览器目标的实时画面为静音；文件夹视频可包含原视频声音。</p>
         <div class="target-summary">
           <p v-if="target">互动执行目标：{{ targetDevice?.name || target.device_id }} · {{ target.package_id }}</p>
-          <p v-else>先在下方保存互动执行目标，再启动自动直播。</p>
+          <p v-else>请在「互动接入」设置执行目标。</p>
           <p v-if="targetDevice?.capabilities?.media_output === false" class="error">当前执行目标不支持音视频输出，请选择其他目标。</p>
           <button type="button" @click="emit('configure-target')">{{ target ? '查看执行目标' : '设置执行目标' }}</button>
         </div>
@@ -117,10 +115,11 @@ async function stop() {
     </div>
     <p v-if="status.error" class="error" role="alert">{{ status.error }}</p>
     <div class="actions"><button type="button" @click="emit('open-rules')">配置弹幕规则</button><button type="button" @click="emit('open-logs')">查看触发日志</button></div>
-    <p class="hint">停止自动直播会停止当前互动、清空等待项并关闭输出；互动账号保持连接。关闭面板不影响后台直播。</p>
+    <p v-if="active" class="hint">停止会取消当前互动、清空等待项并关闭输出。</p>
   </div>
 </template>
 
 <style scoped>
+.folder-select{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:8px}summary{cursor:pointer;font-size:13px}details[open]>summary{margin-bottom:8px}
 .automatic-live,form,fieldset{display:grid;gap:12px;min-width:0}p,dl,dd{margin:0}fieldset{border:0;margin:0;padding:0}label{display:grid;gap:6px;font-size:13px}.hint{font-size:13px;line-height:1.65;color:var(--text-2,#b6b6ae)}.automatic-state{font-size:14px;font-weight:600;color:var(--accent,#dda951)}input,select,button{font:inherit;color:var(--text-0,#eeece6);border:1px solid var(--control-border,#7d7b75);border-radius:3px;background:var(--field,#191b1f);box-sizing:border-box;min-width:0}input,select{width:100%;padding:7px 8px;font-size:13px}button{padding:6px 10px;min-height:32px;cursor:pointer;background:var(--bg-2,#282a2f);justify-self:start;font-size:13px}button:hover:not(:disabled){border-color:var(--accent,#dda951)}button:disabled{opacity:.5;cursor:default}input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--accent,#dda951);outline-offset:2px}input::placeholder{color:var(--text-2,#b6b6ae)}.primary{background:var(--accent,#dda951);border-color:var(--accent,#dda951);color:var(--accent-ink,#201d16);font-weight:600}.primary:hover:not(:disabled){background:var(--accent-2,#edbc6c)}.stop,.error{color:var(--danger,#ed9696)}.error{font-size:13px;line-height:1.6;overflow-wrap:anywhere}.row,.actions{display:flex;gap:8px;flex-wrap:wrap}.row>label{flex:1;min-width:100px}.check{display:flex;align-items:center;gap:6px}.check input{width:auto}.target-summary,.folder-preview,.activity{display:grid;gap:8px;border-top:1px solid var(--border,#3b3d42);padding-top:12px;font-size:13px;line-height:1.6}.target-summary p,dd,li{overflow-wrap:anywhere}.folder-preview ol{margin:0;padding-left:24px;max-height:200px;overflow:auto;scrollbar-color:var(--control-border,#7d7b75) var(--bg-1,#202226)}.folder-preview li{padding:2px 0}dl{display:grid;gap:6px}dl>div{display:grid;grid-template-columns:80px minmax(0,1fr);gap:8px}dt{color:var(--text-2,#b6b6ae)}dd{font-variant-numeric:tabular-nums}.automatic-live ::selection{background:var(--accent,#dda951);color:var(--accent-ink,#201d16)}input{caret-color:var(--accent,#dda951)}@media(pointer:coarse){button,input,select{min-height:44px}}@media(prefers-reduced-motion:reduce){*{transition:none}}
 </style>

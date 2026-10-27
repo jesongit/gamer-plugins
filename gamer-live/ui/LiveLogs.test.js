@@ -60,3 +60,13 @@ it('收尾期间保持当前项并显示主任务结果', async () => {
   wrapper = mount(LiveLogs); await flushPromises()
   expect(wrapper.get('.outcome b').text()).toBe('主任务成功 · 收尾中')
 })
+
+it('结束任务的残留扫码状态不会覆盖失败或取消结果', async () => {
+  const failed = row(6, 'failed'), cancelled = row(7, 'cancelled')
+  for (const entry of [failed, cancelled]) {
+    entry.item.phase = 'finished'; entry.item.confirmation = { state: 'awaiting_scan', deadline_at: Date.now() + 300000 }
+  }
+  call.mockReset().mockResolvedValue({ rows: [failed, cancelled], updates: [], has_more: false })
+  wrapper = mount(LiveLogs); await flushPromises()
+  expect(wrapper.findAll('.outcome b').map(el => el.text())).toEqual(['已取消', '执行失败'])
+})

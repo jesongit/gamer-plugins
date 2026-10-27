@@ -366,7 +366,13 @@ async fn confirmation_internal_actions_reject_public_admin_calls_and_forged_owne
     service.install(&archive(true)).await.unwrap();
     service.enable(&live).await.unwrap();
     service.start(&live).await.unwrap();
-    for action in ["confirmation.begin", "confirmation.poll"] {
+    for action in [
+        "confirmation.begin",
+        "confirmation.poll",
+        "login.begin",
+        "login.poll",
+        "login.rescan_done",
+    ] {
         for values in [
             json!({"run_id":"current-main", "device_id":"browser", "package_id":"hsr", "timeout_secs":300}),
             json!({"run_id":"current-main", "device_id":"browser", "package_id":"hsr", "timeout_secs":300,
@@ -391,7 +397,13 @@ async fn confirmation_internal_actions_reject_public_admin_calls_and_forged_owne
         .iter()
         .all(|entry| !matches!(
             entry["action"].as_str(),
-            Some("confirmation.begin" | "confirmation.poll")
+            Some(
+                "confirmation.begin"
+                    | "confirmation.poll"
+                    | "login.begin"
+                    | "login.poll"
+                    | "login.rescan_done"
+            )
         )));
 }
 
@@ -422,7 +434,13 @@ async fn confirmation_internal_calls_require_yaml_permission_and_current_lifecyc
         service.start(&caller).await.unwrap();
         let context = service.plugin_call_context(&caller).await.unwrap();
         let values = json!({"run_id":"fixture-run", "device_id":"browser", "package_id":"hsr", "timeout_secs":300});
-        for action in ["confirmation.begin", "confirmation.poll"] {
+        for action in [
+            "confirmation.begin",
+            "confirmation.poll",
+            "login.begin",
+            "login.poll",
+            "login.rescan_done",
+        ] {
             assert_eq!(
                 service
                     .call_extension_from_plugin(&context, &live, action, values.clone())
@@ -434,7 +452,7 @@ async fn confirmation_internal_calls_require_yaml_permission_and_current_lifecyc
         }
         assert_eq!(
             jobs.calls.load(Ordering::SeqCst),
-            if allowed { 2 } else { 0 }
+            if allowed { 5 } else { 0 }
         );
         if !allowed {
             continue;
@@ -458,14 +476,20 @@ async fn confirmation_internal_calls_require_yaml_permission_and_current_lifecyc
             .call_extension_from_plugin(&fresh, &live, "confirmation.poll", values.clone())
             .await
             .unwrap();
-        assert_eq!(jobs.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(jobs.calls.load(Ordering::SeqCst), 6);
         service.disable(&live).await.unwrap();
-        for action in ["confirmation.begin", "confirmation.poll"] {
+        for action in [
+            "confirmation.begin",
+            "confirmation.poll",
+            "login.begin",
+            "login.poll",
+            "login.rescan_done",
+        ] {
             assert!(service
                 .call_extension_from_plugin(&fresh, &live, action, values.clone())
                 .await
                 .is_err());
         }
-        assert_eq!(jobs.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(jobs.calls.load(Ordering::SeqCst), 6);
     }
 }
