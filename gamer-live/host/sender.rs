@@ -41,7 +41,10 @@ impl Default for Config {
             templates: [
                 ("accepted", "{viewer}已排队#{number}"),
                 ("quota_rejected", "{viewer}次数不足"),
-                ("confirmation_required", "{viewer}登录后请发确认、取消或扫码"),
+                (
+                    "confirmation_required",
+                    "{viewer}登录后请发确认、取消或扫码",
+                ),
                 ("scan_required", "{viewer}请在5分钟内扫码，可发取消或扫码"),
                 ("rescan_requested", "{viewer}正在重新扫码，等待期限不延长"),
                 ("cancelled", "{viewer}已取消，次数退回"),
@@ -203,9 +206,11 @@ impl Sender {
         );
         ensure!(
             u.templates.len() <= Config::default().templates.len()
-                && u.templates.iter().all(|(k, v)| Config::default().templates.contains_key(k)
-                    && v.chars().count() <= 200
-                    && !v.chars().any(char::is_control)),
+                && u.templates
+                    .iter()
+                    .all(|(k, v)| Config::default().templates.contains_key(k)
+                        && v.chars().count() <= 200
+                        && !v.chars().any(char::is_control)),
             "提醒模板无效或超过 200 字"
         );
         for (k, v) in u.templates {
