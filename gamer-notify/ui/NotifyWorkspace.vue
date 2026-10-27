@@ -62,19 +62,19 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); form.key = '' })
   <div class="notify-workspace">
     <div class="toolbar">
       <button type="button" class="btn btn-sm" :class="{ 'btn-primary': tab === 'channels' }" @click="tab = 'channels'">通知通道</button>
+      <button type="button" class="btn btn-sm" :class="{ 'btn-primary': tab === 'send' }" @click="tab = 'send'">手动发送</button>
       <button type="button" class="btn btn-sm" :class="{ 'btn-primary': tab === 'records' }" @click="tab = 'records'">发送记录</button>
       <button type="button" class="btn btn-sm btn-ghost" :disabled="busy" @click="refresh().catch(e => error = e.message)">刷新</button>
     </div>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p v-if="feedback" class="feedback" role="status">{{ feedback }}</p>
     <template v-if="tab === 'channels'">
-      <p class="hint">全局通道供任务和自动化共用。任务结果通知在任务编辑界面配置。</p>
       <button type="button" class="btn btn-primary btn-sm" @click="edit(null)">新增通道</button>
       <form v-if="editing" class="channel-form" @submit.prevent="save">
-        <label>名称<input v-model="form.name" class="input" required maxlength="100" placeholder="例如：我的微信" /></label>
+        <label>名称<input v-model="form.name" class="input" required maxlength="100" /></label>
         <label>类型<select v-model="form.kind" class="select"><option value="wecomlink">企微连（微信通知）</option></select></label>
-        <label>调用密钥<input v-model="form.key" class="input" type="password" autocomplete="new-password" :placeholder="settings.channels.some(c => c.id === form.id) ? '已配置，留空保留原密钥' : '请输入企微连调用密钥'" /></label>
-        <details><summary>通道 ID</summary><input v-model="form.id" class="input mono" :disabled="settings.channels.some(c => c.id === form.id)" placeholder="留空自动生成；供脚本引用" /></details>
+        <label>调用密钥<input v-model="form.key" class="input" type="password" autocomplete="new-password" :placeholder="settings.channels.some(c => c.id === form.id) ? '已保存，留空保留' : undefined" /></label>
+        <details><summary>通道 ID</summary><input v-model="form.id" class="input mono" :disabled="settings.channels.some(c => c.id === form.id)" placeholder="自动生成" aria-label="通道 ID" /></details>
         <label class="inline"><input v-model="form.enabled" type="checkbox" />启用通道</label>
         <div class="toolbar"><button class="btn btn-primary btn-sm" :disabled="busy">保存</button><button type="button" class="btn btn-sm" @click="editing = false; form.key = ''">取消</button></div>
       </form>
@@ -90,12 +90,13 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); form.key = '' })
         </div>
       </div>
       <p v-if="!settings.channels.length" class="hint">还没有通知通道。</p>
+    </template>
+    <template v-else-if="tab === 'send'">
       <form class="channel-form" @submit.prevent="send()">
-        <strong>手动发送</strong>
         <label>通道<select v-model="message.channel" class="select"><option value="">全局默认通道</option><option v-for="channel in settings.channels" :key="channel.id" :value="channel.id" :disabled="!channel.enabled">{{ channel.name }}</option></select></label>
         <label>标题<input v-model="message.title" class="input" /></label>
-        <label>正文<textarea v-model="message.content" class="input" rows="3" required /></label>
-        <p class="hint">标题、换行和正文合计最多 2048 个 UTF-8 字节；测试按钮使用这里的文案。</p>
+        <label class="full-field">正文<textarea v-model="message.content" class="input" rows="3" required /></label>
+        <p class="hint">最多 2048 字节；通道测试使用此文案。</p>
         <button class="btn btn-primary btn-sm" :disabled="busy">发送</button>
       </form>
     </template>
@@ -113,15 +114,17 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); form.key = '' })
 </template>
 
 <style scoped>
-.notify-workspace { padding: 12px; overflow: auto; height: 100%; font-size: 13px; }
+.notify-workspace { padding: 8px; overflow: auto; height: 100%; font-size: 13px; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
-.hint { font-size: 12px; color: var(--text-secondary, #777); line-height: 1.6; }
-.channel-form { display: grid; gap: 10px; border: 1px solid var(--border, #ddd); padding: 12px; margin: 12px 0; border-radius: 6px; }
+.hint { font-size: 12px; color: var(--text-2, #b6b6ae); line-height: 1.6; }
+.channel-form { display: grid; gap: 8px; border: 1px solid var(--border, #3b3d42); padding: 10px; margin: 8px 0; border-radius: 4px; }
 .channel-form label { display: grid; gap: 5px; }
 .channel-form .inline { display: flex; align-items: center; }
-.channel, .record { padding: 12px 0; border-bottom: 1px solid var(--border, #ddd); }
+.channel, .record { padding: 12px 0; border-bottom: 1px solid var(--border, #3b3d42); }
 .channel code { display: block; font-size: 11px; margin: 5px 0; overflow-wrap: anywhere; }
-.badge { font-size: 11px; margin-left: 8px; color: var(--text-secondary, #777); }
+.badge { font-size: 11px; margin-left: 8px; color: var(--text-2, #b6b6ae); }
 .content { white-space: pre-wrap; overflow-wrap: anywhere; }
 .error { color: var(--danger, #c44); }.feedback { color: var(--success, #298555); }
+.channel-form{grid-template-columns:repeat(2,minmax(0,1fr))}.channel-form>details,.channel-form>.inline,.channel-form>.toolbar,.channel-form>.full-field,.channel-form>.hint,.channel-form>button{grid-column:1/-1}
+@media(max-width:360px){.channel-form{grid-template-columns:1fr}}
 </style>
