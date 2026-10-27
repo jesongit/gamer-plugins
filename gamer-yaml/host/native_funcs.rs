@@ -608,7 +608,7 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
         functions.push(NativeFunction {
             name: "wait_live_confirmation",
             display_name: "等待直播观众确认",
-            description: "登录就绪后等待当前队列任务触发者确认或取消；返回 status 为 confirmed、cancelled 或 timeout，停止时中断",
+            description: "登录就绪后等待当前队列任务触发者确认、取消或重新扫码；返回 status 为 confirmed、cancelled、timeout 或 rescan，停止时中断",
             params: vec![p(
                 "timeout",
                 ParamType::Duration,
@@ -616,6 +616,17 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
                 Some(json!("5m")),
                 "确认等待上限，1ms..5m，向上取整到秒；不能延长队列规则冻结的期限",
             )],
+            returns: "object",
+            permissions: &[Permission::RuntimeSleep],
+        });
+        functions.push(NativeFunction {
+            name: "live_login_state",
+            display_name: "直播登录状态",
+            description: "当前直播队列主运行的扫码阶段：begin 开始限时扫码，poll 读取状态，rescan_done 在退出并重新显示扫码页后完成重扫；不发送设备输入",
+            params: vec![
+                p("action", ParamType::String, false, Some(json!("poll")), "begin / poll / rescan_done"),
+                p("timeout", ParamType::Duration, false, Some(json!("5m")), "首次扫码上限，1ms..5m；重复调用和重扫不延长期限"),
+            ],
             returns: "object",
             permissions: &[Permission::RuntimeSleep],
         });
@@ -777,7 +788,7 @@ pub fn native_schema_json(func: &NativeFunction) -> Value {
         "name": func.name,
         "description": func.description,
         "source": "plugin",
-        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "switch_live_device" | "wait_live_confirmation" => Some("gamer-live"), _ => None },
+        "optional_extension": match func.name { "notify" => Some("gamer-notify"), "switch_live_device" | "wait_live_confirmation" | "live_login_state" => Some("gamer-live"), _ => None },
         "params": func.params.iter().map(|param| {
             let mut schema = json!({
             "name": param.name,
@@ -816,15 +827,16 @@ mod tests {
                 assert_ne!(function.params[0].name, "name", "位置简写不能变");
             }
             for param in function.params.iter().filter(|p| p.name == "timeout") {
-                let expected = if function.name == "wait_live_confirmation" {
-                    "5m"
-                } else {
-                    "10s"
-                };
+                let expected =
+                    if matches!(function.name, "wait_live_confirmation" | "live_login_state") {
+                        "5m"
+                    } else {
+                        "10s"
+                    };
                 assert_eq!(param.default, Some(json!(expected)), "{}", function.name);
                 timeouts += 1;
             }
         }
-        assert_eq!(timeouts, 10);
+        assert_eq!(timeouts, 11);
     }
 }

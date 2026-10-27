@@ -176,7 +176,7 @@ pub(crate) fn authorize_external_native(
     anyhow::ensure!(
         !matches!(
             name,
-            "notify" | "switch_live_device" | "wait_live_confirmation"
+            "notify" | "switch_live_device" | "wait_live_confirmation" | "live_login_state"
         ) && !native.permissions.iter().any(|permission| matches!(
             permission,
             crate::extensions::Permission::NotifySend | crate::extensions::Permission::MediaStream
@@ -297,6 +297,7 @@ mod tests {
                 "notify: {content: forbidden}",
                 "switch_live_device: {}",
                 "wait_live_confirmation: {}",
+                "live_login_state: {action: begin}",
                 "ocr: {}",
             ] {
                 let source = format!("functions:\n  helper:\n    run:\n      - {call}\nrun:\n  - match_templates:\n      times: {times}\n      cases:\n        - template: probe.png\n          do:\n            - helper: {{}}\n");

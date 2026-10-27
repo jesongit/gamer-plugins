@@ -121,6 +121,7 @@ fn yaml_acceptance_export_native_catalog() {
             "find_text",
             "switch_live_device",
             "wait_live_confirmation",
+            "live_login_state",
             // Browser-only execution is covered by tools/live-workflow/local-e2e.mjs.
             "hover",
         ]

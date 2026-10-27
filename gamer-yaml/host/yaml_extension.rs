@@ -497,6 +497,7 @@ impl NativeYamlHost {
             "notify" => self.notify(&bound).await,
             "switch_live_device" => self.switch_live_device(&bound).await,
             "wait_live_confirmation" => self.wait_live_confirmation(&bound).await,
+            "live_login_state" => self.live_login_state(&bound).await,
             "tap" => self.tap(&bound).await,
             "hover" => self.hover(&bound).await,
             "swipe" => self.swipe(&bound).await,
@@ -969,6 +970,54 @@ impl NativeYamlHost {
         }
     }
 
+    async fn live_login_state(&self, args: &BoundArgs) -> Result<Value> {
+        ensure!(!self.runtime.cancelled(), "CANCELLED");
+        let timeout = args.duration_ms("timeout")?;
+        ensure!(
+            (1..=300_000).contains(&timeout),
+            "扫码等待 timeout 必须在 1ms..5m"
+        );
+        let action = match args.string("action")?.as_str() {
+            "begin" => "login.begin",
+            "poll" => "login.poll",
+            "rescan_done" => "login.rescan_done",
+            _ => bail!("直播登录 action 必须为 begin / poll / rescan_done"),
+        };
+        let values = json!({"timeout_secs":timeout.div_ceil(1000)});
+        // The main run can start before the submitter has committed its run id.
+        // Retry only that short hand-off race, never relax caller provenance.
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.live_confirmation_action(action, values.clone()).await {
+                Ok(value) => {
+                    ensure!(
+                        matches!(
+                            value["status"].as_str(),
+                            Some(
+                                "scanning"
+                                    | "rescan"
+                                    | "waiting"
+                                    | "confirmed"
+                                    | "cancelled"
+                                    | "timeout"
+                            )
+                        ),
+                        "LIVE_LOGIN_INVALID_STATE: 登录状态无效"
+                    );
+                    return Ok(json!({"status":value["status"]}));
+                }
+                Err(error)
+                    if action == "login.begin"
+                        && error.to_string().contains("LIVE_CONFIRMATION_UNOWNED_RUN")
+                        && tokio::time::Instant::now() < until =>
+                {
+                    ensure!(!self.runtime.cancelled(), "CANCELLED");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     async fn wait_live_confirmation(&self, args: &BoundArgs) -> Result<Value> {
         ensure!(!self.runtime.cancelled(), "CANCELLED");
         let timeout_ms = args.duration_ms("timeout")?;
@@ -986,7 +1035,7 @@ impl NativeYamlHost {
         loop {
             ensure!(!self.runtime.cancelled(), "CANCELLED");
             match result["status"].as_str() {
-                Some(status @ ("confirmed" | "cancelled" | "timeout")) => {
+                Some(status @ ("confirmed" | "cancelled" | "timeout" | "rescan")) => {
                     return Ok(json!({"status": status}));
                 }
                 Some("waiting" | "awaiting_confirmation") => {}
@@ -2562,6 +2611,70 @@ log = "^1.0"
             .contains("LIVE_UNAVAILABLE"));
     }
 
+    #[tokio::test]
+    async fn live_login_state_is_scoped_validates_arguments_and_preserves_decisions() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let capture = calls.clone();
+        let bridge: super::super::live_bridge::Switcher = Arc::new(move |action, values| {
+            capture.lock().unwrap().push((action, values));
+            Box::pin(async move {
+                Ok(
+                    json!({"status":if action == "login.begin" {"scanning"} else {"cancelled"}, "open_id":"private"}),
+                )
+            })
+        });
+        let native = NativeYamlHost::new(
+            vision_host(trace.clone(), &stub, LogTrace::new(), &["runtime.sleep"]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(bridge.clone()));
+        for args in [
+            json!({"action":"forged"}),
+            json!({"timeout":"301s"}),
+            json!({"timeout":"0ms"}),
+            json!({"run_id":"forged"}),
+        ] {
+            assert!(native
+                .call_function("live_login_state", args)
+                .await
+                .is_err());
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            native
+                .call_function("live_login_state", json!({"action":"begin"}))
+                .await
+                .unwrap(),
+            json!({"status":"scanning"})
+        );
+        assert_eq!(
+            native
+                .call_function("live_login_state", json!({"action":"rescan_done"}))
+                .await
+                .unwrap(),
+            json!({"status":"cancelled"})
+        );
+        let denied = NativeYamlHost::new(
+            vision_host(trace, &stub, LogTrace::new(), &[]),
+            test_context(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_live_switcher(Some(bridge));
+        assert!(denied
+            .call_function("live_login_state", json!({}))
+            .await
+            .is_err());
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
     #[tokio::test]
     async fn live_confirmation_cancels_inflight_rpc_and_between_polls() {
         struct Dropped(Arc<std::sync::atomic::AtomicUsize>);
@@ -4238,6 +4351,38 @@ runtime = "^1.0"
         }));
         let result = LazyYamlWasmtimeRuntime::new().run(request).await.unwrap();
         assert_eq!(result.value, json!({"status":"cancelled"}));
+        assert!(trace.apps.lock().unwrap().is_empty());
+        assert!(trace.taps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_yaml_component_live_login_reads_state_without_device_input() {
+        let trace = Arc::new(tests::Trace::default());
+        let host = tests::vision_host(
+            trace.clone(),
+            &tests::VisionStub::new(FrameSize::new(1920, 1080)),
+            tests::LogTrace::new(),
+            &["runtime.sleep"],
+        );
+        let script = parse_script(
+            "run:\n  - live_login_state: {action: begin}\n    as: login\n  - return: $login\n",
+        )
+        .unwrap();
+        let mut request = run_request(
+            build_program(&script, &vec![], Default::default(), 0),
+            host,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        request.live_switcher = Some(Arc::new(|action, values| {
+            Box::pin(async move {
+                assert_eq!(action, "login.begin");
+                assert_eq!(values, json!({"timeout_secs":300}));
+                Ok(json!({"status":"scanning","open_id":"private"}))
+            })
+        }));
+        let result = LazyYamlWasmtimeRuntime::new().run(request).await.unwrap();
+        assert_eq!(result.value, json!({"status":"scanning"}));
         assert!(trace.apps.lock().unwrap().is_empty());
         assert!(trace.taps.lock().unwrap().is_empty());
     }

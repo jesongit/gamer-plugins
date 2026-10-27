@@ -30,7 +30,7 @@ impl ConfirmationOwner {
             "device_id": self.device_id,
             "package_id": self.package_id,
         });
-        if action == "confirmation.begin" {
+        if matches!(action, "confirmation.begin" | "login.begin") {
             let timeout = args["timeout_secs"]
                 .as_u64()
                 .filter(|timeout| (1..=300).contains(timeout))
@@ -57,7 +57,8 @@ pub fn switcher(
         Box::pin(async move {
             let confirmation = match action {
                 "stream.switch" => false,
-                "confirmation.begin" | "confirmation.poll" => true,
+                "confirmation.begin" | "confirmation.poll" | "login.begin" | "login.poll"
+                | "login.rescan_done" => true,
                 _ => anyhow::bail!("LIVE_ACTION_UNAVAILABLE"),
             };
             let values = if confirmation {
@@ -123,5 +124,26 @@ mod tests {
         let mut missing_package = context;
         missing_package.content_package = None;
         assert!(ConfirmationOwner::capture(Some("run".into()), &missing_package).is_none());
+    }
+
+    #[test]
+    fn login_bridge_uses_frozen_owner_for_every_scan_action() {
+        let owner = ConfirmationOwner::capture(
+            Some("run".into()),
+            &AppContext::for_test("device", "package").unwrap(),
+        )
+        .unwrap();
+        let forged = json!({"run_id":"other", "device_id":"other", "package_id":"other", "open_id":"other", "timeout_secs":300});
+        for action in ["login.begin", "login.poll", "login.rescan_done"] {
+            let request = owner.request(action, &forged).unwrap();
+            assert_eq!(request["run_id"], "run");
+            assert_eq!(request["device_id"], "device");
+            assert_eq!(request["package_id"], "package");
+            assert!(request.get("open_id").is_none());
+            assert_eq!(
+                request.get("timeout_secs"),
+                (action == "login.begin").then_some(&json!(300))
+            );
+        }
     }
 }
