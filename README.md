@@ -8,14 +8,14 @@
 
 | 插件 | 功能 | 当前源码版本 | 使用说明 |
 | --- | --- | --- | --- |
-| `gamer-yaml` 自动化 | YAML 脚本、函数、模板、工作稿版本、检查与执行 | `0.3.26` | [自动化](gamer-yaml/README.md) |
-| `gamer-keymap` 按键映射 | 将键盘、鼠标与手柄动作映射为目标输入 | `0.1.8` | [按键映射](gamer-keymap/README.md) |
-| `gamer-video` 视频工作台 | 录制、逐帧分析、目标标记与独立素材包 | `0.2.8` | [视频工作台](gamer-video/README.md) |
-| `gamer-notify` 通知助手 | 通知渠道、任务结果通知与发送记录 | `0.1.2` | [通知助手](gamer-notify/README.md) |
-| `gamer-live` 直播助手 | 设备与媒体输出、推流和互动队列 | `0.2.19` | [直播助手](gamer-live/README.md) |
-| `gamer-package-publisher` 配置包发布 | 通过服务电脑上的 GitHub CLI 发布配置包 | `0.1.0` | [配置包发布](gamer-package-publisher/README.md) |
+| `gamer-yaml` 自动化 | YAML 脚本、函数、模板、工作稿版本、检查与执行 | `0.3.27` | [自动化](gamer-yaml/README.md) |
+| `gamer-keymap` 按键映射 | 将键盘、鼠标与手柄动作映射为目标输入 | `0.1.9` | [按键映射](gamer-keymap/README.md) |
+| `gamer-video` 视频工作台 | 录制、逐帧分析、目标标记与独立素材包 | `0.2.9` | [视频工作台](gamer-video/README.md) |
+| `gamer-notify` 通知助手 | 通知渠道、任务结果通知与发送记录 | `0.1.3` | [通知助手](gamer-notify/README.md) |
+| `gamer-live` 直播助手 | 设备与媒体输出、推流和互动队列 | `0.2.20` | [直播助手](gamer-live/README.md) |
+| `gamer-package-publisher` 配置包发布 | 通过服务电脑上的 GitHub CLI 发布配置包 | `0.1.1` | [配置包发布](gamer-package-publisher/README.md) |
 
-源码版本与已公开目录分别管理，实际可安装版本以 Release 和界面目录为准。视频工作台 `0.2.8` 和键盘映射 `0.1.8` 要求 Gamer `0.5.8` 或更新版本；自动化 `0.3.26` 和直播助手 `0.2.19` 要求 Gamer `0.5.2` 或更新版本；其他插件以各自 manifest 的宿主版本要求为准。
+源码版本与已公开目录分别管理，实际可安装版本以 Release 和界面目录为准。视频工作台 `0.2.9` 和键盘映射 `0.1.9` 要求 Gamer `0.5.8` 或更新版本；自动化 `0.3.27` 和直播助手 `0.2.20` 要求 Gamer `0.5.2` 或更新版本；其他插件以各自 manifest 的宿主版本要求为准。
 
 OCR 已内置 Gamer Core，在「设置 → 运行依赖」管理识别引擎与语言模型，无需安装独立插件。[OCR 指南](https://github.com/jesongit/gamer/blob/main/docs/guides/ocr.md)说明使用方式。历史 `gamer-ocr`、`gamer-ai` 安装与私密数据保留，但不参与当前构建和分发；模型、对话与规划由用户选择的外部 Agent 承担。
 

@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-package-publisher"
-version = "0.1.0"
+version = "0.1.1"
 name = "配置包发布"
 description = "使用本机 GitHub CLI 将配置包发布到自己的公开仓库"
 permissions = ["ui.host", "package.publish"]

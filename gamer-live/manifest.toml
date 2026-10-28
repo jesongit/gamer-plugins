@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-live"
-version = "0.2.19"
+version = "0.2.20"
 name = "直播助手"
 description = "设备直播与文件夹视频自动直播，弹幕排队执行脚本并自动切换画面；支持直播姬与手动 RTMP 输出"
 permissions = ["ui.host", "media.stream", "media.read", "live.connect", "resource.read", "resource.write", "run.submit", "run.control"]

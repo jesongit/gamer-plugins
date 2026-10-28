@@ -9,16 +9,16 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "js-yaml": "^5.3.0",
     "fflate": "^0.8.3",
-    "pinyin-pro": "^3.29.3"
+    "js-yaml": "^5.5.0",
+    "pinyin-pro": "^3.29.5",
+    "vue": "^3.5.44"
   },
   "devDependencies": {
-    "vite": "^5.0.0",
-    "@vitejs/plugin-vue": "^5.0.0",
-    "vitest": "^3.2.7",
-    "@vue/test-utils": "^2.5.0",
-    "happy-dom": "^20.11.12"
+    "@vitejs/plugin-vue": "^6.0.10",
+    "@vue/test-utils": "^2.5.1",
+    "happy-dom": "^21.0.4",
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   }
 }

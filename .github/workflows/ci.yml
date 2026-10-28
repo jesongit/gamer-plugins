@@ -27,6 +27,13 @@ jobs:
             gamer-yaml/interpreter
       - run: node tools/verify-sdk.mjs
       - run: node --test tools/release.test.mjs
+      - name: Audit every active plugin UI lockfile
+        shell: pwsh
+        run: |
+          foreach ($id in @('gamer-yaml','gamer-keymap','gamer-video','gamer-package-publisher','gamer-live','gamer-notify')) {
+            pnpm --dir "$id/ui" audit --registry=https://registry.npmjs.org --audit-level=low
+            if ($LASTEXITCODE -ne 0) { throw "UI dependency security audit failed: $id" }
+          }
       - run: cargo test --locked --manifest-path gamer-yaml/interpreter/Cargo.toml
       - name: Build all official packages without a Gamer checkout
         shell: pwsh
