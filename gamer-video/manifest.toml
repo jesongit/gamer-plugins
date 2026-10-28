@@ -18,7 +18,7 @@ packages = ["*"]
 [execution]
 kind = "builtin"
 builtin_id = "gamer-video"
-host_version = ">=0.3.0"
+host_version = ">=0.5.8"
 
 [[ui.contributions]]
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端

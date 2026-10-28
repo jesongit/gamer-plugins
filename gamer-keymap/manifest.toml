@@ -20,7 +20,7 @@ resource = "^1.0"
 # 独立 WASM guest：真实 plugin.wasm，常驻实例模型（start 持有实例）。
 [execution]
 kind = "wasm"
-host_version = ">=0.3.0"
+host_version = ">=0.5.8"
 
 [[ui.contributions]]
 # runtime = "core"：面板由宿主 Vue 组件渲染，component 键由前端
