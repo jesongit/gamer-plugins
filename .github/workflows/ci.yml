@@ -83,10 +83,19 @@ jobs:
         with:
           name: official-plugins
           path: host/server/target/plugin-test-fixtures
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Verify host and guest dependency security
+        shell: pwsh
+        run: ./host/tools/verify-release.ps1
       - run: cargo test --locked --manifest-path host/server/Cargo.toml
         env:
           GAMER_PROFILE: dev
           GAMER_PLUGIN_TEST_FIXTURE_ROOT: ${{ github.workspace }}/host/server/target/plugin-test-fixtures
+      - name: Patched DTLS protocol and curve regressions
+        run: cargo test --locked --manifest-path host/server/Cargo.toml -p dtls --lib
       - name: Verify live media output with FFmpeg on loopback
         run: cargo test --locked --manifest-path host/server/Cargo.toml media::output::tests -- --include-ignored
         env:

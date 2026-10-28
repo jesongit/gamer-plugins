@@ -2,7 +2,7 @@
   "schema_version": 1,
   "host_api": "1.0.0",
   "repository": "https://github.com/jesongit/gamer.git",
-  "commit": "12722b34eb843492509c55d5243af8c71e3a5b8a",
+  "commit": "ab5d116945c0711158d12abfddab774121910321",
   "files": [
     {
       "source": "sdk/ui/module-build.mjs",
@@ -27,17 +27,17 @@
     {
       "source": "tools/plugin-packer/Cargo.lock",
       "path": "plugin-packer/Cargo.lock",
-      "sha256": "2091e27ed28e978951fca16e1497938cbcc8f5848e2be6b1f2fc8b6b0e1ce268"
+      "sha256": "524c3373761182bdaa70b89a3b5174253c3f64b8134c3b4eae95999dc21fee29"
     },
     {
       "source": "tools/plugin-packer/Cargo.toml",
       "path": "plugin-packer/Cargo.toml",
-      "sha256": "d410b694919afce00691f0fc44550609878b6882bf0a03da34fe6aa00fc2b604"
+      "sha256": "61467f3577710bab5cbfece4a893ec90b552e7aa6ad1c92fbfda7020d787e599"
     },
     {
       "source": "tools/plugin-packer/src/main.rs",
       "path": "plugin-packer/src/main.rs",
-      "sha256": "21cad86c1e06ab05600d2875b760c92cfa9e1ecf0a8e902008cc08b21124ba09"
+      "sha256": "95e35024ec081a4345fb3983e0c5ba55597c403cb3bbce378cca017ea0d7be8b"
     }
   ]
 }

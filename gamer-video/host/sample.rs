@@ -816,7 +816,7 @@ pub fn validate_archive(
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut file = zip.by_index(i)?;
-        let path = file.name().to_owned();
+        let path = file.name()?.into_owned();
         anyhow::ensure!(
             safe_path(&path) && !file.is_dir(),
             "unsafe archive path: {path}"

@@ -17,4 +17,4 @@ wit-bindgen = "0.57.1"
 wit-component = "0.254.0"
 # profile 消费：keymap YAML（schema 同 mappings/*.yaml）在 guest 内解析
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "0.9.42" }
