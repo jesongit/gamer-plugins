@@ -3,6 +3,21 @@
 pub(crate) fn append_schemas<W: std::io::Write + std::io::Seek>(writer: &mut zip::ZipWriter<W>) {
     use std::io::Write;
     let options = zip::write::SimpleFileOptions::default();
+    for (name, bytes) in [
+        (
+            "external_draft_publish_preview.json",
+            include_bytes!("../schemas/external_draft_publish_preview.json").as_slice(),
+        ),
+        (
+            "external_draft_publish.json",
+            include_bytes!("../schemas/external_draft_publish.json").as_slice(),
+        ),
+    ] {
+        writer
+            .start_file(format!("schemas/{name}"), options)
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+    }
     writer
         .start_file("schemas/external_grammar.json", options)
         .unwrap();

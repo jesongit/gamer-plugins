@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "package_id": {"type":"string","minLength":1,"maxLength":128},
+    "script_id": {"type":"string","minLength":1,"maxLength":200},
+    "version": {"type":"string","minLength":1,"maxLength":40},
+    "expected_version": {"type":"string","minLength":1,"maxLength":40},
+    "expected_source_sha256": {"type":"string","pattern":"^[a-f0-9]{64}$"},
+    "expected_resource_sha256": {"type":["string","null"],"pattern":"^[a-f0-9]{64}$"}
+  },
+  "required": ["package_id","script_id","version","expected_version","expected_source_sha256","expected_resource_sha256"]
+}

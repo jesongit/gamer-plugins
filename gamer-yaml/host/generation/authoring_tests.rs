@@ -165,6 +165,70 @@ async fn script_revisions_publish_exact_selected_content_and_keep_minor_edits_pr
 }
 
 #[tokio::test]
+async fn pinned_publication_rejects_drift_and_revocation_before_any_formal_write() {
+    let (_root, service, _) = fixture();
+    service
+        .call(
+            "authoring.create",
+            json!({"package_id":"default","script_id":"pinned.yaml"}),
+        )
+        .await
+        .unwrap();
+    let source = "# immutable source\nrun: [{log: pinned}]\n";
+    service.call("authoring.save",json!({"package_id":"default","script_id":"pinned.yaml","expected_version":"","yaml":source})).await.unwrap();
+    let correct = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let mut args = json!({"package_id":"default","script_id":"pinned.yaml","version":"0.1","expected_version":"0.1","expected_source_sha256":correct,"expected_resource_sha256":null});
+    args["expected_source_sha256"] = json!("0".repeat(64));
+    assert!(service
+        .call("authoring.publish", args.clone())
+        .await
+        .is_err());
+    args["expected_source_sha256"] = json!(correct);
+    args["expected_resource_sha256"] = json!("0".repeat(64));
+    assert!(service
+        .call("authoring.publish", args.clone())
+        .await
+        .is_err());
+    args["expected_resource_sha256"] = Value::Null;
+    let admission: Admission = Arc::new(|| anyhow::bail!("credential_invalid: synthetic revoke"));
+    assert!(service
+        .call_admitted("authoring.publish", args.clone(), admission)
+        .await
+        .is_err());
+    assert!(service
+        .inner
+        .packages
+        .read_text(
+            "default",
+            super::super::YAML_EXTENSION_ID,
+            "automations/pinned.yaml"
+        )
+        .unwrap()
+        .is_none());
+    let published = service
+        .call("authoring.publish", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(published["script"]["head_version"], "1.0");
+    assert_eq!(published["script"]["versions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        service
+            .inner
+            .packages
+            .read_text(
+                "default",
+                super::super::YAML_EXTENSION_ID,
+                "automations/pinned.yaml"
+            )
+            .unwrap()
+            .unwrap()
+            .content,
+        source
+    );
+    assert!(service.call("authoring.publish", args).await.is_err());
+}
+
+#[tokio::test]
 async fn invalid_source_is_an_editable_revision_but_cannot_publish_or_start_a_device() {
     let (_root, service, _input) = fixture();
     service

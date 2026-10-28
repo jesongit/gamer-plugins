@@ -2,7 +2,7 @@
   "schema_version": 1,
   "host_api": "1.0.0",
   "repository": "https://github.com/jesongit/gamer.git",
-  "commit": "143309f17359e261ccace0827484c10f79ae6bb2",
+  "commit": "7fed8dcc3f203f90d29320490f58f4a48999e3dc",
   "files": [
     {
       "source": "sdk/ui/module-build.mjs",

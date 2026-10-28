@@ -1,3 +1,39 @@
 {
-  "plugins": []
+  "plugins": [
+    {
+      "id": "gamer-keymap",
+      "version": "0.1.9",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-video-v0.2.9/gamer-keymap-0.1.9.gplugin",
+      "sha256": "cb68af6c48d91b5ac61e2eeb3a2c00f0dada84e2a98296365319b36cd05a5444",
+      "size": 134666
+    },
+    {
+      "id": "gamer-live",
+      "version": "0.2.20",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-video-v0.2.9/gamer-live-0.2.20.gplugin",
+      "sha256": "dbc187b5328c1877114f81f25d9b2257f020afbce232519c10f0432c0a4fe544",
+      "size": 36251
+    },
+    {
+      "id": "gamer-notify",
+      "version": "0.1.3",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-video-v0.2.9/gamer-notify-0.1.3.gplugin",
+      "sha256": "6bcdc9ebd7b55786981d1c51339f9178629897dca054999c221f16f2fec5d994",
+      "size": 6063
+    },
+    {
+      "id": "gamer-package-publisher",
+      "version": "0.1.1",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-video-v0.2.9/gamer-package-publisher-0.1.1.gplugin",
+      "sha256": "22cf8650b3c39368e707b2e167de8286d510029c1decf55caa1cc082d180ed04",
+      "size": 5170
+    },
+    {
+      "id": "gamer-video",
+      "version": "0.2.9",
+      "download_url": "https://github.com/jesongit/gamer-plugins/releases/download/gamer-video-v0.2.9/gamer-video-0.2.9.gplugin",
+      "sha256": "3bc3a231db73a48e552ed594a65e293548d7a011a1ac2a473477d748d8446bcc",
+      "size": 34152
+    }
+  ]
 }

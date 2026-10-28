@@ -465,6 +465,9 @@ fn map_start_error(error: StartError) -> TimerRunnerError {
     match error {
         StartError::Conflict(record) => TimerRunnerError::Conflict(record),
         StartError::ShuttingDown => TimerRunnerError::ShuttingDown,
+        StartError::Maintenance => {
+            TimerRunnerError::Other("plugin update in progress; retry after maintenance".into())
+        }
     }
 }
 

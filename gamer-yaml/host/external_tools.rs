@@ -157,6 +157,7 @@ impl ExternalToolHandler for YamlTools {
         if matches!(
             action,
             "external.draft_create"
+                | "external.draft_publish"
                 | "external.draft_import"
                 | "external.draft_save"
                 | "external.draft_crop"
@@ -174,6 +175,7 @@ impl ExternalToolHandler for YamlTools {
             | "external.draft_list"
             | "external.draft_get"
             | "external.draft_diff"
+            | "external.draft_publish_preview"
             | "external.template_read" => "plugin.gamer-yaml.read",
             "external.draft_create"
             | "external.draft_import"
@@ -182,6 +184,7 @@ impl ExternalToolHandler for YamlTools {
             | "external.legacy_import" => "plugin.gamer-yaml.draft.write",
             "external.draft_validate" | "external.draft_match" => "plugin.gamer-yaml.validate",
             "external.draft_run" => "plugin.gamer-yaml.draft.run",
+            "external.draft_publish" => "plugin.gamer-yaml.publish",
             "external.legacy_list"
             | "external.legacy_get"
             | "external.legacy_export"
@@ -193,6 +196,22 @@ impl ExternalToolHandler for YamlTools {
             }
         };
         ctx.require_scope(scope)?;
+        if action == "external.draft_publish" {
+            if args["version"] != args["expected_version"]
+                || args["expected_source_sha256"].as_str().is_none()
+                || args.get("expected_resource_sha256").is_none()
+            {
+                return Err(McpError::invalid(
+                    "Publish the exact previewed draft head with both SHA256 pins",
+                ));
+            }
+            let selected = self.selected(args).await?;
+            if selected["published"] == true {
+                return Err(McpError::invalid(
+                    "This version is already published; publication does not roll back history",
+                ));
+            }
+        }
         if !matches!(
             action,
             "external.legacy_list"
@@ -227,6 +246,7 @@ impl ExternalToolHandler for YamlTools {
         if matches!(
             action,
             "external.draft_validate"
+                | "external.draft_publish"
                 | "external.draft_run"
                 | "external.draft_crop"
                 | "external.draft_match"
@@ -257,6 +277,31 @@ impl ExternalToolHandler for YamlTools {
         let admission: super::authoring::Admission =
             Arc::new(move || admitted.check_active().map_err(anyhow::Error::new));
         let result = match action {
+            "external.draft_publish_preview" => {
+                let selected = self.selected(&args).await?;
+                let current = self
+                    .service
+                    .packages()
+                    .read_text(
+                        required(&args, "package_id").map_err(error)?,
+                        "gamer-yaml",
+                        &format!(
+                            "automations/{}",
+                            required(&args, "script_id").map_err(error)?
+                        ),
+                    )
+                    .map_err(error)?;
+                let doc = self
+                    .authoring()
+                    .call("authoring.get", args.clone())
+                    .await
+                    .map_err(error)?;
+                json!({"version":selected["version"],"head_version":doc["script"]["head_version"],
+                    "source_sha256":format!("{:x}",sha2::Sha256::digest(selected["yaml"].as_str().unwrap_or_default().as_bytes())),
+                    "resource_sha256":current.map(|r|format!("{:x}",sha2::Sha256::digest(r.content.as_bytes()))),
+                    "diagnostics":selected["diagnostics"],"validation_scope":"syntax_and_references",
+                    "is_head":selected["version"]==doc["script"]["head_version"],"already_published":selected["published"],"real_execution":false})
+            }
             "external.syntax" => {
                 let text = include_str!("../../../docs/reference/YAML.md");
                 let offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -396,6 +441,7 @@ impl ExternalToolHandler for YamlTools {
                     "external.draft_create" => "authoring.create",
                     "external.draft_import" => "authoring.import",
                     "external.draft_save" => "authoring.save",
+                    "external.draft_publish" => "authoring.publish",
                     "external.draft_validate" => "authoring.validate",
                     "external.draft_run" => "authoring.run",
                     "external.draft_crop" => "authoring.crop_template",
@@ -587,6 +633,91 @@ mod tests {
         assert_eq!(runs.get_run(&second).unwrap().state, RunState::Cancelled);
     }
     #[tokio::test]
+    async fn explicit_publish_previews_pins_and_keeps_published_versions_immutable() {
+        let root = tempfile::tempdir().unwrap();
+        let (old, credentials) = context(&root.path().join("mcp"), "sample-a");
+        let packages = Arc::new(
+            crate::resources::PackageStore::open(&crate::config::Config {
+                data_dir: root.path().into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        packages.ensure_default_package().unwrap();
+        let service = Arc::new(GenerationService::new(
+            packages.clone(),
+            Arc::new(RunManager::new(Arc::new(SyntheticExecutor))),
+        ));
+        let authoring = service.authoring();
+        authoring
+            .call(
+                "authoring.create",
+                json!({"package_id":"default","script_id":"agent.yaml"}),
+            )
+            .await
+            .unwrap();
+        authoring.call("authoring.save",json!({"package_id":"default","script_id":"agent.yaml","expected_version":"","yaml":"run: [{log: published}]\n"})).await.unwrap();
+        let tools = YamlTools::new(service);
+        let created = credentials
+            .create(CreateTokenRequest {
+                label: "publisher".into(),
+                scopes: [
+                    "plugin.gamer-yaml.read".into(),
+                    "plugin.gamer-yaml.publish".into(),
+                ]
+                .into(),
+                allowed: old.principal.allowed.clone(),
+                expires_in_seconds: 60,
+            })
+            .unwrap();
+        let ctx = InvocationContext::new(
+            credentials.authenticate(&created.token).unwrap(),
+            "publish-test".into(),
+            Some("publish-once".into()),
+            credentials,
+            Arc::new(ReceiptStore::open(&root.path().join("publish-receipts")).unwrap()),
+        );
+        let selected = json!({"package_id":"default","script_id":"agent.yaml","version":"0.1"});
+        let preview = tools
+            .call(
+                ctx.clone(),
+                "external.draft_publish_preview",
+                selected.clone(),
+            )
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(preview["is_head"], true);
+        assert_eq!(preview["already_published"], false);
+        assert!(preview["resource_sha256"].is_null());
+        let mut args = selected;
+        args["expected_version"] = json!("0.1");
+        args["expected_source_sha256"] = preview["source_sha256"].clone();
+        args["expected_resource_sha256"] = Value::Null;
+        assert!(tools
+            .authorize(&old, "external.draft_publish", &args)
+            .await
+            .is_err());
+        let published = tools
+            .call(ctx.clone(), "external.draft_publish", args)
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(published["script"]["head_version"], "1.0");
+        assert!(packages
+            .read_text("default", "gamer-yaml", "automations/agent.yaml")
+            .unwrap()
+            .is_some());
+        let invalid = json!({"package_id":"default","script_id":"agent.yaml","version":"1.0","expected_version":"1.0","expected_source_sha256":preview["source_sha256"],"expected_resource_sha256":preview["source_sha256"]});
+        assert!(tools
+            .call(ctx, "external.draft_publish", invalid)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn yaml_tools_reject_admin_actions_cross_package_and_ungranted_standalone_material() {
         let root = tempfile::tempdir().unwrap();
         let (ctx, _) = context(&root.path().join("mcp"), "sample-a");
@@ -606,6 +737,7 @@ mod tests {
             .authorize(&ctx, "authoring.publish", &json!({"package_id":"default"}))
             .await
             .is_err());
+        assert!(tools.authorize(&ctx,"external.draft_publish",&json!({"package_id":"default","script_id":"agent.yaml","version":"0.1","expected_version":"0.1","expected_source_sha256":"0".repeat(64),"expected_resource_sha256":null})).await.is_err(), "Draft-write credentials must not gain publication");
         assert!(tools
             .authorize(&ctx, "external.draft_get", &json!({"package_id":"other"}))
             .await

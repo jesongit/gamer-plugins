@@ -1000,89 +1000,113 @@ impl AuthoringState {
                 "publish_invalid: {diagnostics}"
             );
             let _gate = self.gate.lock();
-            let latest = self.authoring_read(package, &script)?;
-            ensure!(latest.head() == expected, "script_version_conflict");
-            ensure!(
-                !latest.job.as_ref().is_some_and(|job| self
-                    .jobs
-                    .lock()
-                    .contains_key(job["id"].as_str().unwrap_or(""))),
-                "script_busy"
-            );
-            let current = self
-                .packages
-                .read_text(
-                    package,
-                    super::YAML_EXTENSION_ID,
-                    &format!("automations/{script}"),
-                )?
-                .map(|v| format!("{:x}", Sha256::digest(v.content.as_bytes())));
-            ensure!(
-                current == doc.published_resource_hash,
-                "published_script_changed: 脚本库内容已被其他编辑修改"
-            );
-            let version = revision(
-                doc.published_version
-                    .as_deref()
-                    .map(number)
-                    .map(|v| v.0 + 1)
-                    .unwrap_or(1),
-                0,
-            );
-            let mut changes = BTreeMap::from([(
-                format!("automations/{script}"),
-                source.yaml.as_bytes().to_vec(),
-            )]);
-            for (name, bytes) in &source.generated_templates {
-                let path = format!("templates/{name}");
-                if let Some(current) =
-                    self.packages
-                        .read_binary(package, super::YAML_EXTENSION_ID, &path)?
-                {
+            return self.packages.with_package_write(package, || {
+                let latest = self.authoring_read(package, &script)?;
+                ensure!(latest.head() == expected, "script_version_conflict");
+                ensure!(
+                    !latest.job.as_ref().is_some_and(|job| self
+                        .jobs
+                        .lock()
+                        .contains_key(job["id"].as_str().unwrap_or(""))),
+                    "script_busy"
+                );
+                let current = self
+                    .packages
+                    .read_text(
+                        package,
+                        super::YAML_EXTENSION_ID,
+                        &format!("automations/{script}"),
+                    )?
+                    .map(|v| format!("{:x}", Sha256::digest(v.content.as_bytes())));
+                ensure!(
+                    current == doc.published_resource_hash,
+                    "published_script_changed: 脚本库内容已被其他编辑修改"
+                );
+                if let Some(expected) = args.get("expected_source_sha256") {
                     ensure!(
-                        current == *bytes,
-                        "template_conflict: 素材 {name} 已存在且内容不同，请使用新名称"
+                        expected.as_str()
+                            == Some(
+                                format!("{:x}", Sha256::digest(source.yaml.as_bytes())).as_str()
+                            ),
+                        "publish_source_changed: selected source SHA256 changed"
+                    );
+                    let expected_resource = args
+                        .get("expected_resource_sha256")
+                        .context("publish_resource_pin_required")?;
+                    ensure!(
+                        expected_resource.is_null() || expected_resource.is_string(),
+                        "invalid publication resource pin"
+                    );
+                    ensure!(
+                        expected_resource.as_str() == current.as_deref(),
+                        "published_script_changed: formal resource SHA256 changed"
                     );
                 }
-                changes.insert(path, bytes.clone());
-            }
-            let mut published_doc = doc.clone();
-            published_doc.published_resource_hash =
-                Some(format!("{:x}", Sha256::digest(source.yaml.as_bytes())));
-            published_doc.published_version = Some(version.clone());
-            published_doc.versions.push(Version {
-                version: version.clone(),
-                published: true,
-                source: "publish".into(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                ..source.clone()
+                let version = revision(
+                    doc.published_version
+                        .as_deref()
+                        .map(number)
+                        .map(|v| v.0 + 1)
+                        .unwrap_or(1),
+                    0,
+                );
+                let mut changes = BTreeMap::from([(
+                    format!("automations/{script}"),
+                    source.yaml.as_bytes().to_vec(),
+                )]);
+                for (name, bytes) in &source.generated_templates {
+                    let path = format!("templates/{name}");
+                    if let Some(current) =
+                        self.packages
+                            .read_binary(package, super::YAML_EXTENSION_ID, &path)?
+                    {
+                        ensure!(
+                            current == *bytes,
+                            "template_conflict: 素材 {name} 已存在且内容不同，请使用新名称"
+                        );
+                    }
+                    changes.insert(path, bytes.clone());
+                }
+                let mut published_doc = doc.clone();
+                published_doc.published_resource_hash =
+                    Some(format!("{:x}", Sha256::digest(source.yaml.as_bytes())));
+                published_doc.published_version = Some(version.clone());
+                published_doc.versions.push(Version {
+                    version: version.clone(),
+                    published: true,
+                    source: "publish".into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    ..source.clone()
+                });
+                ensure!(
+                    serde_json::to_vec(&published_doc)?.len() <= 64 * 1024 * 1024,
+                    "script history exceeds64MiB"
+                );
+                // Once admitted, complete the shared publication transaction and
+                // history write even if revocation races its durable commit.
+                admit(&admission)?;
+                revisions::commit(
+                    &self.packages,
+                    package,
+                    &revisions::version(&self.packages, package)?,
+                    &changes,
+                    &format!("{script}@{version}"),
+                    "published",
+                    false,
+                )?;
+                doc.published_resource_hash =
+                    Some(format!("{:x}", Sha256::digest(source.yaml.as_bytes())));
+                doc.published_version = Some(version.clone());
+                doc.versions.push(Version {
+                    version,
+                    published: true,
+                    source: "publish".into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    ..source
+                });
+                self.authoring_write(package, &doc)?;
+                Ok(json!({"script":self.authoring_view(&doc)}))
             });
-            ensure!(
-                serde_json::to_vec(&published_doc)?.len() <= 64 * 1024 * 1024,
-                "script history exceeds64MiB"
-            );
-            revisions::commit(
-                &self.packages,
-                package,
-                &revisions::version(&self.packages, package)?,
-                &changes,
-                &format!("{script}@{version}"),
-                "published",
-                false,
-            )?;
-            doc.published_resource_hash =
-                Some(format!("{:x}", Sha256::digest(source.yaml.as_bytes())));
-            doc.published_version = Some(version.clone());
-            doc.versions.push(Version {
-                version,
-                published: true,
-                source: "publish".into(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                ..source
-            });
-            admit(&admission)?;
-            self.authoring_write(package, &doc)?;
-            return Ok(json!({"script":self.authoring_view(&doc)}));
         }
         anyhow::bail!("unknown authoring action: {action}")
     }
