@@ -16,6 +16,28 @@ pub const MAX_KEYMAP_YAML_BYTES: usize = 1024 * 1024;
 const MAX_SWIPE_DURATION_MS: u32 = 60_000;
 const MAX_ANDROID_KEYCODE: u32 = 1_000;
 
+/// Authoring reference shares limits and example validation with this parser.
+pub(crate) fn grammar() -> serde_json::Value {
+    serde_json::json!({
+        "format":"keymap-yaml-v1",
+        "max_source_bytes":MAX_KEYMAP_YAML_BYTES,
+        "required_fields":["version","name","bindings"],
+        "version":1,
+        "name_max_bytes":255,
+        "unknown_fields":"rejected",
+        "binding":{"required":["key","action"],"duplicate_keys":"rejected","key":"supported KeyboardEvent.code or selectors","mouse":["MouseLeft","MouseMiddle","MouseRight","MouseBack","MouseForward","MouseMove"],"gamepad":{"GamepadButton":[0,31],"GamepadAxis":[0,7]}},
+        "coordinate_space":{"type":"normalized","range":[0,1],"origin":"top_left","values":"[x,y]"},
+        "actions":[
+            {"type":"tap","required":["at"]},
+            {"type":"hold","required":["at"],"behavior":"Press holds one touch; release ends it. No pointer_id field."},
+            {"type":"swipe","required":["from","to","duration_ms"],"duration_ms":{"minimum":1,"maximum":MAX_SWIPE_DURATION_MS}},
+            {"type":"raw_key","at_least_one":["code","keycode"],"code":"supported KeyboardEvent.code only","keycode":{"minimum":0,"maximum":MAX_ANDROID_KEYCODE}}
+        ],
+        "examples":[{"name":"example.yaml","content":"version: 1\nname: Example\nbindings:\n  - key: Space\n    action: {type: tap, at: [0.72, 0.86]}\n  - key: KeyW\n    action: {type: hold, at: [0.2, 0.8]}\n  - key: KeyE\n    action: {type: swipe, from: [0.4, 0.8], to: [0.6, 0.8], duration_ms: 300}\n  - key: F1\n    action: {type: raw_key, keycode: 131}\n"}],
+        "workflow":["profiles_validate checks syntax without input","profiles_write saves with optimistic resource version","Select the profile in Gamer to activate it"]
+    })
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Keymap {
     pub version: u32,

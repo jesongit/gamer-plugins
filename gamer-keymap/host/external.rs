@@ -109,7 +109,7 @@ impl ExternalToolHandler for ExternalTools {
         context.check_active()?;
         context.authorize_plugin(super::KEYMAP_EXTENSION_ID)?;
         let scope = match action {
-            "profiles.list" | "profiles.read" | "profiles.validate" => {
+            "profiles.grammar" | "profiles.list" | "profiles.read" | "profiles.validate" => {
                 "plugin.gamer-keymap.profiles.read"
             }
             "profiles.write" => "plugin.gamer-keymap.profiles.write",
@@ -120,6 +120,9 @@ impl ExternalToolHandler for ExternalTools {
             }
         };
         context.require_scope(scope)?;
+        if action == "profiles.grammar" {
+            return Ok(());
+        }
         context.require_scope(if action == "profiles.write" {
             "resource.write"
         } else {
@@ -148,6 +151,7 @@ impl ExternalToolHandler for ExternalTools {
     ) -> Result<ToolResult, McpError> {
         self.authorize(&context, action, &arguments).await?;
         match action {
+            "profiles.grammar" => Ok(ToolResult::json(super::dsl::grammar())),
             "profiles.list" => {
                 let request: Package = decode(arguments)?;
                 let entries = self
@@ -239,6 +243,62 @@ impl ExternalToolHandler for ExternalTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn external_grammar_needs_no_package_and_all_examples_pass_the_authoritative_parser() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = Arc::new(
+            PackageStore::open(&crate::config::Config {
+                data_dir: root.path().into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let credentials = Arc::new(crate::mcp::CredentialStore::open(root.path()).unwrap());
+        let token = credentials
+            .create(crate::mcp::CreateTokenRequest {
+                label: "grammar fixture".into(),
+                scopes: ["plugin.gamer-keymap.profiles.read".into()].into(),
+                allowed: crate::mcp::AllowedObjects {
+                    plugins: [super::super::KEYMAP_EXTENSION_ID.into()].into(),
+                    ..Default::default()
+                },
+                expires_in_seconds: 60,
+            })
+            .unwrap();
+        let context = InvocationContext::new(
+            credentials.authenticate(&token.token).unwrap(),
+            "grammar".into(),
+            None,
+            credentials,
+            Arc::new(crate::mcp::ReceiptStore::open(root.path()).unwrap()),
+        );
+        let tools = ExternalTools::new(packages);
+        let reference = tools
+            .call(context.clone(), "profiles.grammar", json!({}))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(reference["version"], 1);
+        for example in reference["examples"].as_array().unwrap() {
+            let parsed = super::super::parse_keymap_content(
+                example["content"].as_str().unwrap(),
+                example["name"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed.bindings.len(),
+                reference["actions"].as_array().unwrap().len()
+            );
+        }
+        assert!(tools.packages.list_packages().unwrap().is_empty());
+        let mut denied = context;
+        denied.principal.scopes.clear();
+        assert!(tools
+            .call(denied, "profiles.grammar", json!({}))
+            .await
+            .is_err());
+    }
     #[tokio::test]
     async fn revoked_profile_write_waiting_for_the_resource_barrier_preserves_the_file() {
         let root = tempfile::tempdir().unwrap();

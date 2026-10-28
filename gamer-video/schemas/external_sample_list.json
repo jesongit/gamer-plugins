@@ -3,6 +3,11 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "name": {
+      "type": "string",
+      "maxLength": 255,
+      "description": "按素材显示名称做不区分大小写的包含搜索，在授权过滤后分页。"
+    },
     "offset": {
       "type": "integer",
       "minimum": 0

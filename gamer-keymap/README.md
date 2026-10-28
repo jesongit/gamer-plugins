@@ -2,6 +2,8 @@
 
 按键映射编辑器与 WASM 输入规则。插件 ID、目录名和发行归档均使用 `gamer-keymap`。
 
+外部 Agent 可先调用 `gamer.plugin.gamer-keymap.grammar` 读取当前映射 YAML 语法、坐标与输入选择器范围和示例，再调用 `profiles_validate`、`profiles_write`。映射使用 `version: 1`，保存后仍由用户在 Gamer 选用；这些工具不发送输入或热切换方案。`grammar` 的原生实现随宿主更新。
+
 ## 目录与开发
 
 - `manifest.toml`：身份、版本、权限、依赖和面板声明的单一来源。

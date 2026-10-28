@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-video"
-version = "0.2.6"
+version = "0.2.7"
 name = "视频工作台"
 description = "视频工作台：媒体素材库、设备录制与可携带演示素材"
 permissions = ["ui.host", "media.read", "media.import", "media.record", "media.write", "media.events.read"]
@@ -39,7 +39,7 @@ component = "VideoWorkbench"
 [[tools]]
 tool_id = "sample_list"
 action = "external.sample_list"
-description = "List only individually authorized standalone samples. A Package selector never grants sample access."
+description = "Find individually authorized standalone samples by display name (case-insensitive substring), then paginate. A Package selector never grants sample access."
 input_schema = "schemas/external_sample_list.json"
 required_scopes = ["plugin.gamer-video.read", "media.read"]
 required_permissions = ["media.read"]

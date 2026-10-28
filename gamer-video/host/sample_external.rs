@@ -43,6 +43,9 @@ impl VideoTools {
             .status(&RecordingId(text(args, "recording_id")?.into()))
             .map_err(error)?;
         ctx.authorize_device(&record.device_id)?;
+        if record.segments.is_empty() {
+            ctx.authorize_media("*")?;
+        }
         for segment in record.segments {
             ctx.authorize_media(&segment.media_id.0)?;
         }
@@ -176,7 +179,18 @@ impl ExternalToolHandler for VideoTools {
                     })
                     .cloned()
                     .collect();
-                page(&allowed, &args)?
+                let query = args["name"].as_str().unwrap_or("").trim().to_lowercase();
+                let matching: Vec<_> = allowed
+                    .into_iter()
+                    .filter(|sample| {
+                        sample["name"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&query)
+                    })
+                    .collect();
+                page(&matching, &args)?
             }
             "external.sample_import" => {
                 let encoded = text(&args, "base64")?;
@@ -309,6 +323,55 @@ impl ExternalToolHandler for VideoTools {
 mod tests {
     use super::*;
     use crate::mcp::{AllowedObjects, CreateTokenRequest, CredentialStore, ReceiptStore};
+    #[tokio::test]
+    async fn external_sample_search_filters_names_and_permissions_before_pagination() {
+        let (mut manifest, files) = super::super::tests::fixture();
+        let root = tempfile::tempdir().unwrap();
+        manifest.name = "退出云游戏 Exit".into();
+        manifest.content_sha256 = fingerprint(&manifest).unwrap();
+        let original_id = manifest.id.clone();
+        {
+            let _io = SAMPLE_IO.lock().unwrap();
+            save_standalone(
+                root.path(),
+                &manifest,
+                &encode_archive(&manifest, &files).unwrap(),
+            )
+            .unwrap();
+            manifest.id = "hidden-sample".into();
+            manifest.content_sha256 = fingerprint(&manifest).unwrap();
+            save_standalone(
+                root.path(),
+                &manifest,
+                &encode_archive(&manifest, &files).unwrap(),
+            )
+            .unwrap();
+        }
+        let ctx = context(&root.path().join("mcp"), &original_id);
+        let tools = VideoTools::new(root.path());
+        for name in ["退出云游戏", "exit"] {
+            let page = tools
+                .call(
+                    ctx.clone(),
+                    "external.sample_list",
+                    json!({"name":name,"limit":1}),
+                )
+                .await
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(page["total"], 1);
+            assert_eq!(page["items"][0]["id"], original_id);
+            assert_eq!(page["next_offset"], Value::Null);
+        }
+        let empty = tools
+            .call(ctx, "external.sample_list", json!({"name":"missing"}))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(empty["total"], 0);
+    }
     fn context(root: &Path, sample: &str) -> InvocationContext {
         let credentials = std::sync::Arc::new(CredentialStore::open(root).unwrap());
         let token = credentials

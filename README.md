@@ -9,8 +9,8 @@
 | 插件 | 功能 | 当前源码版本 | 使用说明 |
 | --- | --- | --- | --- |
 | `gamer-yaml` 自动化 | YAML 脚本、函数、模板、工作稿版本、检查与执行 | `0.3.26` | [自动化](gamer-yaml/README.md) |
-| `gamer-keymap` 按键映射 | 将键盘、鼠标与手柄动作映射为目标输入 | `0.1.6` | [按键映射](gamer-keymap/README.md) |
-| `gamer-video` 视频工作台 | 录制、逐帧分析、目标标记与独立素材包 | `0.2.6` | [视频工作台](gamer-video/README.md) |
+| `gamer-keymap` 按键映射 | 将键盘、鼠标与手柄动作映射为目标输入 | `0.1.7` | [按键映射](gamer-keymap/README.md) |
+| `gamer-video` 视频工作台 | 录制、逐帧分析、目标标记与独立素材包 | `0.2.7` | [视频工作台](gamer-video/README.md) |
 | `gamer-notify` 通知助手 | 通知渠道、任务结果通知与发送记录 | `0.1.2` | [通知助手](gamer-notify/README.md) |
 | `gamer-live` 直播助手 | 设备与媒体输出、推流和互动队列 | `0.2.19` | [直播助手](gamer-live/README.md) |
 | `gamer-package-publisher` 配置包发布 | 通过服务电脑上的 GitHub CLI 发布配置包 | `0.1.0` | [配置包发布](gamer-package-publisher/README.md) |
@@ -64,6 +64,8 @@ run:
 ## 外部 Agent
 
 统一 MCP 由 Gamer Core 提供，插件通过 manifest 中显式的 `[[tools]]` 和随包 JSON schema 接入。工具的可见性取决于插件运行状态、权限与令牌授权范围，不自动开放管理 action、界面按钮或原生函数。
+
+键盘映射提供 `grammar` 读取语法及可验证示例，再通过 `profiles_validate` / `profiles_write` 保存方案；视频 `sample_list` 支持按显示名称搜索。两者均需包含相应 host 实现的新宿主，单独更新插件归档不能替换原生代码。
 
 通知、推流、凭据配置和正式发布不能借普通脚本工具间接获得。输入继续服从 Core 控制租约、暂停屏障与帧身份校验。接入见 [MCP 指南](https://github.com/jesongit/gamer/blob/main/docs/guides/external-agent-mcp.md)。
 

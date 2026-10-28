@@ -1,6 +1,6 @@
 manifest_version = 2
 id = "gamer-keymap"
-version = "0.1.6"
+version = "0.1.7"
 name = "键盘映射"
 description = "按键映射：键盘、鼠标、手柄动作映射为设备触控与按键"
 entry = "plugin.wasm"
@@ -37,6 +37,15 @@ preferred_width = 360
 component = "console.keymaps"
 
 # External tools are explicit; UI/internal actions are never exported automatically.
+[[tools]]
+tool_id = "grammar"
+action = "profiles.grammar"
+description = "读取当前键盘映射 YAML 语法、输入选择器、坐标范围和可校验示例；不切换方案或发送输入。"
+input_schema = "schemas/mcp/grammar.json"
+required_scopes = ["plugin.gamer-keymap.profiles.read"]
+required_permissions = []
+effect = "read"
+
 [[tools]]
 tool_id = "profiles_list"
 action = "profiles.list"
