@@ -76,6 +76,6 @@ export function useConsoleScriptRunner({ toast, packageId, restorePackage = prev
   function onBeforeUnload(event) { if (sourceEditorDirty.value) { event.preventDefault(); event.returnValue = '' } }
   const makePanel = kind => ({ kind, runKind: ref(kind), sourceFile: ref(''), sourceFunction: ref(''), sourcePackage: ref(''), packageId, store, selScript, automationTab, sourceEditorDirty, sourceEditorSaving, startPending, runStopping, stopScript, runScript, runFunction, runArgsFlow, configureTargetScript, startRunStatusPoll })
   onUnmounted(() => { disposed = true; fetching++; stopRunStatusPoll() })
-  return { resourcePreview, closeResourcePreview: () => { resourcePreview.open = false }, runArgsFlow, onRunArgsSubmit: (...args) => runArgsFlow.confirm(...args), liveLogs, startPending, runStopping, beforePackageChange, beforeTargetChange, projectTargetConfig, refreshScripts,
+  return { resourcePreview, closeResourcePreview: () => { resourcePreview.open = false }, runArgsFlow, onRunArgsSubmit: ({ args }) => runArgsFlow.confirm(args), liveLogs, startPending, runStopping, beforePackageChange, beforeTargetChange, projectTargetConfig, refreshScripts,
     startLogPolling: () => consoleRuntime.startLogPolling?.(), stopLogPolling: () => consoleRuntime.stopLogPolling?.(), pushLog, clearCallParamsCache: () => {}, editorMatchThreshold: ref(0.9), onTemplateRenamed: () => refreshScripts(), startRunStatusPoll, stopRunStatusPoll, restoreRunState: startRunStatusPoll, onBeforeUnload, scriptPanel: makePanel('script'), functionsPanel: makePanel('func') }
 }

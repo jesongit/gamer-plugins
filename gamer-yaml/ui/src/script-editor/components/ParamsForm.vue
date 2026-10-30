@@ -34,7 +34,7 @@
       <div v-if="isActive(decl.name)" class="pf-editor">
         <textarea
           v-if="usesJsonEditor(decl.type)"
-          class="cell-input json-input" rows="2" spellcheck="false"
+          class="cell-input json-input" :rows="decl.type === 'list' ? 5 : 2" spellcheck="false"
           :value="jsonTextFor(decl.name, values[decl.name])" :aria-label="decl.name"
           @input="onJsonEdit(decl, ($event.target as HTMLTextAreaElement).value)"
         ></textarea>
@@ -279,6 +279,10 @@ function validate(): ArgFieldError[] {
   const errs: ArgFieldError[] = []
   for (const decl of props.params) {
     if (!isActive(decl.name)) continue
+    if (jsonErrors[decl.name]) {
+      errs.push({ name: decl.name, message: jsonErrors[decl.name]! })
+      continue
+    }
     const err = check(decl)
     if (err) {
       errs.push({ name: decl.name, message: err })
@@ -340,7 +344,8 @@ defineExpose({ getArgs, validate, effectiveArgs })
 }
 .cell-input:focus { outline: none; border-color: var(--accent); }
 .cell-input.num { width: 74px; }
-.json-input { width: min(100%, 420px); min-height: 42px; resize: vertical; font-family: var(--mono); }
+.json-input { width: 100%; min-height: 42px; resize: vertical; font-family: var(--mono); }
+@media (pointer: coarse) { .json-input { font-size: 16px; } }
 .pf-err-msg { font-size: 12px; color: var(--danger); }
 .mono { font-family: var(--mono); }
 </style>

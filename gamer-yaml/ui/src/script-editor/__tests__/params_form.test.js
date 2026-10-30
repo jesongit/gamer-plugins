@@ -183,6 +183,8 @@ describe('mapArgDiagnostics / describeResolvedArgs / validateArgsAgainstParams',
 
   it('fmtLiteral 展示形态', () => {
     expect(fmtLiteral([0.5, 0.8])).toBe('[0.5, 0.8]')
+    expect(fmtLiteral([])).toBe('[]')
+    expect(fmtLiteral(['永远不会抛弃你', '永远不会欺骗你', '星神阿哈祝福你'])).toBe('["永远不会抛弃你", "永远不会欺骗你", "星神阿哈祝福你"]')
     expect(fmtLiteral(true)).toBe('true')
     expect(fmtLiteral(3)).toBe('3')
     expect(fmtLiteral(null)).toBe('—')

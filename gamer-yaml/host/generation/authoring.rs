@@ -326,6 +326,14 @@ impl AuthoringState {
                 .as_object_mut()
                 .unwrap()
                 .remove("generated_templates");
+            // Derived from this immutable source, never the current formal entrypoint.
+            version["parameter_schema"] = version["yaml"]
+                .as_str()
+                .and_then(|yaml| syntax::parse_script(yaml).ok())
+                .map(|script| {
+                    crate::extensions::gamer_yaml::task_params::decls_schema_json(&script.params)
+                })
+                .unwrap_or(Value::Null);
         }
         if let Some(job) = value
             .get_mut("job")

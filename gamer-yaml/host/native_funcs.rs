@@ -668,6 +668,25 @@ pub(crate) fn native_functions() -> &'static [NativeFunction] {
             params: vec![p("op", ParamType::String, true, None, "运算名"), p("a", ParamType::Number, true, None, "左值"), p("b", ParamType::Number, true, None, "右值")],
             returns: "number", permissions: &[],
         });
+        functions.push(NativeFunction {
+            name: "list_length",
+            display_name: "列表长度",
+            description: "返回列表元素数，可驱动有界 repeat；空列表返回 0",
+            params: vec![p("items", ParamType::List, true, None, "输入列表")],
+            returns: "integer",
+            permissions: &[],
+        });
+        functions.push(NativeFunction {
+            name: "list_get",
+            display_name: "读取列表项",
+            description: "按从零开始的整数索引读取列表项；负数或越界明确失败，不静默返回 null",
+            params: vec![
+                p("items", ParamType::List, true, None, "输入列表"),
+                p("index", ParamType::Integer, true, None, "从零开始的索引"),
+            ],
+            returns: "any",
+            permissions: &[],
+        });
         let mut text_params = vec![
             p("text", ParamType::String, true, None, "要查找的文字"),
             p(

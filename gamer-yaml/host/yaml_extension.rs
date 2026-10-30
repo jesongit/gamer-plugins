@@ -544,6 +544,23 @@ impl NativeYamlHost {
                 bound.number("a")?.context("缺少 a")?,
                 bound.number("b")?.context("缺少 b")?,
             ),
+            "list_length" => Ok(json!(bound.values["items"]
+                .as_array()
+                .context("items 必须为列表")?
+                .len())),
+            "list_get" => {
+                let items = bound.values["items"]
+                    .as_array()
+                    .context("items 必须为列表")?;
+                let index = bound.values["index"]
+                    .as_u64()
+                    .context("LIST_INDEX_INVALID: index 必须为非负整数")?;
+                let index = usize::try_from(index).context("LIST_INDEX_INVALID: index 超出范围")?;
+                items
+                    .get(index)
+                    .cloned()
+                    .context("LIST_INDEX_OUT_OF_BOUNDS: index 超出列表长度")
+            }
             "find_any" => self.find_any(&bound).await,
             "wait_find" => self.wait_find(&bound).await,
             "tap_template" => self.tap_template(&bound).await,
@@ -2179,6 +2196,33 @@ log = "^1.0"
         );
         let error = call("gt", json!({"a": "x", "b": 2}), &host).unwrap_err();
         assert!(error.to_string().contains("number"), "{error}");
+    }
+
+    #[test]
+    fn list_helpers_preserve_values_and_reject_invalid_indices() {
+        let trace = Arc::new(Trace::default());
+        let stub = VisionStub::new(FrameSize::new(1000, 1000));
+        let host = vision_host(trace, &stub, LogTrace::new(), &[]);
+        let items = json!(["永远不会抛弃你", null, {"nested": [1, false]}]);
+        assert_eq!(
+            call("list_length", json!({"items": items}), &host).unwrap(),
+            3
+        );
+        assert_eq!(call("list_length", json!({"items": []}), &host).unwrap(), 0);
+        for index in 0..3 {
+            assert_eq!(
+                call("list_get", json!({"items": items, "index": index}), &host).unwrap(),
+                items[index]
+            );
+        }
+        for index in [json!(-1), json!(3), json!(0.5), json!("0"), json!(u64::MAX)] {
+            assert!(call("list_get", json!({"items": items, "index": index}), &host).is_err());
+        }
+        for items in [Value::Null, json!("abc"), json!({"0":"x"})] {
+            assert!(call("list_length", json!({"items": items}), &host).is_err());
+            assert!(call("list_get", json!({"items": items, "index": 0}), &host).is_err());
+        }
+        assert!(call("list_get", json!({"items": []}), &host).is_err());
     }
 
     #[test]
@@ -4589,6 +4633,32 @@ runtime = "^1.0"
         );
         assert_eq!(trace.taps.lock().unwrap().len(), 1);
         assert!(runtime.is_available());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn yaml_component_iterates_empty_and_variable_length_string_lists() {
+        for codes in [
+            vec![],
+            vec!["甲"],
+            vec!["永远不会抛弃你", "永远不会欺骗你", "星神阿哈祝福你"],
+        ] {
+            let trace = Arc::new(tests::Trace::default());
+            let runtime = LazyYamlWasmtimeRuntime::new();
+            let script = parse_script("params:\n  codes: {type: list, required: true}\nvars:\n  index: 0\nrun:\n  - list_length: {items: $codes}\n    as: count\n  - repeat: $count\n    do:\n      - list_get: {items: $codes, index: $index}\n        as: code\n      - input_text: $code\n      - calculate: {op: add, a: $index, b: 1}\n        as: index\n").unwrap();
+            let mut args: JsonMap<String, Value> = script.vars.iter().cloned().collect();
+            args.insert("codes".into(), json!(codes));
+            let program = build_program(&script, &Default::default(), args, 0);
+            runtime
+                .run(run_request(
+                    program,
+                    host_with_permissions(trace.clone(), &["device.read", "input.text"]),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(trace.text.lock().unwrap().as_slice(), codes.as_slice());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -22,7 +22,7 @@ export const ARG_TYPE_LABELS: Record<string, string> = {
 /** 字面量 → 短展示串（默认值行 / 摘要 / 对比表共用）；undefined/null → '—'。 */
 export function fmtLiteral(v: unknown | null | undefined): string {
   if (v === null || v === undefined) return '—'
-  if (Array.isArray(v)) return `[${v[0]}, ${v[1]}]`
+  if (Array.isArray(v)) return `[${v.map(item => JSON.stringify(item)).join(', ')}]`
   if (typeof v === 'object') return JSON.stringify(v)
   if (typeof v === 'boolean') return v ? 'true' : 'false'
   return String(v)

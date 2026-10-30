@@ -201,4 +201,21 @@ describe('work draft lifecycle and formal resource refresh', () => {
     expect(wrapper.text()).toContain('network failed')
     expect(api.callExtension.mock.calls.some(c => ['authoring.import', 'authoring.create', 'authoring.save'].includes(c[1]))).toBe(false)
   })
+  it('saved private source requests its exact version parameters before submitting a string list', async () => {
+    const context = { packageId: 'pkg', store: { deviceId: 'device', runId: '' }, selScript: 'pkg/daily.yaml' }
+    const wrapper = mount(SourceYamlEditor, { props: { context } }); wrappers.push(wrapper); await flushPromises()
+    const yaml = 'params:\n  codes: {type: list, required: true}\nrun: []\n'
+    await wrapper.get('[aria-label="YAML 原文"]').setValue(yaml)
+    const implementation = api.callExtension.getMockImplementation()
+    api.callExtension.mockImplementation((plugin, action, values) => {
+      if (action === 'authoring.save') { doc = { ...doc, head_version: '0.2', versions: [{ version: '0.2', yaml, parameter_schema: [{ name: 'codes', type: 'list', required: true }], diagnostics: [] }] }; return Promise.resolve({ script: doc }) }
+      return implementation(plugin, action, values)
+    })
+    await button(wrapper, '保存并运行').trigger('click'); await flushPromises()
+    expect(api.callExtension.mock.calls.some(c => c[1] === 'authoring.run')).toBe(false)
+    const codes = ['甲', '乙', '丙']
+    await wrapper.get('[aria-label="codes"]').setValue(JSON.stringify(codes))
+    await button(wrapper, '▶ 运行').trigger('click'); await flushPromises()
+    expect(api.callExtension).toHaveBeenCalledWith('gamer-yaml', 'authoring.run', { package_id: 'pkg', script_id: 'daily.yaml', version: '0.2', expected_version: '0.2', device_id: 'device', args: { codes } })
+  })
 })

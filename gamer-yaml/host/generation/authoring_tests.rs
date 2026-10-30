@@ -38,6 +38,38 @@ pub(super) fn fixture() -> (tempfile::TempDir, AuthoringService, Value) {
 }
 
 #[tokio::test]
+async fn version_parameter_schemas_follow_immutable_source_without_rewriting_history() {
+    let (_root, service, _) = fixture();
+    service
+        .call(
+            "authoring.create",
+            json!({"package_id":"default","script_id":"params.yaml"}),
+        )
+        .await
+        .unwrap();
+    let first = service.call("authoring.save", json!({"package_id":"default","script_id":"params.yaml","expected_version":"","yaml":"params:\n  codes: {type: list, required: true}\nrun: []\n"})).await.unwrap();
+    let head = first["script"]["head_version"].as_str().unwrap();
+    service.call("authoring.save", json!({"package_id":"default","script_id":"params.yaml","expected_version":head,"yaml":"params:\n  other: {type: integer, default: 2}\nrun: []\n"})).await.unwrap();
+    let path = service
+        .inner
+        .authoring_path("default", "params.yaml")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let result = service
+        .call(
+            "authoring.get",
+            json!({"package_id":"default","script_id":"params.yaml"}),
+        )
+        .await
+        .unwrap();
+    let versions = result["script"]["versions"].as_array().unwrap();
+    assert_eq!(versions[0]["parameter_schema"][0]["name"], "codes");
+    assert_eq!(versions[0]["parameter_schema"][0]["type"], "list");
+    assert_eq!(versions[1]["parameter_schema"][0]["name"], "other");
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[tokio::test]
 async fn admitted_save_rechecks_after_waiting_for_the_draft_and_before_persistence() {
     let (_root, service, _) = fixture();
     service

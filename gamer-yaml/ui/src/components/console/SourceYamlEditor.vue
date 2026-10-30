@@ -9,17 +9,38 @@ import { useSourceYamlEditor } from '../../composables/useSourceYamlEditor'
 import { addScriptFunction, scriptCallSnippet } from './script-functions'
 import { pluginMessageChannel } from '../../../../../../web/src/workspace/plugin-messages'
 import { yamlResourcesChanged } from './resource-changes'
+import ParallelRunModal from './ParallelRunModal.vue'
+import RunParamsModal from '../RunParamsModal.vue'
+import { useRunArgsFlow } from '../../composables/useRunArgsFlow'
 const props = defineProps({ context: { type: Object, required: true } })
 const emit = defineEmits(['show-logs', 'generate'])
 const ctx = reactive(props.context), workspace = inject(WORKSPACE_CONTEXT_KEY, null), confirm = useConfirmDialog()
 const selected = ref(''), resources = ref([]), functionName = ref('')
 const editor = reactive(useSourceYamlEditor({ api, call: (action, values) => api.callExtension('gamer-yaml', action, values) }))
-const busy = computed(() => editor.loading || editor.saving || ctx.startPending || ctx.store.running)
+const busy = computed(() => editor.loading || editor.saving || ctx.startPending || ctx.store.running || parallelOpen.value || draftArgsFlow.modal.open || draftArgsFlow.modal.loading || draftArgsFlow.modal.submitting)
 const functionNames = computed(() => { try { return Object.keys(parseYaml(editor.content)?.functions || {}) } catch { return [] } })
 const newFunctionName = ref(''), referenceTarget = ref('')
 const referenceOptions = ref([])
 const draftVersion = ref(''), saveNotice = ref('')
 const sourceOpen = ref(false)
+const parallelOpen = ref(false)
+let draftRunSnapshot
+const draftArgsFlow = useRunArgsFlow({
+  loadParams: async () => {
+    const result = await api.callExtension('gamer-yaml', 'authoring.get', { package_id: draftRunSnapshot.package_id, script_id: draftRunSnapshot.script_id })
+    const record = result.script?.versions.find(v => v.version === draftRunSnapshot.version)
+    if (!Array.isArray(record?.parameter_schema)) throw new Error('无法读取该版本参数，请更新 Gamer 后重试')
+    return { schema: record.parameter_schema }
+  },
+  exec: async ({ args }) => {
+    const snapshot = draftRunSnapshot
+    if (snapshot.device_id !== ctx.store.deviceId || snapshot.package_id !== ctx.packageId) throw new Error('运行目标已变化，请重新运行')
+    const run = await api.callExtension('gamer-yaml', 'authoring.run', { ...snapshot, args })
+    applyRunRecord({ ...run, state: 'starting', device_id: snapshot.device_id, runner_id: 'gamer-yaml-version', entrypoint: `${snapshot.package_id}/${snapshot.script_id}` })
+    ctx.startRunStatusPoll?.()
+    return run
+  },
+})
 watch(() => editor.dirty, dirty => { if (dirty) sourceOpen.value = true })
 async function openPackages() {
   try { await workspace?.uiBridge.workspace.openPanel('packages') }
@@ -100,9 +121,8 @@ async function run() {
   if (token !== scope) return
   if (draftVersion.value) {
     try {
-      const run = await api.callExtension('gamer-yaml', 'authoring.run', { package_id: ctx.packageId, script_id: editor.name, expected_version: draftVersion.value, version: draftVersion.value, device_id: ctx.store.deviceId })
-      applyRunRecord({ ...run, state: 'starting', device_id: ctx.store.deviceId, runner_id: 'gamer-yaml-version', entrypoint: editor.id })
-      ctx.startRunStatusPoll?.()
+      draftRunSnapshot = { package_id: ctx.packageId, script_id: editor.name, expected_version: draftVersion.value, version: draftVersion.value, device_id: ctx.store.deviceId }
+      await draftArgsFlow.begin({ id: editor.id, name: editor.name, deviceId: ctx.store.deviceId, entrypoint: editor.id })
     }
     catch(e) { editor.error = e.message }
   } else { ctx.selScript = editor.id; try { await ctx.runScript({ startIndex: 0 }) } catch(e) { editor.error = e.message } }
@@ -113,6 +133,7 @@ function manageVersions() {
   request.packageId = ctx.packageId; request.scriptId = editor.name; request.importScriptId = draftVersion.value ? '' : editor.name; request.candidateId = null; request.seq++
 }
 watch([() => ctx.packageId, () => ctx.store.deviceId], () => {
+  parallelOpen.value = false; draftArgsFlow.close()
   const restore = ctx.sourcePackage === ctx.packageId ? ctx.sourceFile || ctx.selScript : ctx.selScript
   const restoreFunction = ctx.sourcePackage === ctx.packageId ? ctx.sourceFunction : ''
   scope++; selected.value = restore && restore.startsWith(`${ctx.packageId}/`) ? restore : ''; resources.value = []; functionName.value = restoreFunction || ''
@@ -176,6 +197,7 @@ defineExpose({ beforeTabChange })
       <button v-if="editor.dirty && editor.name" class="btn" :disabled="busy" @click="save" title="保存为未发布版本，不替换脚本库">保存草稿</button>
       <button v-if="ctx.configureTargetScript && editor.id" class="btn" :disabled="busy || editor.dirty || !ctx.store.deviceId || ctx.runArgsFlow?.modal.loading" @click="ctx.configureTargetScript">运行设置</button>
       <button v-if="!ctx.store.running && editor.name" class="btn btn-primary" :disabled="busy || !ctx.store.deviceId" @click="run" :title="editor.dirty ? '先保存修改，再在当前目标上运行一次' : '在当前游戏目标上运行一次'">{{ editor.dirty ? '保存并运行' : '运行脚本' }}</button>
+      <button v-if="editor.id" class="btn" :disabled="editor.loading || editor.saving || editor.dirty || !!draftVersion" title="选择多个账号，同时运行当前正式脚本与同一组参数" @click="parallelOpen = true">多账号运行</button>
       <button v-if="ctx.store.running" class="btn btn-danger" :disabled="ctx.runStopping" @click="ctx.stopScript">停止脚本</button>
       <button v-if="editor.name || ctx.store.runId" class="btn" @click="showLogs">运行日志</button>
     </div>
@@ -184,6 +206,8 @@ defineExpose({ beforeTabChange })
       <button class="btn btn-sm" :disabled="busy || editor.dirty || !editor.id" @click="manageVersions" title="先保存当前修改，再进入版本管理">修改与版本管理</button>
     </div>
     <p v-if="editor.name && !ctx.store.deviceId" class="hint">选择游戏目标后可运行；编辑和源码校验可离线进行。</p>
+    <ParallelRunModal v-if="parallelOpen" :open="parallelOpen" :package-id="ctx.packageId" :entrypoint="editor.id" :current-device="ctx.store.deviceId" @close="parallelOpen = false" />
+    <RunParamsModal :open="draftArgsFlow.modal.open" :title="draftArgsFlow.modal.title" :params="draftArgsFlow.modal.params" :suggestions="draftArgsFlow.modal.suggestions" :field-errors="draftArgsFlow.modal.fieldErrors" :general-errors="draftArgsFlow.modal.generalErrors" :submitting="draftArgsFlow.modal.submitting" @close="draftArgsFlow.close()" @submit="draftArgsFlow.confirm($event.args)" />
     <p v-if="editor.valid" class="success" role="status">源码校验通过；实际目标与素材验证仍需单独执行</p>
     <p v-if="editor.error" role="alert" class="error">{{ editor.error }} <button v-if="editor.conflict" class="btn" @click="reload">放弃修改并重载最新版本</button></p>
     <ul v-if="editor.diagnostics.length" class="diagnostics"><li v-for="(d,index) in editor.diagnostics" :key="index">{{ d.path || d.step_path || d.field || '文档' }} · {{ d.message }} ({{ d.code }})</li></ul>
